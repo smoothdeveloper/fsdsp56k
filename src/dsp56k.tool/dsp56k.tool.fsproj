@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <AssemblyName>fsdsp56k</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Cli.fs" />
+    <Compile Include="Commands.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../dsp56k/dsp56k.fsproj" />
+    <ProjectReference Include="../dsp56k.dsl/dsp56k.dsl.fsproj" />
+    <ProjectReference Include="../dsp56k.native/dsp56k.native.fsproj" />
+    <ProjectReference Include="../machinedrum/machinedrum.fsproj" />
+    <ProjectReference Include="../machinedrum.run/machinedrum.run.fsproj" />
+  </ItemGroup>
+  <Import Project="..\..\.paket\Paket.Restore.targets" />
+</Project>

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Machinedrum</AssemblyName>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Mds.fs" />
+    <Compile Include="Abi.fs" />
+    <Compile Include="Sysex.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../dsp56k/dsp56k.fsproj" />
+    <ProjectReference Include="../dsp56k.dsl/dsp56k.dsl.fsproj" />
+  </ItemGroup>
+  <Import Project="..\..\.paket\Paket.Restore.targets" />
+</Project>

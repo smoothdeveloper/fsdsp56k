@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Dsp56k.Tests</AssemblyName>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <GenerateProgramFile>false</GenerateProgramFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Fixtures.fs" />
+    <Compile Include="Catalogue.fs" />
+    <Compile Include="OracleTests.fs" />
+    <Compile Include="GoldTests.fs" />
+    <Compile Include="EmulatorTests.fs" />
+    <Compile Include="CorpusTests.fs" />
+    <Compile Include="ImportTests.fs" />
+    <Compile Include="ToolTests.fs" />
+    <Compile Include="Main.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/dsp56k/dsp56k.fsproj" />
+    <ProjectReference Include="../../src/dsp56k.native/dsp56k.native.fsproj" />
+    <ProjectReference Include="../../src/machinedrum/machinedrum.fsproj" />
+    <ProjectReference Include="../../src/machinedrum.run/machinedrum.run.fsproj" />
+    <ProjectReference Include="../../src/dsp56k.tool/dsp56k.tool.fsproj" />
+  </ItemGroup>
+  <Import Project="..\..\.paket\Paket.Restore.targets" />
+</Project>

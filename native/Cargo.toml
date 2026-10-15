@@ -1,0 +1,20 @@
+[package]
+name = "fsdsp56k-native"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "C ABI over mborgerson/dsp56300 (assembler, disassembler, JIT emulator) for the F# tooling"
+
+[lib]
+crate-type = ["cdylib"]
+
+# Pinned: the oracle's behaviour is part of what the tests check.
+[dependencies]
+dsp56300-core = { git = "https://github.com/mborgerson/dsp56300", rev = "2f99039" }
+dsp56300-asm = { git = "https://github.com/mborgerson/dsp56300", rev = "2f99039" }
+dsp56300-disasm = { git = "https://github.com/mborgerson/dsp56300", rev = "2f99039" }
+dsp56300-emu = { git = "https://github.com/mborgerson/dsp56300", rev = "2f99039", default-features = false }
+
+[profile.release]
+opt-level = 3

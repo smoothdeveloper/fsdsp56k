@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Dsp56k.Dsl</AssemblyName>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Asm.fs" />
+    <Compile Include="Layout.fs" />
+    <Compile Include="Tables.fs" />
+    <Compile Include="Lower.fs" />
+    <Compile Include="Transcribe.fs" />
+    <Compile Include="Program.fs" />
+    <Compile Include="Import.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../dsp56k/dsp56k.fsproj" />
+  </ItemGroup>
+  <Import Project="..\..\.paket\Paket.Restore.targets" />
+</Project>

@@ -1,0 +1,15 @@
+bin/
+obj/
+paket-files/
+packages/
+native/build/
+native/deps/
+fixtures/
+out/
+*.cld
+*.lst
+native/target/
+
+# local notes: kept next to the checkout, never committed
+*.local.md
+.local/
