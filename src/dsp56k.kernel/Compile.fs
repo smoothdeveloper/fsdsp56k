@@ -1858,6 +1858,12 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
     let elseLabel = fresh ctx "ELSE"
     // the condition is compiled knowing either branch runs after it
     thenRun ctx f (fun () -> thenRun ctx t (fun () -> thenRun ctx cond (fun () -> branchUnless ctx cond elseLabel)))
+    // The then branch gives back the registers of locals and cursors the code after the if no
+    // longer reads, but the else branch may still read them: it starts from the registers as
+    // they were before the then branch. After the if, the else branch's state holds (what it gave
+    // back is dead after the if too, and the then branch's own locals ended inside it).
+    let freeData, deadLocals = ctx.freeData, List.ofSeq ctx.deadLocals
+    let freeRegs, released = ctx.freeRegs, List.ofSeq ctx.released
     genStmt ctx t
     match f with
     | Value(null, _) -> emit ctx (Label elseLabel)
@@ -1865,6 +1871,8 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
       let endLabel = fresh ctx "ENDIF"
       emit ctx (bra endLabel)
       emit ctx (Label elseLabel)
+      ctx.freeData <- freeData; ctx.deadLocals.Clear(); ctx.deadLocals.UnionWith deadLocals
+      ctx.freeRegs <- freeRegs; ctx.released.Clear(); ctx.released.UnionWith released
       genStmt ctx f
       emit ctx (Label endLabel)
   | Call(Some(Var o), mi, [x]) when o.Type = typeof<Output> && intrinsic mi = Some "out.write" ->

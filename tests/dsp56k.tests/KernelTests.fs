@@ -948,6 +948,92 @@ module Frames =
 
   let kernel = Kernel.define "probe-subroutine-frames" <@ init @> <@ trig @> <@ render @>
 
+/// Four Acc locals live across a loop body (P-I-HP's `pair`: two coupled-form resonators a
+/// pass, a, b and c, d, with MACs and the limiter between them).
+[<ReflectedDefinition>]
+module FourAcc =
+  type S =
+    { mutable wa : Long
+      mutable wb : Long
+      mutable wc : Long
+      mutable wd : Long
+      [<Length 32>] mutable pulse : Frac array
+      mutable w1 : Frac
+      mutable r1 : Frac
+      mutable w2 : Frac
+      mutable r2 : Frac }
+
+  let init (_: Banks.P) (s: S) =
+    s.wa <- Long.ofRaw 0x123456789aL
+    s.wb <- Long.ofRaw -0x0fedcba987L
+    s.wc <- Long.ofRaw 0x2468ace013L
+    s.wd <- Long.ofRaw 0x13579bdf02L
+    s.w1 <- Frac.ofRaw 0x0c0000
+    s.r1 <- Frac.ofRaw 0x001000
+    s.w2 <- Frac.ofRaw 0x1a0000
+    s.r2 <- Frac.ofRaw 0x002000
+
+  let trig (_: Banks.P) (_: S) = ()
+
+  let pair (s: S) (g1: Frac) (g2: Frac) (k1: Frac) (k2: Frac) (out: Output) =
+    let mutable a = Acc.ofLong s.wa
+    let mutable b = Acc.ofLong s.wb
+    let mutable c = Acc.ofLong s.wc
+    let mutable d = Acc.ofLong s.wd
+    for i in 0 .. 31 do
+      let e = s.pulse[i]
+      a <- Acc.mac a e g1
+      a <- a - Acc.sat b * s.w1
+      let x = Acc.sat a
+      a <- a - x * s.r1
+      b <- Acc.mac b x s.w1
+      c <- Acc.mac c e g2
+      c <- c - Acc.sat d * s.w2
+      let y = Acc.sat c
+      c <- c - y * s.r2
+      d <- Acc.mac d y s.w2
+      out.Write(Acc.sat (Acc.rnd (Acc.mac (Acc.mac (Acc.ofFrac e) k1 x) k2 y)))
+    s.wa <- Long.ofAcc a
+    s.wb <- Long.ofAcc b
+    s.wc <- Long.ofAcc c
+    s.wd <- Long.ofAcc d
+
+  let render (p: Banks.P) (s: S) (out: Output) =
+    for i in 0 .. 31 do
+      s.pulse[i] <- Acc.hi (Acc.ofFrac p.d >>> 4)
+    pair s p.a p.b p.c p.d out
+
+  let kernel = Kernel.define "probe-four-acc" <@ init @> <@ trig @> <@ render @>
+
+/// Locals in X1 and Y1 read in both branches of an if: the then branch, past its last read of
+/// them, gives their registers to its own locals; the else branch still reads them (P-I-HP:
+/// `if s.left = 0 then ... modes p4 ring; range s else force s; modes p4 ring`).
+[<ReflectedDefinition>]
+module Branches =
+  type S = { mutable w : Frac }
+
+  let init (_: Banks.P) (s: S) = s.w <- Frac.ofRaw 0x123456
+
+  let trig (_: Banks.P) (_: S) = ()
+
+  let render (p: Banks.P) (s: S) (out: Output) =
+    let k = Acc.hi (Acc.ofFrac p.a >>> 1)
+    let j = Acc.hi (Acc.ofFrac p.b >>> 2)
+    if p.c > Frac.zero then
+      for _ in 0 .. 15 do out.Write(Acc.sat (k * j + s.w * k))
+      let u = Acc.sat (p.d * s.w)
+      let v = Acc.hi (Acc.ofFrac u >>> 3)
+      for _ in 0 .. 15 do out.Write(Acc.sat (u * v + v * p.d))
+      s.w <- Acc.hi (Acc.ofFrac u + v)
+    else
+      let q = Acc.sat (p.d * p.d)
+      let r = Acc.hi (Acc.ofFrac q >>> 2)
+      for _ in 0 .. 15 do out.Write(Acc.sat (q * r + r * p.a))
+      for _ in 0 .. 15 do out.Write(Acc.sat (k * j + q * k))
+      s.w <- Acc.hi (Acc.ofFrac r + j)
+
+  let kernel = Kernel.define "probe-branch-registers" <@ init @> <@ trig @> <@ render @>
+
 /// [<Unroll>]: four calls deep, a DO loop at each level, then an 8-tap loop: 14 system stack
 /// levels with the taps a DO loop, 12 with them written out.
 [<ReflectedDefinition>]
@@ -1508,6 +1594,14 @@ let tests =
       test "frames over the caller's dead locals: compiled program equals the .NET kernel" {
         needNative ()
         conformance Frames.kernel 52
+      }
+      test "register locals read in both branches of an if: compiled program equals the .NET kernel" {
+        needNative ()
+        conformance Branches.kernel 56
+      }
+      test "four Acc locals live across a loop body: compiled program equals the .NET kernel" {
+        needNative ()
+        conformance FourAcc.kernel 55
       }
       test "frames over the caller's dead locals: a chain of calls takes the words its live locals need" {
         match Optimize.compile Optimize.Peephole Kernel.mds Frames.kernel with
