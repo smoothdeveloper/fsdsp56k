@@ -107,9 +107,13 @@ let toFloat (w: int) = float (if w &&& 0x800000 <> 0 then w - 0x1000000 else w) 
 /// Where each step falls in the rendered samples.
 let markers (r: Report) =
   let mutable at = 0
+  let marked = r.steps |> List.exists (function Mark _ -> true | _ -> false)
   [ for s in r.steps do
       match s with
       | Render n -> at <- at + r.harness.target.blockWords * n
+      // a pattern labels its own steps; the raw changes would only crowd them
+      | Mark text -> yield at, text, (if text.Contains "TRIG" then "trig" else "set")
+      | _ when marked -> ()
       | Trig -> yield at, "TRIG", "trig"
       | Settings v ->
         let names = r.harness.parameterNames
@@ -150,6 +154,9 @@ let waveform (r: Report) =
     for b in 1 .. n / bw - 1 do
       sb.Append($"<line class=\"grid\" x1=\"{inv (x (bw * b))}\" x2=\"{inv (x (bw * b))}\" y1=\"{inv pad}\" y2=\"{inv (h - pad)}\"/>") |> ignore
   let marks = markers r
+  // a long pattern: bars get labels, trigs only their ticks
+  let crowded = (marks |> List.length) > 40
+  let marks = if crowded then marks |> List.map (fun (at, text, cls) -> at, (if cls = "trig" then "" else text), cls) else marks
   // labels go on the first row where they do not overlap an earlier one (about 6 units a character)
   let ends = Collections.Generic.List<float>()
   marks |> List.iter (fun (at, text, cls) ->
@@ -205,9 +212,16 @@ let detail (r: Report) =
   sb.Append("</svg>").ToString()
 
 /// RENDER cycles per call, the kernel's bars beside the reference's, with the host's limit.
+/// More calls than a chart has room for: each bar the worst of its neighbouring calls.
+let maxBars = 240
+
+let binned (xs: int64 array) =
+  if xs.Length <= maxBars then xs
+  else Array.init maxBars (fun c -> xs[c * xs.Length / maxBars .. max (c * xs.Length / maxBars) ((c + 1) * xs.Length / maxBars - 1)] |> Array.max)
+
 let cycles (r: Report) =
-  let ours = r.dsp.render |> List.toArray
-  let theirs = r.refRun |> Option.map (fun x -> x.render |> List.toArray) |> Option.defaultValue [||]
+  let ours = r.dsp.render |> List.toArray |> binned
+  let theirs = r.refRun |> Option.map (fun x -> x.render |> List.toArray |> binned) |> Option.defaultValue [||]
   let limit = r.harness.cycleLimit |> Option.map float |> Option.defaultValue infinity
   let declared = float r.program.declaredCycles
   let top = (Array.append ours theirs |> Array.fold max 0L |> float |> max (if Double.IsInfinity limit then 1.0 else limit)) * 1.08
@@ -237,8 +251,9 @@ let cycles (r: Report) =
     sb.Append($"<text class=\"limit-t\" x=\"{inv (w - 4.0)}\" y=\"{inv (y limit - 4.0)}\" text-anchor=\"end\">track limit {int limit}</text>") |> ignore
   if declared > 0.0 && declared <> limit then
     sb.Append($"<line class=\"declared\" x1=\"{inv padL}\" x2=\"{inv w}\" y1=\"{inv (y declared)}\" y2=\"{inv (y declared)}\"/>") |> ignore
+  let worstNote = if r.dsp.render.Length > maxBars then " (each bar the worst of its calls)" else ""
   sb.Append($"<text class=\"tick\" x=\"{inv padL}\" y=\"{inv (h - 4.0)}\">RENDER 1</text>") |> ignore
-  sb.Append($"<text class=\"tick\" x=\"{inv w}\" y=\"{inv (h - 4.0)}\" text-anchor=\"end\">RENDER {ours.Length}</text>") |> ignore
+  sb.Append($"<text class=\"tick\" x=\"{inv w}\" y=\"{inv (h - 4.0)}\" text-anchor=\"end\">RENDER {r.dsp.render.Length}{worstNote}</text>") |> ignore
   sb.Append("</svg>").ToString()
 
 /// Two horizontal bars, kernel and reference, for the summary table.
@@ -327,9 +342,32 @@ let scenario (r: Report) =
     | Init -> """<span class="chip">INIT</span>"""
     | Trig -> """<span class="chip trig">TRIG</span>"""
     | Render n -> $"""<span class="chip">RENDER ×{n}</span>"""
-  r.steps |> List.map chip |> String.concat """<span class="arrow">→</span>"""
+    | Mark text -> $"""<span class="chip trig">{enc text}</span>"""
+  let marked = r.steps |> List.exists (function Mark _ -> true | _ -> false)
+  let markCount = r.steps |> List.filter (function Mark _ -> true | _ -> false) |> List.length
+  r.steps
+  |> List.filter (fun s ->
+    match s with
+    | Mark text -> markCount <= 40 || text.StartsWith "bar "      // a long pattern: its bars (trigs are in the script)
+    | _ -> not marked)
+  |> List.map chip |> String.concat """<span class="arrow">→</span>"""
 
-let section (e: Entry) =
+/// A kernel's section; `media` is its files' folder relative to the page, when they were kept
+/// (Audio.save): the page then plays them and links the folder.
+let sectionWith (media: string option) (e: Entry) =
+  let players =
+    match media with
+    | None -> ""
+    | Some folder ->
+      let k = e.report.kernel
+      let file (suffix: string) = $"{folder}/{k}.{suffix}"
+      let reference =
+        if e.report.refRun.IsSome then $"""<label>reference <audio controls preload="none" src="{enc (file "reference.wav")}"></audio></label>""" else ""
+      $"""<div class="players"><label>kernel <audio controls preload="none" src="{enc (file "kernel.wav")}"></audio></label>{reference}
+<span class="files"><a href="{enc (file "script.txt")}">script</a> · <a href="{enc (file "labels.txt")}">Audacity labels</a> · <a href="{enc (file "kernel.asm56k")}">listing</a> · <a href="{enc folder}/">folder</a></span></div>"""
+  let gridNote =
+    if e.report.blocks <= 96 then $"; grid lines are blocks of {enc e.report.harness.target.blockText}"
+    else $" of {enc e.report.harness.target.blockText}; dashed lines are the pattern's bars and trigs"
   let r = e.report
   let id = slug r.kernel
   let correct = r.correctness.IsEmpty
@@ -361,9 +399,10 @@ let section (e: Entry) =
   <h3>Scenario</h3>
   <div class="chips">{scenario r}</div>
   <h3>Output</h3>
+  {players}
   <div class="legend"><span class="sw s-ours"></span>kernel, compiled{refOutLegend}<span class="sw diff"></span>differing words</div>
   {waveform r}
-  <div class="caption">All {r.blocks} blocks; grid lines are blocks of {enc r.harness.target.blockText}{(if r.harness.target.channels > 1 then ", words interleaved" else "")}. Below: the first {3 * bw} words after the first TRIG, word by word.</div>
+  <div class="caption">All {r.blocks} blocks{gridNote}{(if r.harness.target.channels > 1 then ", words interleaved" else "")}. Below: the first {3 * bw} words after the first TRIG, word by word.</div>
   {detail r}
   <h3>Cost</h3>
   <div class="cost-row">
@@ -452,6 +491,8 @@ td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
 .sw{display:inline-block;width:14px;height:8px;border-radius:2px;margin-right:4px;vertical-align:middle}
 .sw.s-ours,.sw.b-ours{background:var(--ours)} .sw.s-ref,.sw.b-ref{background:var(--ref)} .sw.diff,.sw.limit{background:var(--bad)}
 .caption{font-size:12px;color:var(--muted)}
+.players{display:flex;flex-wrap:wrap;gap:14px;align-items:center;font-size:12px;color:var(--muted);margin:4px 0 8px}
+.players label{display:flex;gap:6px;align-items:center} .players audio{height:30px}
 .cost-row{display:grid;grid-template-columns:1fr;gap:10px}
 @media (min-width:1000px){.cost-row{grid-template-columns:3fr 2fr;align-items:start}.cost-row .legend{grid-column:1 / -1}}
 .cost{font-size:14px}
@@ -498,10 +539,10 @@ document.querySelectorAll('.panes').forEach(function(panes){
 });
 """
 
-let lede = "Machines written in kernel F#, compiled to DSP56300 code and graded on the emulator. <b>Correctness</b>: the compiled program against the same F# run as .NET code. <b>Fidelity</b>: its output against the shipped machine the kernel was ported from. <b>Cost</b>: cycles and words against that machine. The compiler does no optimisation yet, so the cycle ratios measure what is left to win."
+let lede = "Machines written in kernel F#, compiled to DSP56300 code and graded on the emulator. <b>Correctness</b>: the compiled program against the same F# run as .NET code. <b>Fidelity</b>: its output against the shipped machine the kernel was ported from. <b>Cost</b>: cycles and words against that machine. The compiler's optimizer is still young: the cycle ratios measure what is left to win."
 
 /// The page with its own heading and introduction (HTML), for callers grading other references.
-let pageWith (heading: string) (introduction: string) (entries: Entry list) =
+let pageWithMedia (heading: string) (introduction: string) (media: Entry -> string option) (entries: Entry list) =
   let stamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm")
   $"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -510,8 +551,13 @@ let pageWith (heading: string) (introduction: string) (entries: Entry list) =
 <h1>{enc heading}</h1>
 <p class="lede">{introduction}</p>
 {summary entries}
-{entries |> List.map section |> String.concat "\n"}
+{entries |> List.map (fun e -> sectionWith (media e) e) |> String.concat "\n"}
 <footer>Generated {stamp} by fsdsp56k's Dsp56k.Kernel.Grade.</footer>
 </main><script>{script}</script></body></html>"""
+
+let pageWith (heading: string) (introduction: string) (entries: Entry list) =
+  pageWithMedia heading introduction (fun _ -> None) entries
+
+let section (e: Entry) = sectionWith None e
 
 let page (entries: Entry list) = pageWith "Kernel grades" lede entries

@@ -279,6 +279,20 @@ let helperMachine =
   { Mds.machine "org.fsdsp56k.probe-helper" "PROBE" "GND" "PH" with
       parameters = [| for n in [| "B0"; "B1"; "B2"; "A1"; "A2" |] -> Mds.param n Mds.UnipolarQ23 |] }
 
+/// Where the tests keep what they grade (untracked, emptied when the tests start: Main.fs).
+let keptRoot = repoRoot </> "out" </> "kernels" </> "tests"
+
+/// A graded kernel kept for listening in out/kernels/tests/<path>.
+let keepAt (path: string list) (r: Report) =
+  try Audio.save (System.IO.Path.Combine(Array.ofList (keptRoot :: path))) r.kernel r |> ignore
+  with _ -> ()        // a render that cannot be written does not fail the grade
+  r
+
+/// In out/kernels/tests/<group>/<kernel>.
+let keepIn (group: string list) (r: Report) = keepAt (group @ [ r.kernel ]) r
+
+let keep (r: Report) = keepIn [ "probes" ] r
+
 let conformanceWith (machine: Mds.Machine) (k: Kernel.Kernel) seed =
   let rng = Random(seed: int)
   let words () = Array.init machine.parameters.Length (fun _ -> if rng.Next 3 = 0 then [| 0; 0x7fffff; 0x800000; 0x400000 |][rng.Next 4] else rng.Next 0x1000000)
@@ -288,7 +302,7 @@ let conformanceWith (machine: Mds.Machine) (k: Kernel.Kernel) seed =
       for _ in 1 .. 100 do
         yield Words(words ())
         yield Render 1 ]
-  match grade k machine None { name = "random words"; steps = steps } with
+  match grade k machine None { name = "random words"; steps = steps } |> Result.map keep with
   | Error e -> failtest e
   | Ok r -> Expect.isEmpty r.correctness (text r)
 
@@ -300,12 +314,14 @@ let conformance (k: Kernel.Kernel) seed =
       for _ in 1 .. 200 do
         yield Words(randomWords rng)
         yield Render 1 ]
-  match grade k probeMachine None { name = "random words"; steps = steps } with
+  match grade k probeMachine None { name = "random words"; steps = steps } |> Result.map keep with
   | Error e -> failtest e
   | Ok r -> Expect.isEmpty r.correctness (text r)
 
+
 let tests =
   testList "kernels" [
+
     test "arithmetic intrinsics: compiled program equals the .NET kernel" {
       needNative ()
       conformance Probes.arithmeticKernel 1
@@ -367,6 +383,7 @@ let tests =
           match samples.kernels.Grading.run (fixture "") sample with
           | Error e -> failtest e
           | Ok { report = r } ->
+            keepAt ("samples" :: sample.group @ [ sample.folder ]) r |> ignore
             Expect.isEmpty r.correctness (text r)
             Expect.equal r.fidelity (Some None) (text r)
             // the optimizer's ground so far: regressions past it fail

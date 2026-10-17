@@ -112,6 +112,15 @@ The TX6 toms and hats are one engine each, parameterized by a `Voice` record the
 reads: LT's pitch glide (`if voice.glide`) and CY's bell layer (`match voice.layer with ...`)
 are decided when compiling, so each kernel contains only its own code.
 
+Everything a grade produces is under `out/kernels/` (untracked, and deleted at the start of the
+run that regenerates it): `report.html`, then one folder per machine, grouped by origin
+(`kitbasher/tx6/bd/`, `jmamma-mds/examples/sine/`, ...), each with the compiled
+kernel's output and the reference's as WAV files, the scenario script, an Audacity label track
+(File > Import > Labels...) and the compiled listing; the tests keep theirs in
+`out/kernels/tests/` (probes, samples). The scenarios play two bars at 120 BPM
+as a sequencer would (trigs, parameter locks), then sweep each control from its default and
+cover every pair of controls at low, default and high values.
+
 Each is word for word identical to the shipped machine on the emulator, and to the same F# run
 as .NET code. The page shows per kernel the verdicts, the output over the reference (SVG), the
 cycles of every call against the track limit, the costs, and three listings side by side: the F#

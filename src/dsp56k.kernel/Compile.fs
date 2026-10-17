@@ -1,7 +1,9 @@
 /// Kernel F# to DSL items, by direct translation: every expression is evaluated into A (an
 /// accumulator value) or X0 (a word), operands go through B, X0 and Y0, and anything that does
-/// not fit is spilled to X:(r6+n). Nothing is kept in registers across statements and no move is
-/// packed into a parallel slot: the output is correct and slow, and the grade says how slow.
+/// not fit is spilled to X:(r6+n). Across statements only locals stay in registers: Frac locals
+/// in X1/Y1, one Acc local read in a loop or a branch in B (when nothing else in its scope needs
+/// B). A loop splits in two on a condition it does not change. No move is packed into a parallel
+/// slot here: Optimize does that.
 ///
 /// What a kernel may contain: let / let mutable / <- on locals and state fields; `for _ in a .. b`
 /// with constant bounds (DO); `if` on comparisons of Frac or Acc values (CMP, Bcc); intrinsic
@@ -115,7 +117,8 @@ type Home =
   { space  : Space
     offset : int
     ty     : Ty
-    reg    : Reg option }   // a Frac local kept in X1 or Y1 instead of memory
+    reg    : Reg option     // a Frac local kept in X1 or Y1 instead of memory, an Acc local in B
+    bound  : float }        // an Acc local's largest magnitude (< 1: a1:a0 hold it, sign-extended)
 
 type Ctx =
   { target   : Target
@@ -139,7 +142,10 @@ type Ctx =
     mutable freeData : Reg list               // X1, Y1 when no local holds them
     scores   : Dictionary<Var, int>           // uses of each local, weighted by loop trip counts
     deadLocals : HashSet<Var>                 // register locals given back before their scope ended
-    tables   : ResizeArray<Table> }   // program tables, emitted after the code
+    tables   : ResizeArray<Table>     // program tables, emitted after the code
+    unswitched : HashSet<Var>         // loops (by index) already split on a condition
+    mutable bHeld  : bool             // an Acc local lives in B: nothing else may write it
+    mutable bWrite : bool }           // ...except the local's own updates
 
 /// A cursor's address register.
 and CursorReg =
@@ -148,7 +154,26 @@ and CursorReg =
     step   : int
     ring   : bool }
 
+/// An Acc local lives in B for its scope only if nothing else in the scope writes B: the scope
+/// is compiled with the local in B and compiled again with it in memory when something does.
+exception BTaken
+
+let writesB (it: Item) =
+  let isB (r: Reg) = Array.contains B (Lower.storage r)
+  match it with
+  | Op(Par(alu, moves)) ->
+    (alu |> Option.exists (fun a -> Lower.aluWrites a |> Array.exists isB))
+    || (moves |> Array.exists (fun m -> Lower.moveWrites m |> Array.exists isB))
+  | Op(IfCc(alu, _, _)) -> Lower.aluWrites alu |> Array.exists isB
+  | Op(AluImm(_, _, d)) | Op(ShiftImm(_, _, _, d)) | Op(ShiftReg(_, _, _, d)) | Op(MulImm(_, _, _, _, d))
+  | Op(MulSu(_, _, _, _, _, d)) | Op(MulI(_, _, _, _, d)) | Op(Div(_, d)) | Op(Norm(_, d)) | Op(Inc d) | Op(Dec d)
+  | Op(Clb(_, d)) | Op(Normf(_, d)) | Op(Merge(_, d)) | Op(Extract(_, _, _, d)) | Op(Insert(_, _, d))
+  | Op(Dmac(_, _, _, _, d)) -> d = dsp56k.Acc.B
+  | Op(Tcc(_, Some(_, d), _)) -> d = dsp56k.Acc.B
+  | _ -> false
+
 let emit (ctx: Ctx) (it: Item) =
+  if ctx.bHeld && not ctx.bWrite && writesB it then raise BTaken
   ctx.items.Add it
   ctx.lines.Add ctx.line
 
@@ -180,7 +205,7 @@ let fresh (ctx: Ctx) what =
   $"K_{what}_{ctx.labels}"
 
 let alloc (ctx: Ctx) ty =
-  let h = { space = Space.X; offset = ctx.next; ty = ty; reg = None }
+  let h = { space = Space.X; offset = ctx.next; ty = ty; reg = None; bound = infinity }
   ctx.next <- ctx.next + words ty
   if ctx.next > ctx.target.xLimit then fail $"{ctx.kernel.name}: locals and spills need more than {ctx.target.xLimit} X words"
   ctx.high <- max ctx.high ctx.next
@@ -194,7 +219,7 @@ let param (f: Field) : Mem = ym (disp r6 f.offset)
 let field (ctx: Ctx) (name: string) =
   ctx.layout.state |> Array.find (fun f -> f.name = name)
 
-let stateHome (f: Field) = { space = Space.Y; offset = f.offset; ty = f.ty; reg = None }
+let stateHome (f: Field) = { space = Space.Y; offset = f.offset; ty = f.ty; reg = None; bound = infinity }
 
 /// Intrinsics that read firmware memory or have effects: never evaluated at compile time (a
 /// resource's .NET words are a stand-in for the firmware's).
@@ -278,15 +303,31 @@ let rec normalize (e: Expr) : Expr =
   | ExprShape.ShapeLambda(v, body) -> Expr.Lambda(v, normalize body)
   | ExprShape.ShapeCombination(shape, xs) -> ExprShape.RebuildShapeCombination(shape, xs |> List.map normalize)
 
+/// Whether `e` (the helpers it calls included) may assign a record field named `name`.
+let writesField (name: string) (e: Expr) =
+  let seen = HashSet<MethodInfo>()
+  let rec go (e: Expr) =
+    match e with
+    | PropertySet(_, p, _, _) when p.Name = name -> true
+    | Call(None, mi, args) when (reflected mi).IsSome && intrinsic mi = None ->
+      List.exists go args || (seen.Add mi && go (reflected mi).Value)
+    | ExprShape.ShapeVar _ -> false
+    | ExprShape.ShapeLambda(_, b) -> go b
+    | ExprShape.ShapeCombination(_, xs) -> List.exists go xs
+  go e
+
 /// A call to a kernel helper: its parameters bound to the arguments.
 let inlined (mi: MethodInfo) (args: Expr list) =
   match reflected mi with
   | Some def ->
     let rec bind (body: Expr) (args: Expr list) =
       match body, args with
-      // a variable argument is substituted (the body cannot assign the caller's variable);
-      // anything else is bound, evaluated once
+      // a variable argument is substituted (the body cannot assign the caller's variable), and
+      // so is a record field the body does not assign (read where it is used, as the caller's
+      // own reads are); anything else is bound, evaluated once
       | Lambda(v, rest), (Var _ as a) :: more -> (bind rest more : Expr).Substitute(fun x -> if x = v then Some a else None)
+      | Lambda(v, rest), (PropertyGet(Some(Var _), p, []) as a) :: more when not (writesField p.Name rest) ->
+        (bind rest more : Expr).Substitute(fun x -> if x = v then Some a else None)
       | Lambda(v, rest), a :: more -> Expr.Let(v, a, bind rest more)
       | body, [] -> body
       | _ -> fail $"{mi.Name}: partial application is not supported"
@@ -319,6 +360,9 @@ let placeFactors (w1: Word) (w2: Word) =
   let ok (s, t) = multiplierPairs.Contains((s, t)) || multiplierPairs.Contains((t, s))
   let ordered (s, t) = if multiplierPairs.Contains((s, t)) then (s, t) else (t, s)
   match w1, w2 with
+  // a square: one register, both inputs
+  | WReg r, WReg r' when r = r' && (r = X0 || r = Y0) -> [], (r, r)
+  | _ when w1 = w2 -> loadWord w1 X0, (X0, X0)
   | WReg r1, WReg r2 when r1 <> r2 && ok (r1, r2) -> [], ordered (r1, r2)
   | WReg r, other | other, WReg r when other <> WReg r ->
     let partner = if ok (r, Y0) && other <> WReg Y0 then Y0 else X0
@@ -330,6 +374,12 @@ type AccLeaf =
   | AConst of int64
   | AOfWord of Word            // Acc.ofFrac
   | AOfLong of Mem * Mem       // Acc.ofLong of a Long in memory
+
+/// The two-operand Acc operations: A op B into A, or the flags of A - B.
+type BinOp =
+  | BAdd
+  | BSub
+  | BCmp
 
 let parts (acc: Reg) =
   match acc with
@@ -352,6 +402,7 @@ let loadAccConst (c: int64) (acc: Reg) =
 let loadAccLeaf (l: AccLeaf) (acc: Reg) =
   let e, _, lo = parts acc
   match l with
+  | AHome { reg = Some r } -> if r = acc then [||] else [| tfr r acc |]
   | AHome h -> [| move (at h 0) acc; move (at h 1) lo; move (at h 2) e |]
   | AConst c -> loadAccConst c acc
   | AOfWord w -> loadWord w acc |> List.toArray
@@ -359,6 +410,7 @@ let loadAccLeaf (l: AccLeaf) (acc: Reg) =
 
 let storeA (h: Home) =
   match h.ty with
+  | TAcc when h.reg.IsSome -> [| tfr a h.reg.Value |]
   | TAcc -> [| move a1 (at h 0); move a0 (at h 1); move a2 (at h 2) |]
   | TLong -> [| move a1 (at h 0); move a0 (at h 1) |]
   | TFrac -> fail "a Frac home takes a word, not an accumulator"
@@ -419,7 +471,7 @@ let rec wordLeaf (ctx: Ctx) (e: Expr) : Word option =
     | Call(None, mi, [ x ]) when (intrinsic mi = Some "acc.hi" || intrinsic mi = Some "acc.lo") && (accLeaf ctx x).IsSome ->
       let word = if intrinsic mi = Some "acc.hi" then 0 else 1
       match (accLeaf ctx x).Value with
-      | AHome h -> Some(WMem(at h word))
+      | AHome h when h.reg.IsNone -> Some(WMem(at h word))
       | AOfLong(hi, lo) -> Some(WMem(if word = 0 then hi else lo))
       | AOfWord w when word = 0 -> Some w
       | _ -> None
@@ -477,12 +529,142 @@ let tableLabel (t: Table) = "K_TBL_" + t.name.ToUpperInvariant().Replace("-", "_
 
 /// A local whose value can be read in place of the variable: a constant, a parameter, an
 /// immutable local.
-let substitutable (ctx: Ctx) (v: Var) (value: Expr) =
+/// How much a local is used, loops weighted by their trip counts.
+let score (ctx: Ctx) (w: Var) = match ctx.scores.TryGetValue w with | true, n -> n | _ -> 0
+
+/// Whether a loop or a branch in `e` reads `v`: where a value in memory is reloaded, as straight
+/// code does not.
+let rec acrossControl (v: Var) (e: Expr) =
+  match e with
+  | ForIntegerRangeLoop _ | IfThenElse _ when e.GetFreeVars() |> Seq.contains v -> true
+  | ExprShape.ShapeVar _ -> false
+  | ExprShape.ShapeLambda(_, b) -> acrossControl v b
+  | ExprShape.ShapeCombination(_, xs) -> List.exists (acrossControl v) xs
+
+/// Everything compiling a scope changes but the label counter, to compile it again.
+let snapshot (ctx: Ctx) =
+  let count = ctx.items.Count
+  let line, vars, consts, next, high, cursors, freeRegs, conts = ctx.line, ctx.vars, ctx.consts, ctx.next, ctx.high, ctx.cursors, ctx.freeRegs, ctx.conts
+  let released, deadLocals = List.ofSeq ctx.released, List.ofSeq ctx.deadLocals
+  let trackHome, indexed, counters, freeData, tables = ctx.trackHome, ctx.indexed, ctx.counters, ctx.freeData, ctx.tables.Count
+  let bHeld, bWrite = ctx.bHeld, ctx.bWrite
+  fun () ->
+    ctx.items.RemoveRange(count, ctx.items.Count - count)
+    ctx.lines.RemoveRange(count, ctx.lines.Count - count)
+    ctx.tables.RemoveRange(tables, ctx.tables.Count - tables)
+    ctx.line <- line; ctx.vars <- vars; ctx.consts <- consts; ctx.next <- next; ctx.high <- high
+    ctx.cursors <- cursors; ctx.freeRegs <- freeRegs; ctx.conts <- conts
+    ctx.released.Clear(); ctx.released.UnionWith released
+    ctx.deadLocals.Clear(); ctx.deadLocals.UnionWith deadLocals
+    ctx.trackHome <- trackHome; ctx.indexed <- indexed; ctx.counters <- counters; ctx.freeData <- freeData
+    ctx.bHeld <- bHeld; ctx.bWrite <- bWrite
+
+/// A condition in a loop's body (at its top level, not in a branch or an inner loop) that the
+/// loop does not change: it reads parameters, constants, locals bound outside the loop and not
+/// assigned in it, and state the loop does not write.
+let invariantIf (ctx: Ctx) (index: Var) (body: Expr) =
+  let assigned = HashSet<Var>()
+  let rec sets (e: Expr) =
+    match e with
+    | VarSet(w, x) -> assigned.Add w |> ignore; sets x
+    | ExprShape.ShapeVar _ -> ()
+    | ExprShape.ShapeLambda(_, b) -> sets b
+    | ExprShape.ShapeCombination(_, xs) -> List.iter sets xs
+  sets body
+  let rec pure' (c: Expr) =
+    match c with
+    | Var w -> w <> index && not (assigned.Contains w) && (ctx.vars.ContainsKey w || ctx.consts.ContainsKey w)
+    | Value _ -> true
+    | PropertyGet(Some(Var p), _, []) when p.Type = ctx.kernel.paramsType -> true
+    | PropertyGet(Some(Var s), f, []) when s.Type = ctx.kernel.stateType -> not (writesField f.Name body)
+    | PropertyGet(None, _, []) -> true
+    | Call(None, mi, args) ->
+      let mi' = resolve mi args
+      let ok =
+        match intrinsic mi' with
+        | Some n -> not (n.StartsWith "cursor.") && n <> "out.write" && n <> "out.pair"
+        | None -> owner mi' = operators || isConst mi' || mi'.DeclaringType = typeof<Frac> || mi'.DeclaringType = typeof<Acc>
+      ok && List.forall pure' args
+    | _ -> false
+  let rec find (e: Expr) =
+    match e with
+    | IfThenElse(c, _, _) when (tryConst ctx c).IsNone && pure' c -> Some c
+    | Sequential(a, b) -> find a |> Option.orElse (find b)
+    | Let(_, _, b) -> find b
+    | _ -> None
+  find body
+
+/// The body with the first invariant condition (as found above) decided.
+let rec decide (ctx: Ctx) (cond: Expr) (taken: bool) (e: Expr) =
+  match e with
+  | IfThenElse(c, t, f) when obj.ReferenceEquals(c, cond) -> if taken then t else f
+  | Sequential(a, b) ->
+    let a' = decide ctx cond taken a
+    if obj.ReferenceEquals(a', a) then Expr.Sequential(a, decide ctx cond taken b) else Expr.Sequential(a', b)
+  | Let(v, x, b) -> Expr.Let(v, x, decide ctx cond taken b)
+  | _ -> e
+
+let substitutable (ctx: Ctx) (v: Var) (value: Expr) (body: Expr) =
   not v.IsMutable
   && (match value with
       | Var w -> not w.IsMutable && ctx.vars.ContainsKey w
-      | PropertyGet(Some(Var p), _, []) -> p.Type = ctx.kernel.paramsType
+      | PropertyGet(Some(Var p), _, []) when p.Type = ctx.kernel.paramsType -> true
+      // a state word the scope does not assign
+      | PropertyGet(Some(Var s), f, []) when s.Type = ctx.kernel.stateType ->
+        (field ctx f.Name).ty = TFrac && not (writesField f.Name body)
       | _ -> (tryConst ctx value).IsSome)
+
+/// A multiplication the multiplier does in one instruction: the accumulated value (if any), the
+/// factors, the kind and whether the product is negated.
+let mulForm (e: Expr) =
+  match e with
+  | Intr "acc.add" [l; Intr "frac.mul" [x; y]] -> Some(Some l, x, y, (MulKind.Mac, false))
+  | Intr "acc.add" [Intr "frac.mul" [x; y]; r] -> Some(Some r, x, y, (MulKind.Mac, false))
+  | Intr "acc.sub" [l; Intr "frac.mul" [x; y]] -> Some(Some l, x, y, (MulKind.Mac, true))
+  | Intr "acc.neg" [Intr "frac.mul" [x; y]] -> Some(None, x, y, (MulKind.Mpy, true))
+  | Intr "acc.rnd" [Intr "frac.mul" [x; y]] -> Some(None, x, y, (MulKind.Mpyr, false))
+  | Intr "acc.rnd" [Intr "acc.mac" [l; x; y]] -> Some(Some l, x, y, (MulKind.Macr, false))
+  | Intr "acc.rnd" [Intr "acc.add" [l; Intr "frac.mul" [x; y]]] -> Some(Some l, x, y, (MulKind.Macr, false))
+  | Intr "acc.rnd" [Intr "acc.add" [Intr "frac.mul" [x; y]; r]] -> Some(Some r, x, y, (MulKind.Macr, false))
+  | Intr "acc.rnd" [Intr "acc.sub" [l; Intr "frac.mul" [x; y]]] -> Some(Some l, x, y, (MulKind.Macr, true))
+  | Intr "frac.mul" [x; y] -> Some(None, x, y, (MulKind.Mpy, false))
+  | Intr "acc.mac" [acc; x; y] -> Some(Some acc, x, y, (MulKind.Mac, false))
+  | _ -> None
+
+/// The largest magnitude an Acc expression can have, from what it is made of (infinity: not
+/// known). Below 1, the value is a sign-extended 48-bit a1:a0 and can be added as an X or Y pair.
+let rec accBound (ctx: Ctx) (e: Expr) : float =
+  match tryConst ctx e with
+  | Some(:? Acc as c) -> abs (float c.Raw) / 140737488355328.0
+  | _ ->
+    match e with
+    | Var v when ctx.vars.ContainsKey v -> ctx.vars[v].bound
+    | Intr "acc.ofFrac" [_] | Intr "acc.ofLong" [_] | Intr "frac.mul" [_; _] -> 1.0
+    | Intr "acc.add" [l; r] | Intr "acc.sub" [l; r] -> accBound ctx l + accBound ctx r
+    | Intr "acc.addFrac" [l; _] | Intr "acc.subFrac" [l; _] | Intr "acc.mac" [l; _; _] -> accBound ctx l + 1.0
+    | Intr "acc.neg" [x] -> accBound ctx x
+    | Intr "acc.asr" [x; n] ->
+      match tryConst ctx n with
+      | Some(:? int as n) -> accBound ctx x / Math.Pow(2.0, float n)
+      | _ -> infinity
+    | _ -> infinity
+
+/// The X or Y pair no local holds: (high, low, pair).
+let freePair (ctx: Ctx) =
+  if List.contains X1 ctx.freeData then Some(X1, X0, X)
+  elif List.contains Y1 ctx.freeData then Some(Y1, Y0, Y)
+  else None
+
+/// A fixed Acc that fits 48 bits (added as a register pair) leaves B to a local its scope
+/// carries around a loop or across a branch.
+let yields (ctx: Ctx) (v: Var) (value: Expr) (body: Expr) =
+  let rec carried (e: Expr) =
+    match e with
+    | Let(w, _, b) when w.IsMutable && w.Type = typeof<Acc> && acrossControl w b -> true
+    | ExprShape.ShapeVar _ -> false
+    | ExprShape.ShapeLambda(_, b) -> carried b
+    | ExprShape.ShapeCombination(_, xs) -> List.exists carried xs
+  not v.IsMutable && accBound ctx value < 1.0 && carried body
 
 let rec genAcc (ctx: Ctx) (e: Expr) : unit =
   match accLeaf ctx e with
@@ -498,17 +680,11 @@ let rec genAcc (ctx: Ctx) (e: Expr) : unit =
       match intrinsic mi, args with
       | Some "acc.ofFrac", [f] -> genWord ctx f; emit ctx (move x0 a)
       | Some "acc.ofLong", [l] -> genLong ctx l
-      | Some "acc.add", [l; Intr "frac.mul" [x; y]] -> mulInto ctx (Some l) x y (MulKind.Mac, false)
-      | Some "acc.add", [Intr "frac.mul" [x; y]; r] -> mulInto ctx (Some r) x y (MulKind.Mac, false)
-      | Some "acc.sub", [l; Intr "frac.mul" [x; y]] -> mulInto ctx (Some l) x y (MulKind.Mac, true)
-      | Some "acc.neg", [Intr "frac.mul" [x; y]] -> mulInto ctx None x y (MulKind.Mpy, true)
-      | Some "acc.add", [l; r] -> binAcc ctx l r (add b a)
-      | Some "acc.sub", [l; r] -> binAcc ctx l r (sub b a)
-      | Some "acc.rnd", [Intr "frac.mul" [x; y]] -> mulInto ctx None x y (MulKind.Mpyr, false)
-      | Some "acc.rnd", [Intr "acc.mac" [l; x; y]] -> mulInto ctx (Some l) x y (MulKind.Macr, false)
-      | Some "acc.rnd", [Intr "acc.add" [l; Intr "frac.mul" [x; y]]] -> mulInto ctx (Some l) x y (MulKind.Macr, false)
-      | Some "acc.rnd", [Intr "acc.add" [Intr "frac.mul" [x; y]; r]] -> mulInto ctx (Some r) x y (MulKind.Macr, false)
-      | Some "acc.rnd", [Intr "acc.sub" [l; Intr "frac.mul" [x; y]]] -> mulInto ctx (Some l) x y (MulKind.Macr, true)
+      | _ when (mulForm e).IsSome ->
+        let acc, x, y, kind = (mulForm e).Value
+        mulInto ctx acc x y kind dsp56k.Acc.A
+      | Some "acc.add", [l; r] -> binAcc ctx l r BAdd
+      | Some "acc.sub", [l; r] -> binAcc ctx l r BSub
       | Some "acc.rnd", [x] -> genAcc ctx x; emit ctx (rnd a)
       | Some "acc.divide", [x; d] ->
         let w = (operands ctx [ d ])[0]
@@ -532,40 +708,67 @@ let rec genAcc (ctx: Ctx) (e: Expr) : unit =
         let m = constInt ctx "andHi's mask" m
         genAcc ctx x
         emit ctx (and' (immL (m &&& 0xffffff)) a)
-      | Some "frac.mul", [x; y] -> mulInto ctx None x y (MulKind.Mpy, false)
-      | Some "acc.mac", [acc; x; y] -> mulInto ctx (Some acc) x y (MulKind.Mac, false)
       | Some n, _ -> fail $"{n} does not give an Acc"
       | None, _ -> genAcc ctx (inlined mi args)
     | _ -> fail $"not a kernel Acc expression: {e}"
 
-/// A multiplication: the factors in X0 and Y0, the accumulated value (if any) in A.
-and mulInto (ctx: Ctx) (acc: Expr option) (x: Expr) (y: Expr) (kind: MulKind, negate: bool) =
+/// A multiplication: the factors in X0 and Y0, the accumulated value (if any) in A. Into B only
+/// for the local B holds, accumulating onto itself (`acc` None or that local).
+and mulInto (ctx: Ctx) (acc: Expr option) (x: Expr) (y: Expr) (kind: MulKind, negate: bool) (dst: dsp56k.Acc) =
   let xs = operands ctx [ x; y ]
-  acc |> Option.iter (genAcc ctx)
+  if dst = dsp56k.Acc.A then acc |> Option.iter (genAcc ctx)
+  let product (it: Item) =
+    ctx.bWrite <- dst = dsp56k.Acc.B
+    emit ctx it
+    ctx.bWrite <- false
   match xs with
   | [| WImm v; w |] | [| w; WImm v |] when (match w with WImm _ -> false | _ -> true) ->
     // a constant factor rides in the instruction: mpyi/maci #c,s,a
     let r, loads = match w with WReg r -> r, [] | _ -> X0, loadWord w X0
     emitAll ctx loads
-    emit ctx (Op(MulI(kind, negate, immL v, r, dsp56k.Acc.A)))
+    product (Op(MulI(kind, negate, immL v, r, dst)))
   | _ ->
     let loads, (s, t) = placeFactors xs[0] xs[1]
     emitAll ctx loads
-    emit ctx (alu (Mul(kind, negate, s, t, dsp56k.Acc.A)))
+    product (alu (Mul(kind, negate, s, t, dst)))
 
-/// l op r with l in A and r in B.
-and binAcc (ctx: Ctx) (l: Expr) (r: Expr) (op: Item) =
+/// l op r with l in A and r in B. While B holds a local, a word operand is used as it is
+/// (sign-extended, as in B) and an operation on the local itself is turned around.
+and binAcc (ctx: Ctx) (l: Expr) (r: Expr) (op: BinOp) =
+  let item (s: Reg) = match op with BAdd -> add s a | BSub -> sub s a | BCmp -> cmp s a
+  let held (x: Expr) = match accLeaf ctx x with Some(AHome { reg = Some _ }) -> true | _ -> false
   match accLeaf ctx r with
-  | Some rl ->
+  | Some(AOfWord w) when ctx.bHeld ->
+    genAcc ctx l
+    match w with
+    | WReg s -> emit ctx (item s)
+    | _ ->
+      emitAll ctx (loadWord w x0)
+      emit ctx (item x0)
+  // B holds a local: an Acc that fits 48 bits added as an X or Y pair
+  | Some(AHome h) when ctx.bHeld && h.reg.IsNone && h.bound < 1.0 && op <> BCmp && (freePair ctx).IsSome ->
+    genAcc ctx l
+    let hi, lo, pair = (freePair ctx).Value
+    emit ctx (move (at h 0) hi)
+    emit ctx (move (at h 1) lo)
+    emit ctx (match op with BSub -> sub pair a | _ -> add pair a)
+  | Some rl when not (held l) || held r ->
     genAcc ctx l
     emitAll ctx (loadAccLeaf rl B)
-  | None ->
+    emit ctx (item b)
+  | _ when held l ->
+    genAcc ctx r
+    match op with
+    | BAdd -> emit ctx (add b a)
+    | BSub -> emit ctx (sub b a); emit ctx (neg a)
+    | BCmp -> emit ctx (cmp a b)
+  | _ ->
     genAcc ctx r
     let t = alloc ctx TAcc
     emitAll ctx (storeA t)
     genAcc ctx l
     emitAll ctx (loadAccLeaf (AHome t) B)
-  emit ctx op
+    emit ctx (item b)
 
 /// l op f with l in A and f in X0.
 and binAccWord (ctx: Ctx) (l: Expr) (f: Expr) (op: Reg -> Item) =
@@ -616,9 +819,9 @@ and genWord (ctx: Ctx) (e: Expr) : unit =
     | Call(None, mi, args) ->
       let mi = resolve mi args
       match intrinsic mi, args with
-      | Some "acc.hi", [x] -> genAcc ctx x; emit ctx (move a1 x0)
-      | Some "acc.lo", [x] -> genAcc ctx x; emit ctx (move a0 x0)
-      | Some "acc.sat", [x] -> genAcc ctx x; emit ctx (move a x0)
+      | Some "acc.hi", [x] -> emit ctx (move (accPart ctx x 1) x0)
+      | Some "acc.lo", [x] -> emit ctx (move (accPart ctx x 0) x0)
+      | Some "acc.sat", [x] -> emit ctx (move (accPart ctx x 2) x0)
       | Some "table.read", [t; i] -> tableRead ctx t i 1 0 x0
       | Some "table.row", [t; w; i; c] -> tableRead ctx t i (constInt ctx "a table width" w) (constInt ctx "a table column" c) x0
       | Some "region.address", [r] ->
@@ -764,6 +967,7 @@ and store (ctx: Ctx) (h: Home) (e: Expr) =
   match h.ty with
   | TFrac when h.reg.IsSome -> storeWordReg ctx e h.reg.Value
   | TFrac -> storeWord ctx e (at h 0)
+  | TAcc when h.reg.IsSome -> storeHeld ctx h.reg.Value e
   | TAcc -> genAcc ctx e; emitAll ctx (storeA h)
   | TLong ->
     match e with
@@ -772,6 +976,50 @@ and store (ctx: Ctx) (h: Home) (e: Expr) =
     emitAll ctx (storeA h)
   | TArray _ -> fail "an array state field is written element by element, s.field[k] <- v"
   | TOther t -> fail $"{t.Name} values cannot be stored"
+
+/// A value into the accumulator holding a local: multiplications onto the local and words added
+/// to it done there, anything else computed in A and copied.
+and storeHeld (ctx: Ctx) (r: Reg) (e: Expr) =
+  let self (x: Expr) = match accLeaf ctx x with Some(AHome { reg = Some q }) -> q = r | _ -> false
+  let dst = if r = B then dsp56k.Acc.B else dsp56k.Acc.A
+  let onto (it: Item) =
+    ctx.bWrite <- true
+    emit ctx it
+    ctx.bWrite <- false
+  match mulForm e with
+  | Some(acc, x, y, kind) when (match acc with None -> true | Some l -> self l) -> mulInto ctx acc x y kind dst
+  | _ ->
+    let word op l f =
+      match accLeaf ctx f with
+      | Some(AOfWord w) when self l ->
+        match w with
+        | WReg s -> onto (op s r)
+        | _ ->
+          emitAll ctx (loadWord w x0)
+          onto (op x0 r)
+        true
+      | _ -> false
+    // an Acc added to the local: a fitting one as a pair, anything else computed in A
+    let acc op l f =
+      self l && not (self f) &&
+      match accLeaf ctx f, freePair ctx with
+      | Some(AHome h), Some(hi, lo, pair) when h.reg.IsNone && h.bound < 1.0 ->
+        emit ctx (move (at h 0) hi)
+        emit ctx (move (at h 1) lo)
+        onto (op pair r)
+        true
+      | _ ->
+        genAcc ctx f
+        onto (op a r)
+        true
+    let done' =
+      match e with
+      | Intr "acc.add" [l; f] -> word add l f || word add f l || acc add l f || acc add f l
+      | Intr "acc.sub" [l; f] -> word sub l f || acc sub l f
+      | _ -> false
+    if not done' then
+      genAcc ctx e
+      onto (tfr a r)
 
 /// A Frac into a memory word: an accumulator stored directly when it is one.
 and storeWord (ctx: Ctx) (e: Expr) (dst: Mem) =
@@ -783,9 +1031,9 @@ and storeWord (ctx: Ctx) (e: Expr) (dst: Mem) =
       emitAll ctx (loadWord w x0)
       emit ctx (move x0 dst)
     | None -> ()
-  | Call(None, mi, [x]) when intrinsic (resolve mi [x]) = Some "acc.sat" -> genAcc ctx x; emit ctx (move a dst)
-  | Call(None, mi, [x]) when intrinsic (resolve mi [x]) = Some "acc.hi" -> genAcc ctx x; emit ctx (move a1 dst)
-  | Call(None, mi, [x]) when intrinsic (resolve mi [x]) = Some "acc.lo" -> genAcc ctx x; emit ctx (move a0 dst)
+  | Call(None, mi, [x]) when intrinsic (resolve mi [x]) = Some "acc.sat" -> emit ctx (move (accPart ctx x 2) dst)
+  | Call(None, mi, [x]) when intrinsic (resolve mi [x]) = Some "acc.hi" -> emit ctx (move (accPart ctx x 1) dst)
+  | Call(None, mi, [x]) when intrinsic (resolve mi [x]) = Some "acc.lo" -> emit ctx (move (accPart ctx x 0) dst)
   | _ ->
     match wordLeaf ctx e with
     | Some(WReg r) -> emit ctx (move r dst)
@@ -793,13 +1041,31 @@ and storeWord (ctx: Ctx) (e: Expr) (dst: Mem) =
       genWord ctx e
       emit ctx (move x0 dst)
 
+/// Where an Acc's word is read from once it is computed: a0 (0), a1 (1) or a limited (2), of A
+/// or of the accumulator holding a local.
+and accPart (ctx: Ctx) (x: Expr) (part: int) =
+  let acc =
+    match accLeaf ctx x with
+    | Some(AHome { reg = Some r }) -> r
+    | _ ->
+      genAcc ctx x
+      A
+  let e, hi, lo = parts acc
+  ignore e
+  match part with
+  | 0 -> lo
+  | 1 -> hi
+  | _ -> acc
+
 /// A Frac into a data register.
 and storeWordReg (ctx: Ctx) (e: Expr) (dst: Reg) =
   match e with
   | _ when (wordLeaf ctx e).IsSome -> emitAll ctx (loadWord (wordLeaf ctx e).Value dst)
-  | Intr "acc.sat" [x] -> genAcc ctx x; emit ctx (move a dst)
-  | Intr "acc.hi" [x] -> genAcc ctx x; emit ctx (move a1 dst)
-  | Intr "acc.lo" [x] -> genAcc ctx x; emit ctx (move a0 dst)
+  | Call(Some(Var c), mi, []) when ctx.cursors.ContainsKey c && (intrinsic mi = Some "cursor.next" || intrinsic mi = Some "cursor.peek") ->
+    emit ctx (move (cursorMem ctx.cursors[c] (intrinsic mi = Some "cursor.next")) dst)
+  | Intr "acc.sat" [x] -> emit ctx (move (accPart ctx x 2) dst)
+  | Intr "acc.hi" [x] -> emit ctx (move (accPart ctx x 1) dst)
+  | Intr "acc.lo" [x] -> emit ctx (move (accPart ctx x 0) dst)
   | _ ->
     match wordLeaf ctx e with
     | Some w -> emitAll ctx (loadWord w dst)
@@ -825,19 +1091,40 @@ and withLet (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> un
     ctx.consts <- ctx.consts.Add(v, c)
     body ()
     ctx.consts <- saved
-  | _ when substitutable ctx v value ->
+  | _ when substitutable ctx v value bodyExpr ->
     let saved = ctx.vars
     match value with
     | Var w -> ctx.vars <- ctx.vars.Add(v, ctx.vars[w]); body (); ctx.vars <- saved
-    | PropertyGet(Some(Var _), p, []) ->
-      let f = ctx.layout.parameters |> Array.find (fun f -> f.name = p.Name)
-      ctx.vars <- ctx.vars.Add(v, { space = Space.Y; offset = f.offset; ty = TFrac; reg = None })
+    | PropertyGet(Some(Var s), p, []) ->
+      let f =
+        if s.Type = ctx.kernel.stateType then field ctx p.Name
+        else ctx.layout.parameters |> Array.find (fun f -> f.name = p.Name)
+      ctx.vars <- ctx.vars.Add(v, { space = Space.Y; offset = f.offset; ty = TFrac; reg = None; bound = infinity })
       body ()
       ctx.vars <- saved
     | _ -> fail "unreachable"
-  | _ ->
+  | _ when tyOf v.Type = TAcc && not ctx.bHeld && score ctx v >= 2 && acrossControl v bodyExpr
+         && not (yields ctx v value bodyExpr) ->
+    // in B for its scope, unless something there needs B
+    let restore = snapshot ctx
+    try
+      let h = { space = Space.X; offset = -1; ty = TAcc; reg = Some B; bound = infinity }
+      store ctx h value
+      ctx.bHeld <- true
+      let saved = ctx.vars
+      ctx.vars <- ctx.vars.Add(v, h)
+      body ()
+      ctx.vars <- saved
+      ctx.bHeld <- false
+    with BTaken ->
+      restore ()
+      inMemory ctx v value bodyExpr body
+  | _ -> inMemory ctx v value bodyExpr body
+
+/// A local in a register (X1 or Y1 for a Frac used enough) or in X words.
+and inMemory (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> unit) =
     let mark = ctx.next
-    let score w = match ctx.scores.TryGetValue w with | true, n -> n | _ -> 0
+    let score = score ctx
     // a Frac local takes X1 or Y1 when it is used enough, and the locals bound inside its scope
     // that are used more still find one free
     // registers of locals no code still to run reads come back (a let's scope runs to the end
@@ -868,7 +1155,8 @@ and withLet (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> un
       eprintfn $"let {v.Name} score {score v} rivals {rivalsOf v bodyExpr |> List.filter (fun w -> score w > score v) |> List.map (fun w -> w.Name)} free {ctx.freeData} held {holders} -> {register}"
     let h =
       match register with
-      | Some r -> { space = Space.X; offset = -1; ty = TFrac; reg = Some r }
+      | Some r -> { space = Space.X; offset = -1; ty = TFrac; reg = Some r; bound = infinity }
+      | None when tyOf v.Type = TAcc && not v.IsMutable -> { alloc ctx TAcc with bound = accBound ctx value }
       | None -> alloc ctx (tyOf v.Type)
     let afterHome = ctx.next
     store ctx h value
@@ -919,6 +1207,12 @@ and genStmt (ctx: Ctx) (e: Expr) : unit =
   | StateElement ctx (m, [ value ]) -> storeWord ctx value m
   | PropertySet(Some(Var p), f, _, _) when p.Type = ctx.kernel.paramsType ->
     fail $"parameter {f.Name} is read-only"
+  | ForIntegerRangeLoop(v, lo, hi, body) when not (ctx.unswitched.Contains v) && (invariantIf ctx v body).IsSome ->
+    // a condition the loop does not change, tested once: a copy of the loop for each outcome
+    ctx.unswitched.Add v |> ignore
+    let c = (invariantIf ctx v body).Value
+    let loop taken = Expr.ForIntegerRangeLoop(v, lo, hi, decide ctx c taken body)
+    genStmt ctx (Expr.IfThenElse(c, loop true, loop false))
   | ForIntegerRangeLoop(v, lo, hi, body) ->
     let lo = constInt ctx "a loop bound" lo
     let hi = constInt ctx "a loop bound" hi
@@ -1029,8 +1323,8 @@ and branchUnless (ctx: Ctx) (cond: Expr) (target: string) =
     else fail $"comparisons are on Frac or Acc values, not {x.Type.Name}"
   match cond with
   | Call(None, mi, [l; r]) when owner mi = operators ->
-    let unless =
-      match mi.Name with
+    let unless name =
+      match name with
       | "op_LessThan" -> Cond.Ge
       | "op_LessThanOrEqual" -> Cond.Gt
       | "op_GreaterThan" -> Cond.Le
@@ -1038,8 +1332,31 @@ and branchUnless (ctx: Ctx) (cond: Expr) (target: string) =
       | "op_Equality" -> Cond.Ne
       | "op_Inequality" -> Cond.Eq
       | n -> fail $"conditions are comparisons, not {n}"
-    binAcc ctx (asAcc l) (asAcc r) (cmp b a)
-    emit ctx (bcc unless target)
+    let swapped name =
+      match name with
+      | "op_LessThan" -> "op_GreaterThan"
+      | "op_LessThanOrEqual" -> "op_GreaterThanOrEqual"
+      | "op_GreaterThan" -> "op_LessThan"
+      | "op_GreaterThanOrEqual" -> "op_LessThanOrEqual"
+      | n -> n
+    let zero (x: Expr) = match tryConst ctx x with Some(:? Acc as v) -> v.Raw = 0L | _ -> false
+    // against zero: tst, on the local in B where it is one
+    let test (x: Expr) =
+      match accLeaf ctx x with
+      | Some(AHome { reg = Some r }) -> emit ctx (tst r)
+      | _ ->
+        genAcc ctx x
+        emit ctx (tst a)
+    let l, r = asAcc l, asAcc r
+    if zero r then
+      test l
+      emit ctx (bcc (unless mi.Name) target)
+    elif zero l then
+      test r
+      emit ctx (bcc (unless (swapped mi.Name)) target)
+    else
+      binAcc ctx l r BCmp
+      emit ctx (bcc (unless mi.Name) target)
   | _ -> fail $"conditions are comparisons of two values (no &&, || or not yet): {cond}"
 
 // ---------------------------------------------------------------------------------------------
@@ -1144,7 +1461,8 @@ let compile (target: Target) (k: Kernel) : Result<Compiled, string> =
       { target = target; kernel = k; layout = layout target k; items = ResizeArray(); lines = ResizeArray(); line = 0
         vars = Map.empty; consts = Map.empty; next = 0; high = 0; labels = 0
         cursors = Map.empty; freeRegs = [ 1; 2; 3; 4; 5 ]; tables = ResizeArray(); conts = []; released = Collections.Generic.HashSet(); trackHome = None
-        indexed = Map.empty; counters = Map.empty; freeData = [ X1; Y1 ]; scores = Dictionary(); deadLocals = HashSet() }
+        indexed = Map.empty; counters = Map.empty; freeData = [ X1; Y1 ]; scores = Dictionary(); deadLocals = HashSet()
+        unswitched = HashSet(); bHeld = false; bWrite = false }
     entry ctx "INIT" k.init
     entry ctx "TRIG" k.trig
     entry ctx "RENDER" k.render

@@ -8,6 +8,7 @@
   <ItemGroup>
     <Compile Include="Grade.fs" />
     <Compile Include="Html.fs" />
+    <Compile Include="Audio.fs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../dsp56k/dsp56k.fsproj" />

@@ -2,9 +2,11 @@
 ///
 /// - value numbering inside straight-line code: a move whose destination already holds the
 ///   value is dropped (a reload just stored, an Acc local's three words reloaded into the
-///   unchanged accumulator, a store of what the word holds), and a load whose value a data
-///   register holds becomes a register move (which can then be packed);
+///   unchanged accumulator, a store of what the word holds, a tfr between equal accumulators),
+///   and a load whose value a data register holds becomes a register move (which can then be
+///   packed);
 /// - dead stores to the compiler's temporaries: words of the X workset no instruction reads;
+/// - loads of workset words a DO loop does not write moved before the loop;
 /// - packing moves into the parallel slots of neighbouring instructions (Lower.pack).
 ///
 /// Labels, branches, loops and anything not modelled end what is known.
@@ -118,7 +120,22 @@ let applyMoves (f: Facts) (alu: Alu option) (moves: Move array) =
       // only long immediates and zero: a short one lands in the MSBs of a data register
       | Imm(op, _) when op.force = Long || immValue op = Some 0L -> immValue op |> Option.map f.Const
       | _ -> None)
+  // tfr between the accumulators copies all three parts
+  let copied =
+    match alu with
+    | Some(Binary(AluOp.Tfr, ((A | B) as s), d)) ->
+      let e, h, l = (if s = A then (A2, A1, A0) else (B2, B1, B0))
+      Some(Acc.reg d, f.Id(SReg e), f.Id(SReg h), f.Id(SReg l), f.Loaded s)
+    | _ -> None
   alu |> Option.iter (fun a -> for w in Lower.aluWrites a do f.WriteReg w)
+  match copied with
+  | Some(d, e, h, l, loaded) ->
+    let e', h', l' = (if d = A then (A2, A1, A0) else (B2, B1, B0))
+    f.Set(SReg e', e)
+    f.Set(SReg h', h)
+    f.Set(SReg l', l)
+    loaded |> Option.iter (fun v -> f.SetLoaded(d, v))
+  | None -> ()
   moves |> Array.iteri (fun i m ->
     match m with
     | Load(space, ea, dst) ->
@@ -139,7 +156,8 @@ let applyMoves (f: Facts) (alu: Alu option) (moves: Move array) =
         match reads[i] with
         | Some v -> f.Set(slot, v)
         | None -> f.Forget slot            // a limited accumulator: unknown word
-      | None -> f.ForgetSpace space        // a word elsewhere, maybe a state array element
+      // the output block (r7) is not the workset; any other word may be a state array element
+      | None -> match ea with PostInc 7 -> () | _ -> f.ForgetSpace space
     | Copy(_, dst) | Imm(_, dst) ->
       f.WriteReg dst
       match dst, reads[i] with
@@ -164,7 +182,10 @@ let aluWrites (instr: Instr) =
 
 /// Value numbering over straight-line stretches: moves that change nothing are dropped, loads
 /// of a value a data register holds become register moves.
-let forward (items: (Item * int) array) =
+/// `accCopies`: an accumulator loaded from a word a data register holds is copied from the
+/// register instead (done last: earlier, the register's read would keep copyForward from
+/// removing the register's own load).
+let forwardWith (accCopies: bool) (items: (Item * int) array) =
   let f = Facts()
   let out = ResizeArray<Item * int>()
   let mutable i = 0
@@ -212,7 +233,18 @@ let forward (items: (Item * int) array) =
           | None, [| Load(space, ea, ((A | B) as acc)) |] ->
             match workset space ea |> Option.bind f.Get, f.Loaded acc with
             | Some v, Some w when v = w -> None
+            | Some v, _ ->
+              // the word is in a data register: copied from there (sign-extended, a0 cleared, as loaded)
+              match f.Holder(v, acc) with
+              | Some r when accCopies && Lower.encodes (Par(None, [| Copy(r, acc) |])) -> Some(Op(Par(None, [| Copy(r, acc) |])))
+              | _ -> Some it
             | _ -> Some it
+          | Some(Binary(AluOp.Tfr, ((A | B) as src), dst)), _ when Acc.reg dst <> src ->
+            let three r = (if r = A then [ A2; A1; A0 ] else [ B2; B1; B0 ]) |> List.map (fun p -> f.Get(SReg p))
+            let s, d = three src, three (Acc.reg dst)
+            if List.forall Option.isSome s && s = d then
+              (if moves.Length = 0 then None else Some(Op(Par(None, moves))))
+            else Some it
           | None, [| Copy(src, dst) |] when isWord src && isWord dst ->
             match f.Get(SReg src), f.Get(SReg dst) with
             | Some v, Some w when v = w -> None
@@ -236,6 +268,8 @@ let forward (items: (Item * int) array) =
         out.Add(it, line)
         i <- i + 1
   out.ToArray()
+
+let forward = forwardWith false
 
 /// Successors of each item: the next one, branch targets, a DO loop's last instruction back to
 /// the loop's first. None when the program jumps somewhere this cannot follow.
@@ -394,7 +428,87 @@ let deadTempsGlobal (temps: int) (items: (Item * int) array) =
       | _ -> true
     | _ -> true)
 
-/// Lower.pack with each item's source line kept (a merged instruction takes the first's).
+/// Loads into a data register of a workset word a DO loop does not write, where nothing else in
+/// the loop writes the register and the straight code before the load does not read it: done
+/// once, before the loop (a parameter, a state word only read there).
+let hoist (items: (Item * int) array) =
+  let control (instr: Instr) =
+    match instr with
+    | Branch _ | Jump _ | Loop _ | Rep _ | Enddo -> true
+    | _ -> false
+  let overlaps (r: Reg) (ws: Reg array) = ws |> Array.exists (fun w -> Lower.storage w |> Array.exists (fun x -> Array.contains x (Lower.storage r)))
+  let once (its: (Item * int) array) =
+    let candidate (i: int) (e: int) (k: int) =
+      match fst its[k] with
+      | Op(Par(None, [| Load(space, ea, dst) |])) when (dst = X0 || dst = X1 || dst = Y0 || dst = Y1) ->
+        match workset space ea with
+        | Some(SMem(_, w)) ->
+          // every pass reaches the load: what comes before it branches only forward to it or
+          // short of it, and does not read the register
+          let inside (t: Operand) =
+            match t.expr with
+            | Sym l -> its |> Array.tryFindIndex (fun (x, _) -> x = Label l) |> Option.exists (fun at -> at > i && at <= k)
+            | _ -> false
+          let before =
+            [ i + 1 .. k - 1 ] |> List.forall (fun j ->
+              match fst its[j] with
+              | Comment _ | Label _ -> true
+              | Op(Branch((Bcc _ | Bra), t)) -> inside t
+              | Op instr when not (control instr) ->
+                match readsOf instr with
+                | Some rs -> not (overlaps dst rs)
+                | None -> false
+              | _ -> false)
+          let others =
+            [ i + 1 .. e - 1 ] |> List.forall (fun j ->
+              j = k ||
+              match fst its[j] with
+              | Op instr ->
+                let stores =
+                  match instr with
+                  | Par(_, moves) ->
+                    moves |> Array.forall (fun m ->
+                      match m with
+                      | Store(_, sp, ea') when sp = space ->
+                        match workset sp ea', ea' with
+                        | Some(SMem(_, w')), _ -> w' <> w
+                        | None, PostInc 7 -> true
+                        | _ -> false
+                      | _ -> true)
+                  | _ -> true
+                match writesOf instr with
+                | Some ws -> stores && not (overlaps dst ws) && not (Array.contains (R 6) ws)
+                | None -> control instr
+              | _ -> true)
+          before && others
+        | _ -> false
+      | _ -> false
+    its |> Array.indexed |> Array.tryPick (fun (i, (it, _)) ->
+      match it with
+      | Op(Loop(_, _, { expr = Sym name })) ->
+        match its |> Array.tryFindIndex (fun (x, _) -> x = Label name) with
+        | Some e when e > i ->
+          [ i + 1 .. e - 1 ] |> List.tryFind (candidate i e) |> Option.map (fun k ->
+            // before the loop's label and relocation marker
+            let mutable p = i
+            if p > 0 && fst its[p - 1] = machinedrum.Abi.relocateMarker then p <- p - 1
+            if p > 0 && (match fst its[p - 1] with Label l -> l.EndsWith "_DO" | _ -> false) then p <- p - 1
+            k, p)
+        | _ -> None
+      | _ -> None)
+  let mutable cur = items
+  let mutable go = true
+  while go do
+    match once cur with
+    | Some(k, p) ->
+      let moved = cur[k]
+      let rest = cur |> Array.removeAt k
+      cur <- rest |> Array.insertAt p moved
+    | None -> go <- false
+  cur
+
+/// Lower.pack with each item's source line kept (a merged instruction takes the first's), across
+/// the comments quoting the F# (they follow the merged instruction).
 let pack (items: (Item * int) array) =
   let mutable cur = items
   let mutable changed = true
@@ -403,19 +517,89 @@ let pack (items: (Item * int) array) =
     let out = ResizeArray<Item * int>()
     let mutable i = 0
     while i < cur.Length do
-      if i + 1 < cur.Length then
-        match Lower.pack [| fst cur[i]; fst cur[i + 1] |] with
-        | [| merged |] ->
-          out.Add(merged, (if snd cur[i] > 0 then snd cur[i] else snd cur[i + 1]))
-          changed <- true
-          i <- i + 2
-        | _ ->
-          out.Add cur[i]
-          i <- i + 1
-      else
+      let mutable j = i + 1
+      while j < cur.Length && (match fst cur[j] with Comment _ -> true | _ -> false) do j <- j + 1
+      let merged =
+        match fst cur[i] with
+        | Op _ when j < cur.Length ->
+          match Lower.pack [| fst cur[i]; fst cur[j] |] with
+          | [| merged |] -> Some merged
+          | _ -> None
+        | _ -> None
+      match merged with
+      | Some m ->
+        out.Add(m, (if snd cur[i] > 0 then snd cur[i] else snd cur[j]))
+        for k in i + 1 .. j - 1 do out.Add cur[k]
+        changed <- true
+        i <- j + 1
+      | None ->
         out.Add cur[i]
         i <- i + 1
     cur <- out.ToArray()
+  cur
+
+/// Whether nothing reads `r` after item `from` before it is written, following the straight code
+/// (an rts ends it; a branch or a loop gives up).
+let deadOnExit (items: (Item * int) array) (from: int) (r: Reg) =
+  let touches (rs: Reg array) = rs |> Array.exists (fun x -> Lower.storage x |> Array.exists (fun y -> Array.contains y (Lower.storage r)))
+  let rec go k =
+    if k >= items.Length then true
+    else
+      match fst items[k] with
+      | Comment _ | Label _ -> go (k + 1)
+      | Op Rts -> true
+      | Op instr ->
+        match readsOf instr, writesOf instr with
+        | Some rs, Some ws -> if touches rs then false elif touches ws then true else go (k + 1)
+        | _ -> false
+      | _ -> false
+  go from
+
+/// Software pipelining, one stage: a DO loop whose body starts with a load through a
+/// post-incremented address register, and ends with an instruction that load packs into, does the
+/// load at the end of each pass, for the next one (nothing runs in between), and once before the
+/// loop for the first. The last pass loads one word more, so the loaded register and the address
+/// register must be dead after the loop.
+let rotate (items: (Item * int) array) =
+  let isOp (it: Item) = match it with Op _ -> true | _ -> false
+  let once (its: (Item * int) array) =
+    its |> Array.indexed |> Array.tryPick (fun (i, (it, _)) ->
+      match it with
+      | Op(Loop(_, _, { expr = Sym name })) ->
+        match its |> Array.tryFindIndex (fun (x, _) -> x = Label name) with
+        | Some e when e > i ->
+          let first = [ i + 1 .. e - 1 ] |> List.tryFind (fun k -> match fst its[k] with Comment _ -> false | _ -> true)
+          let last = [ e - 1 .. -1 .. i + 1 ] |> List.tryFind (fun k -> match fst its[k] with Comment _ -> false | _ -> true)
+          match first, last with
+          | Some f, Some l when f < l && isOp (fst its[l]) ->
+            match fst its[f], fst its[l] with
+            | Op(Par(None, [| Load(_, ((PostInc r | PostIncN r)), dst) |])) as load, (Op _ as tail)
+                when r <> 6 && r <> 7 && (dst = X0 || dst = X1 || dst = Y0 || dst = Y1)
+                     && deadOnExit its (e + 1) dst && deadOnExit its (e + 1) (R r) ->
+              // the load joins the tail (an X and a Y move: either order of the two moves)
+              match Lower.pack [| tail; load |], tail, load with
+              | [| merged |], _, _ -> Some(i, f, l, load, merged)
+              | _, Op(Par(None, [| m |])), Op(Par(None, [| m' |])) when Lower.encodes (Par(None, [| m'; m |])) ->
+                Some(i, f, l, load, Op(Par(None, [| m'; m |])))
+              | _ -> None
+            | _ -> None
+          | _ -> None
+        | _ -> None
+      | _ -> None)
+  let mutable cur = items
+  let mutable go = true
+  while go do
+    match once cur with
+    | Some(i, f, l, load, merged) ->
+      let line = snd cur[f]
+      let body = cur |> Array.mapi (fun k x -> if k = l then (merged, snd x) else x)
+      let body = body |> Array.removeAt f
+      // before the loop's label and relocation marker
+      let mutable p = i
+      if p > 0 && fst body[p - 1] = machinedrum.Abi.relocateMarker then p <- p - 1
+      if p > 0 && (match fst body[p - 1] with Label n -> n.EndsWith "_DO" | _ -> false) then p <- p - 1
+      cur <- body |> Array.insertAt p (load, line)
+    | None -> go <- false
   cur
 
 /// A DO loop's last instruction cannot be a branch target: a NOP where a pass left a label (or
@@ -449,7 +633,10 @@ let run (level: Level) (temps: int) (items: Item array) (lines: int array) =
     let mutable cur = Array.zip items lines
     for _ in 1 .. 3 do
       cur <- cur |> forward |> copyForward |> deadTemps temps
-    cur <- pack cur |> fixLoops
+    for _ in 1 .. 2 do
+      cur <- cur |> forwardWith true |> copyForward |> deadTemps temps
+    cur <- hoist cur
+    cur <- pack cur |> rotate |> pack |> fixLoops
     Array.map fst cur, Array.map snd cur
 
 /// Compile, then run the passes of `level` over the items.

@@ -25,10 +25,141 @@ type Step =
   | Init
   | Trig
   | Render of blocks: int
+  | Mark of string               // a label for the timeline (a sequencer step); does nothing
 
 type Scenario =
   { name  : string
     steps : Step list }
+
+/// Frames per second of the harnesses' audio.
+let sampleRate = 44100
+
+/// One bar of a 16-step pattern: the parameter values it plays with (Settings or Words), and its
+/// trigs: a step (0..15) and the parameter locks of that trig (parameter index, value), which
+/// last until the next step as a sequencer's locks do.
+type Bar =
+  { values : Step
+    trigs  : (int * (int * float) list) list }
+
+/// Bars as a sequencer plays them at `bpm`, sixteen steps a bar.
+type Pattern =
+  { name  : string
+    bpm   : float
+    names : string array      // parameter names, for the timeline's labels
+    bars  : Bar list }
+
+/// The scenario a pattern makes on a target rendering `blockFrames` frames a call: INIT, then each
+/// step's changes and trig at the block boundary nearest the step's time, RENDER blocks between.
+let play (blockFrames: int) (p: Pattern) =
+  let framesPerStep = float sampleRate * 60.0 / p.bpm / 4.0
+  let blockOf (step: int) = int (System.Math.Round(float step * framesPerStep / float blockFrames))
+  let locked (values: Step) (locks: (int * float) list) =
+    let pick i x = locks |> List.tryFind (fst >> (=) i) |> Option.map snd |> Option.defaultValue x
+    match values with
+    | Settings v -> Settings(Array.mapi pick v)
+    | Words w -> Words(Array.mapi (fun i x -> int (pick i (float x))) w)
+    | other -> other
+  let name i = if i < p.names.Length then p.names[i] else string i
+  let describe (locks: (int * float) list) =
+    locks |> List.map (fun (i, v) -> $"{name i} {v}") |> String.concat ", "
+  // (step, what happens there)
+  let events =
+    [ for b, bar in List.indexed p.bars do
+        let first = b * 16
+        yield first, [ Mark $"bar {b + 1}"; bar.values ]
+        for step, locks in bar.trigs |> List.sortBy fst do
+          let g = first + step
+          let label = $"{b + 1}.{step / 4 + 1}.{step % 4 + 1} TRIG" + (if locks.IsEmpty then "" else $" ({describe locks})")
+          yield g, [ Mark label; (if locks.IsEmpty then bar.values else locked bar.values locks); Trig ]
+          // a lock lasts its step
+          if not locks.IsEmpty && not (bar.trigs |> List.exists (fun (s, _) -> s = step + 1)) && step + 1 < 16 then
+            yield g + 1, [ bar.values ] ]
+    |> List.groupBy fst |> List.map (fun (g, xs) -> g, List.collect snd xs) |> List.sortBy fst
+  let total = blockOf (16 * p.bars.Length)
+  let steps =
+    [ match p.bars with
+      | bar :: _ -> yield bar.values
+      | [] -> ()
+      yield Init
+      let mutable at = 0
+      for g, changes in events do
+        let block = blockOf g
+        if block > at then
+          yield Render(block - at)
+          at <- block
+        yield! changes
+      if total > at then yield Render(total - at) ]
+  { name = $"{p.name} ({p.bars.Length} bars at {p.bpm} BPM)"; steps = steps }
+
+/// A control as a sweep sees it: its range and its default.
+type Control =
+  { name     : string
+    low      : float
+    high     : float
+    standard : float }
+
+/// `n` values spread over a control's range, ends included (whole numbers when the range is).
+let spread (c: Control) (n: int) =
+  [ for k in 0 .. n - 1 ->
+      System.Math.Round(c.low + (c.high - c.low) * float k / float (max 1 (n - 1))) ]
+  |> List.distinct
+
+/// From the defaults, one bar per control: `n` trigs two steps apart, each locking that control
+/// to the next of `n` values over its range.
+let sweeps (controls: Control array) (n: int) (values: float array -> Step) =
+  let defaults = controls |> Array.map _.standard
+  [ for i, c in Array.indexed controls ->
+      { values = values defaults
+        trigs = spread c n |> List.truncate 8 |> List.mapi (fun k v -> 2 * k, [ i, v ]) } ]
+
+/// Rows of control levels (low, default, high) in which every pair of controls meets in every
+/// pair of levels: a pairwise covering set, built greedily (each row takes the levels that cover
+/// the most pairs not yet seen), far fewer rows than every combination.
+let pairwiseRows (controls: Control array) =
+  let levels = controls |> Array.map (fun c -> [ c.low; c.standard; c.high ] |> List.distinct |> List.toArray)
+  let n = controls.Length
+  let uncovered = System.Collections.Generic.HashSet<int * int * int * int>()
+  for i in 0 .. n - 1 do
+    for j in i + 1 .. n - 1 do
+      for a in 0 .. levels[i].Length - 1 do
+        for b in 0 .. levels[j].Length - 1 do
+          uncovered.Add((i, a, j, b)) |> ignore
+  let rows = ResizeArray<int array>()
+  while uncovered.Count > 0 do
+    let row = Array.create n -1
+    // start from a pair still uncovered
+    let i, a, j, b = Seq.head uncovered
+    row[i] <- a
+    row[j] <- b
+    for k in 0 .. n - 1 do
+      if row[k] < 0 then
+        let gain l =
+          [ for m in 0 .. n - 1 do
+              if row[m] >= 0 then
+                let key = if k < m then (k, l, m, row[m]) else (m, row[m], k, l)
+                if uncovered.Contains key then yield 1 ] |> List.sum
+        row[k] <- [ 0 .. levels[k].Length - 1 ] |> List.maxBy gain
+    for x in 0 .. n - 1 do
+      for y in x + 1 .. n - 1 do
+        uncovered.Remove((x, row[x], y, row[y])) |> ignore
+    rows.Add row
+  [ for row in rows -> row |> Array.mapi (fun k l -> levels[k][l]) ]
+
+/// The pairwise rows as bars: a trig every two steps, its locks the row's values.
+let pairwise (controls: Control array) (values: float array -> Step) =
+  let defaults = controls |> Array.map _.standard
+  pairwiseRows controls
+  |> List.chunkBySize 8
+  |> List.map (fun rows ->
+    { values = values defaults
+      trigs = rows |> List.mapi (fun k row -> 2 * k, [ for i, v in Array.indexed row -> i, v ]) })
+
+/// A pattern's musical bars, then every control swept, then the pairwise combinations.
+let exhaustive (controls: Control array) (values: float array -> Step) (p: Pattern) =
+  { p with
+      name = $"{p.name}; then each control swept from its default, then pairwise combinations"
+      names = controls |> Array.map _.name
+      bars = p.bars @ sweeps controls 8 values @ pairwise controls values }
 
 /// What one execution produced, per RENDER block, and the cycles of each call.
 type Run =
@@ -142,6 +273,7 @@ let runNet (h: Harness) (k: Kernel.Kernel) (scenario: Scenario) =
     match step with
     | Settings s -> host.SetParameters(h.settings s)
     | Words w -> host.SetParameters w
+    | Mark _ -> ()
     | Init -> host.Init()
     | Trig -> host.Trig()
     | Render n ->
@@ -163,6 +295,7 @@ let run (h: Harness) (p: Program) (stateWords: int) (scenario: Scenario) =
     match step with
     | Settings s -> session.SetParameters(h.settings s)
     | Words w -> session.SetParameters w
+    | Mark _ -> ()
     | Init -> inits.Add(session.Init())
     | Trig -> trigs.Add(session.Trig())
     | Render n ->
