@@ -82,7 +82,21 @@ locals worth it (uses weighted by loop trip counts) live in X1/Y1, multiplicatio
 factors around them, and constant factors ride in MPYI/MACI. State records hold `Frac`, `Long` (two words), `Acc` (three: kept exact,
 extension byte included) and fixed-length `[<Length n>] Frac array` fields read and written
 with constant indices or the loop's index (`s.h[i + 1]`, `Frac.ofRaw i`); helpers may take the
-parameter and state records. Beyond arithmetic, kernels use cursors (an address register walking a
+parameter and state records. State lives in Y from the target's `stateBase`; fields marked
+`[<XMemory>]` (`[<XMemory; Length 32>] mutable residuals : Frac array`) live in X from X:(r6+0),
+in the order declared, and the compiler's locals follow them in X (then in the Y words after the
+state, when the X state fills the workset). A loop stepping an X array and a Y array gives them
+registers of both banks, so their loads share an XY move. `Host.Instance.StateWords` and the
+grade compare the Y state words, then the X ones. An index computed at run time is a word
+passed through `Frac.index` (`s.h[Frac.index k]`, `s.h[Frac.index d + 32]`, X or Y), and
+`Region.read`/`Region.write` index a region the same way: n0 holds the index (plus the array's
+offset), r0 the workset or the region, and the access is (r0+n0), linear, as the TX8 machines'
+residual writes. On .NET an index outside the array fails; on the DSP it reaches another word. Cursors also
+walk state arrays: `Cursor.linearIn s.h start step` and `Cursor.ringIn s.h start step`, the
+latter with modulo addressing (M = n - 1) as TX8-CY's six-word Y ring (`lua (r6+$10),r4`,
+`movec #5,m4`, `move #3,n4`); `Up`, `Down`, `PutUp` and `PutDown` move one word either way
+whatever the step. A ring must start on a multiple of the power of two at or above its length
+(the compiler says so otherwise), and only on the Machinedrum, whose r6 is 64-word aligned. Beyond arithmetic, kernels use cursors (an address register walking a
 region, linear or modulo, with a step), firmware resources (the sine ROM, the input and
 main-output rings and their position words, the shared temporary memory), tables placed in
 program memory, MPYR/MACR, and an LFSR step.

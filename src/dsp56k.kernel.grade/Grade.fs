@@ -285,8 +285,9 @@ let runNet (h: Harness) (k: Kernel.Kernel) (scenario: Scenario) =
         states.Add(host.StateWords())
   { outputs = outputs.ToArray(); states = states.ToArray(); init = []; trig = []; render = [] })
 
-/// A program on the emulator; `stateWords` Y words from Y:(r6+stateBase) are read after each block.
-let run (h: Harness) (p: Program) (stateWords: int) (scenario: Scenario) =
+/// A program on the emulator; `stateWords` Y words from Y:(r6+stateBase), then `xStateWords` X
+/// words from X:(r6+0) (the [<XMemory>] state), are read after each block.
+let runStates (h: Harness) (p: Program) (stateWords: int) (xStateWords: int) (scenario: Scenario) =
   use session = p.start ()
   let emu = session.Emulator
   let outputs, states = ResizeArray(), ResizeArray()
@@ -303,9 +304,14 @@ let run (h: Harness) (p: Program) (stateWords: int) (scenario: Scenario) =
         let words, cycles = session.Render()
         outputs.Add words
         renders.Add cycles
-        states.Add [| for k in 0 .. stateWords - 1 -> emu.Read(Native.Space.Y, session.Workset + h.target.stateBase + k) |]
+        states.Add
+          [| for k in 0 .. stateWords - 1 -> emu.Read(Native.Space.Y, session.Workset + h.target.stateBase + k)
+             for k in 0 .. xStateWords - 1 -> emu.Read(Native.Space.X, session.Workset + k) |]
   { outputs = outputs.ToArray(); states = states.ToArray()
     init = List.ofSeq inits; trig = List.ofSeq trigs; render = List.ofSeq renders }
+
+/// A program on the emulator; `stateWords` Y words from Y:(r6+stateBase) are read after each block.
+let run (h: Harness) (p: Program) (stateWords: int) (scenario: Scenario) = runStates h p stateWords 0 scenario
 
 // ---------------------------------------------------------------------------------------------
 // The MDS harness: packages loaded the way the Machinedrum loader does it.
@@ -327,7 +333,7 @@ let build (machine: Mds.Machine) (compiled: Compile.Compiled) =
           patches = Abi.patches compiled.items
           initSymbol = "INIT"; trigSymbol = "TRIG"; renderSymbol = "RENDER"
           xWorkset = compiled.xWorkset
-          yWorkset = compiled.layout.yWorkset }
+          yWorkset = compiled.yWorkset }
     match Mds.pack m words r.symbols None with
     | Error e -> Error $"%A{e}"
     | Ok bytes ->
@@ -477,7 +483,7 @@ let firmware (target: Kernel.Target) (map: FirmwareMap) =
     load = fun compiled ->
       place map compiled
       |> Result.map (fun (words, (init, trig, render)) ->
-        { name = compiled.kernel.name; programWords = words.Length; xWorkset = compiled.xWorkset; yWorkset = compiled.layout.yWorkset
+        { name = compiled.kernel.name; programWords = words.Length; xWorkset = compiled.xWorkset; yWorkset = compiled.yWorkset
           declaredCycles = 0; items = compiled.items
           start = fun () -> firmwareSession target map (fun emu -> emu.Load(Native.Space.P, map.kernelBase, words)) (Some init, Some trig, render) }) }
 
@@ -600,7 +606,7 @@ let gradeWith (h: Harness) (k: Kernel.Kernel) (reference: Program option) (scena
     try
       let stateWords = compiled.layout.yWorkset - target.stateBase
       let net = runNet h k scenario
-      let dsp = run h program stateWords scenario
+      let dsp = runStates h program stateWords compiled.layout.xWorkset scenario
       let correctness = [ compare "output" net.outputs dsp.outputs; compare "state" net.states dsp.states ] |> List.choose id
       let refRun = reference |> Option.map (fun r -> run h r 0 scenario)
       let shapes =

@@ -1,6 +1,7 @@
 /// A machine written in kernel F#: three functions of a [<ReflectedDefinition>] module, over a
 /// parameter record (Frac fields, Y:(r6+1) on) and a state record (Frac and Long fields, the
-/// persistent workset), the render also writing frames to an Output.
+/// persistent workset: Y:(r6+stateBase) on, and X:(r6+0) on for fields marked [<XMemory>]),
+/// the render also writing frames to an Output.
 ///
 ///   let init   (p: Params) (s: State) = ...
 ///   let trig   (p: Params) (s: State) = ...
@@ -51,7 +52,7 @@ type Target =
     maxParams   : int
     stateBase   : int        // Y:(r6+stateBase) the first state word
     yLimit      : int        // Y workset words
-    xLimit      : int }      // X workset words (the compiler's locals and spills)
+    xLimit      : int }      // X workset words ([<XMemory>] state, then the compiler's locals and spills)
 
   /// The words one RENDER writes.
   member t.blockWords = t.frames * t.channels
@@ -89,6 +90,11 @@ let hostTargets = hosts |> List.map (fun h -> h.target)
 /// The host whose target this is, if any.
 let hostOf (t: Target) = hosts |> List.tryFind (fun h -> h.target.name = t.name)
 
+/// What r6 is a multiple of under the target's host, for modulo addressing over state: the Machinedrum
+/// renders track t with r6 = 0x800 + 0x40 t; under no other host is a
+/// ring over state known to be aligned.
+let worksetAlignment (t: Target) = match hostOf t with Some KernelHost.Machinedrum -> 0x40 | None -> 1
+
 type Ty =
   | TFrac
   | TLong
@@ -115,12 +121,21 @@ let words ty =
 type Field =
   { name   : string
     ty     : Ty
-    offset : int }      // from r6
+    offset : int        // from r6
+    bank   : Bank }     // YMemory, or XMemory for [<XMemory>] state
 
 type Layout =
   { parameters : Field array
-    state      : Field array
-    yWorkset   : int }  // Y words declared: Y+0 up to the last state word
+    state      : Field array    // Y state, Y:(r6+stateBase) on
+    yWorkset   : int            // Y words declared: Y+0 up to the last state word
+    xState     : Field array    // [<XMemory>] state, X:(r6+0) on
+    xWorkset   : int }          // X words the state takes: the compiler's locals start there
+
+  /// A state field, in Y or X.
+  member l.field (name: string) =
+    match l.state |> Array.tryFind (fun f -> f.name = name) with
+    | Some f -> f
+    | None -> l.xState |> Array.find (fun f -> f.name = name)
 
 let layout (target: Target) (k: Kernel) =
   let ps = FSharpType.GetRecordFields k.paramsType
@@ -128,9 +143,11 @@ let layout (target: Target) (k: Kernel) =
   let parameters =
     ps |> Array.mapi (fun i p ->
       if tyOf p.PropertyType <> TFrac then fail $"{k.name}: parameter {p.Name} must be a Frac"
-      { name = p.Name; ty = TFrac; offset = target.paramBase + i })
+      { name = p.Name; ty = TFrac; offset = target.paramBase + i; bank = YMemory })
+  // Y fields from stateBase and X fields from X+0, each in the order declared
   let mutable at = target.stateBase
-  let state =
+  let mutable xAt = 0
+  let fields =
     [| for p in (if k.stateType = typeof<unit> then [||] else FSharpType.GetRecordFields k.stateType) do
          let ty =
            if p.PropertyType = typeof<Frac array> then
@@ -141,7 +158,13 @@ let layout (target: Target) (k: Kernel) =
          match ty with
          | TFrac | TLong | TAcc | TArray _ -> ()
          | _ -> fail $"{k.name}: state field {p.Name} must be a Frac, a Long, an Acc or a [<Length n>] Frac array"
-         { name = p.Name; ty = ty; offset = at }
-         at <- at + words ty |]
+         if p.GetCustomAttributes(typeof<XMemoryAttribute>, true).Length > 0 then
+           { name = p.Name; ty = ty; offset = xAt; bank = XMemory }
+           xAt <- xAt + words ty
+         else
+           { name = p.Name; ty = ty; offset = at; bank = YMemory }
+           at <- at + words ty |]
   if at > target.yLimit then fail $"{k.name}: the state needs Y+{at - 1}, the target has {target.yLimit} words"
-  { parameters = parameters; state = state; yWorkset = at }
+  if xAt > target.xLimit then fail $"{k.name}: the [<XMemory>] state needs X+{xAt - 1}, the target has {target.xLimit} words"
+  { parameters = parameters; state = fields |> Array.filter (fun f -> f.bank = YMemory); yWorkset = at
+    xState = fields |> Array.filter (fun f -> f.bank = XMemory); xWorkset = xAt }

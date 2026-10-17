@@ -1,6 +1,7 @@
 /// Kernel F# to DSL items, by direct translation: every expression is evaluated into A (an
 /// accumulator value) or X0 (a word), operands go through B, X0 and Y0, and anything that does
-/// not fit is spilled to X:(r6+n). Across statements only locals stay in registers: Frac locals
+/// not fit is spilled to X:(r6+n), after the [<XMemory>] state words (and, once the X workset is
+/// full, to the Y words after the state). Across statements only locals stay in registers: Frac locals
 /// in X1/Y1, one Acc local read in a loop or a branch in B (when nothing else in its scope needs
 /// B). A loop splits in two on a condition it does not change. No move is packed into a parallel
 /// slot here: Optimize does that.
@@ -129,8 +130,9 @@ type Ctx =
     mutable line   : int
     mutable vars   : Map<Var, Home>
     mutable consts : Map<Var, obj>
-    mutable next   : int        // first free X word
-    mutable high   : int        // X words used
+    mutable next   : int        // first free local word: X+0 .. are the [<XMemory>] state, words
+                                // from xLimit on are Y words after the Y state (alloc)
+    mutable high   : int        // local words used, the X state's included
     mutable labels : int
     mutable cursors : Map<Var, CursorReg>
     mutable freeRegs : int list       // address registers for cursors (r0 is the table index)
@@ -150,9 +152,10 @@ type Ctx =
 /// A cursor's address register.
 and CursorReg =
   { reg    : int
-    region : Region
+    region : Region       // a state array's: its name and bank
     step   : int
-    ring   : bool }
+    ring   : bool
+    state  : int option } // over a state array: the array's offset from r6
 
 /// An Acc local lives in B for its scope only if nothing else in the scope writes B: the scope
 /// is compiled with the local in B and compiled again with it in memory when something does.
@@ -204,10 +207,20 @@ let fresh (ctx: Ctx) what =
   ctx.labels <- ctx.labels + 1
   $"K_{what}_{ctx.labels}"
 
+/// A local's words. Locals are a stack of words in X after the [<XMemory>] state; past the X
+/// workset (a kernel whose X state leaves too little), they go on in Y after the Y state, the
+/// words from xLimit on standing for Y:(r6+yWorkset) on. A home does not straddle the two.
 let alloc (ctx: Ctx) ty =
-  let h = { space = Space.X; offset = ctx.next; ty = ty; reg = None; bound = infinity }
-  ctx.next <- ctx.next + words ty
-  if ctx.next > ctx.target.xLimit then fail $"{ctx.kernel.name}: locals and spills need more than {ctx.target.xLimit} X words"
+  let n = words ty
+  let x = ctx.target.xLimit
+  if ctx.next < x && ctx.next + n > x then ctx.next <- x
+  let h =
+    if ctx.next < x then { space = Space.X; offset = ctx.next; ty = ty; reg = None; bound = infinity }
+    else { space = Space.Y; offset = ctx.layout.yWorkset + ctx.next - x; ty = ty; reg = None; bound = infinity }
+  ctx.next <- ctx.next + n
+  if ctx.next > x && ctx.layout.yWorkset + ctx.next - x > ctx.target.yLimit then
+    let state = if ctx.layout.xWorkset = 0 then "" else $"the [<XMemory>] state ({ctx.layout.xWorkset} words), "
+    fail $"{ctx.kernel.name}: {state}locals and spills need more than {x} X words and the Y words after the state (Y+{ctx.layout.yWorkset} to Y+{ctx.target.yLimit - 1})"
   ctx.high <- max ctx.high ctx.next
   h
 
@@ -216,17 +229,20 @@ let at (h: Home) k : Mem = { space = h.space; ea = disp r6 (h.offset + k) }
 
 let param (f: Field) : Mem = ym (disp r6 f.offset)
 
-let field (ctx: Ctx) (name: string) =
-  ctx.layout.state |> Array.find (fun f -> f.name = name)
+let field (ctx: Ctx) (name: string) = ctx.layout.field name
 
-let stateHome (f: Field) = { space = Space.Y; offset = f.offset; ty = f.ty; reg = None; bound = infinity }
+/// The memory space of a field's bank.
+let spaceOf (f: Field) = match f.bank with XMemory -> Space.X | YMemory -> Space.Y
+
+let stateHome (f: Field) = { space = spaceOf f; offset = f.offset; ty = f.ty; reg = None; bound = infinity }
 
 /// Intrinsics that read firmware memory or have effects: never evaluated at compile time (a
 /// resource's .NET words are a stand-in for the firmware's).
 let effects =
   set [ "out.write"; "out.pair"; "table.read"; "table.row"; "region.address"; "cell.read"
         "cursor.next"; "cursor.peek"; "cursor.put"; "cursor.linear"; "cursor.ring"; "cursor.modulo"
-        "cursor.position"; "track.number" ]
+        "cursor.position"; "track.number"; "region.read"; "region.write"; "cursor.up"; "cursor.down"
+        "cursor.putUp"; "cursor.putDown"; "cursor.linearIn"; "cursor.ringIn" ]
 
 let rec tryConst (ctx: Ctx) (e: Expr) : obj option =
   match e with
@@ -437,8 +453,29 @@ let loopOffset (ctx: Ctx) (isIndex: Var -> bool) (e: Expr) =
   | Call(None, mi, [ Var v; c ]) when isIndex v && mi.Name = "op_Subtraction" -> Some(v, -(constInt ctx "an index offset" c))
   | _ -> None
 
+/// `Frac.index w`, `Frac.index w + c` or `Frac.index w - c`, not known when compiling: (w, c).
+let computedIndex (ctx: Ctx) (e: Expr) =
+  if (tryConst ctx e).IsSome then None
+  else
+    match e with
+    | Intr "frac.index" [ w ] -> Some(w, 0)
+    | Call(None, mi, [ Intr "frac.index" [ w ]; c ]) when mi.Name = "op_Addition" -> Some(w, constInt ctx "an index offset" c)
+    | Call(None, mi, [ c; Intr "frac.index" [ w ] ]) when mi.Name = "op_Addition" -> Some(w, constInt ctx "an index offset" c)
+    | Call(None, mi, [ Intr "frac.index" [ w ]; c ]) when mi.Name = "op_Subtraction" -> Some(w, -(constInt ctx "an index offset" c))
+    | _ -> None
+
+/// `s.field[Frac.index w + c]` on a [<Length n>] state array: (the field, w, c, the value written).
+let (|ComputedElement|_|) (ctx: Ctx) (e: Expr) =
+  match e with
+  | Call(None, mi, PropertyGet(Some(Var v), p, []) :: index :: rest)
+      when (mi.Name = "GetArray" || mi.Name = "SetArray") && v.Type = ctx.kernel.stateType ->
+    match (field ctx p.Name).ty, computedIndex ctx index with
+    | TArray _, Some(w, c) -> Some(field ctx p.Name, w, c, rest)
+    | _ -> None
+  | _ -> None
+
 /// `s.field[k]` on a [<Length n>] state array: its workset word for a constant k, or the loop's
-/// address register for k = i + c.
+/// address register for k = i + c. (A computed k is ComputedElement.)
 let (|StateElement|_|) (ctx: Ctx) (e: Expr) =
   match e with
   | Call(None, mi, PropertyGet(Some(Var v), p, []) :: index :: rest)
@@ -449,11 +486,12 @@ let (|StateElement|_|) (ctx: Ctx) (e: Expr) =
       match loopOffset ctx (fun i -> ctx.indexed.ContainsKey(i, p.Name)) index with
       | Some(i, c) ->
         let reg = ctx.indexed[i, p.Name]
-        Some(({ space = Space.Y; ea = (if c = 0 then Ind reg else Disp(reg, Operand.num c)) } : Mem), rest)
+        Some(({ space = spaceOf f; ea = (if c = 0 then Ind reg else Disp(reg, Operand.num c)) } : Mem), rest)
+      | None when (computedIndex ctx index).IsSome -> None
       | None ->
         let k = constInt ctx $"the index into {p.Name} (a constant, or the loop's index plus or minus a constant)" index
         if k < 0 || k >= n then fail $"{p.Name}[{k}] is outside its {n} words"
-        Some(({ space = Space.Y; ea = disp r6 (f.offset + k) } : Mem), rest)
+        Some(({ space = spaceOf f; ea = disp r6 (f.offset + k) } : Mem), rest)
     | _ -> None
   | _ -> None
 
@@ -582,7 +620,7 @@ let invariantIf (ctx: Ctx) (index: Var) (body: Expr) =
       let mi' = resolve mi args
       let ok =
         match intrinsic mi' with
-        | Some n -> not (n.StartsWith "cursor.") && n <> "out.write" && n <> "out.pair"
+        | Some n -> not (n.StartsWith "cursor.") && n <> "out.write" && n <> "out.pair" && n <> "region.read" && n <> "region.write"
         | None -> owner mi' = operators || isConst mi' || mi'.DeclaringType = typeof<Frac> || mi'.DeclaringType = typeof<Acc>
       ok && List.forall pure' args
     | _ -> false
@@ -816,6 +854,10 @@ and genWord (ctx: Ctx) (e: Expr) : unit =
     | IfThenElse(c, t, f) when (match tryConst ctx c with Some(:? bool) -> true | _ -> false) ->
       genWord ctx (if (tryConst ctx c).Value :?> bool then t else f)
     | Sequential(s, rest) -> thenRun ctx rest (fun () -> genStmt ctx s); genWord ctx rest
+    | ComputedElement ctx (f, w, c, []) ->
+      indexInN0 ctx w (f.offset + c)
+      emit ctx (move r6 r0)
+      emit ctx (move (computedMem f.bank) x0)
     | Call(None, mi, args) ->
       let mi = resolve mi args
       match intrinsic mi, args with
@@ -823,6 +865,11 @@ and genWord (ctx: Ctx) (e: Expr) : unit =
       | Some "acc.lo", [x] -> emit ctx (move (accPart ctx x 0) x0)
       | Some "acc.sat", [x] -> emit ctx (move (accPart ctx x 2) x0)
       | Some "table.read", [t; i] -> tableRead ctx t i 1 0 x0
+      | Some "region.read", [r; i] ->
+        let region = constRegion ctx r
+        indexInN0 ctx i 0
+        regionInR0 ctx region
+        emit ctx (move (computedMem region.bank) x0)
       | Some "table.row", [t; w; i; c] -> tableRead ctx t i (constInt ctx "a table width" w) (constInt ctx "a table column" c) x0
       | Some "region.address", [r] ->
         let region : Region = constRegion ctx r
@@ -848,6 +895,14 @@ and genWord (ctx: Ctx) (e: Expr) : unit =
       match intrinsic mi with
       | Some "cursor.next" -> emit ctx (move (cursorMem ctx.cursors[c] true) x0)
       | Some "cursor.peek" -> emit ctx (move (cursorMem ctx.cursors[c] false) x0)
+      | Some("cursor.up" | "cursor.down" as n) -> emit ctx (move (cursorOne ctx.cursors[c] n) x0)
+      | Some "cursor.position" when ctx.cursors[c].state.IsSome ->
+        let cr = ctx.cursors[c]
+        emit ctx (move (R cr.reg) a)
+        emit ctx (move r6 x0)
+        emit ctx (sub x0 a)
+        if cr.state.Value <> 0 then emit ctx (sub (immL cr.state.Value) a)
+        emit ctx (move a1 x0)
       | Some "cursor.position" ->
         let cr = ctx.cursors[c]
         emit ctx (move (R cr.reg) a)
@@ -900,6 +955,59 @@ and tableRead (ctx: Ctx) (t: Expr) (index: Expr) (width: int) (col: int) (dst: R
   | Resource symbol -> importHere ctx table.name symbol (move (xm (dispL r0 0)) dst)
   | Program -> emit ctx (move (pm (ind r0)) dst)
 
+/// n0 = the index word w plus `extra` (a state array's offset in the workset and the index's
+/// constant), for an (r0+n0) access.
+and indexInN0 (ctx: Ctx) (w: Expr) (extra: int) =
+  match wordLeaf ctx w with
+  | Some leaf when extra = 0 -> emitAll ctx (loadWord leaf (N 0))
+  | _ ->
+    genAcc ctx (Expr.Call(nonNull (typeof<Acc>.GetMethod "ofFrac"), [ w ]))
+    if extra <> 0 then emit ctx (add (immL (extra &&& 0xffffff)) a)
+    emit ctx (move a1 (N 0))
+
+/// r0 at a region's first word (the loader patches the address in).
+and regionInR0 (ctx: Ctx) (region: Region) =
+  importHere ctx region.name region.abiSymbol (move (immL 0) r0)
+
+/// The (r0+n0) word in a bank.
+and computedMem (bank: Bank) : Mem =
+  { space = (match bank with XMemory -> Space.X | YMemory -> Space.Y); ea = IndexN 0 }
+
+/// Whether computing `e` may write r0 or n0: table reads, region and computed array accesses,
+/// in e or the helpers it calls.
+and usesIndexRegs (ctx: Ctx) (e: Expr) =
+  let seen = HashSet<MethodInfo>()
+  let rec go (e: Expr) =
+    match e with
+    | Call(None, mi, args) ->
+      match intrinsic (resolve mi args) with
+      | Some("table.read" | "table.row" | "region.read" | "region.write") -> true
+      | Some "frac.index" -> (tryConst ctx e).IsNone
+      | Some _ -> List.exists go args
+      | None -> List.exists go args || (match reflected mi with Some d when seen.Add mi -> go d | _ -> false)
+    | ExprShape.ShapeVar _ -> false
+    | ExprShape.ShapeLambda(_, b) -> go b
+    | ExprShape.ShapeCombination(_, xs) -> List.exists go xs
+  go e
+
+/// `value` into the (r0+n0) word: n0 the index, `setBase` r0. A value that needs r0 or n0 itself
+/// is computed first and kept in an X word meanwhile.
+and computedStore (ctx: Ctx) (w: Expr) (extra: int) (setBase: unit -> unit) (dst: Mem) (value: Expr) =
+  if usesIndexRegs ctx value then
+    let mark = ctx.next
+    genWord ctx value
+    let t = alloc ctx TFrac
+    emit ctx (move x0 (at t 0))
+    indexInN0 ctx w extra
+    setBase ()
+    emit ctx (move (at t 0) x0)
+    emit ctx (move x0 dst)
+    ctx.next <- mark
+  else
+    indexInN0 ctx w extra
+    setBase ()
+    storeWord ctx value dst
+
 /// `name: ; mds: import ...` before an instruction whose second word the loader patches.
 and importHere (ctx: Ctx) (name: string) (symbol: int) (instr: Item) =
   emit ctx (Label(fresh ctx (name.ToUpperInvariant())))
@@ -921,15 +1029,47 @@ and cursorMem (c: CursorReg) (advance: bool) : Mem =
   let ea = if not advance then Ind c.reg elif c.step = 1 then PostInc c.reg else PostIncN c.reg
   { space = space; ea = ea }
 
-/// A cursor bound for the scope of `body`: an address register at region + start, modulo the
-/// region's size for a ring, its step in nn.
+/// A cursor's word one up or one down (Up, Down, PutUp, PutDown), whatever its step.
+and cursorOne (c: CursorReg) (how: string) : Mem =
+  let space = match c.region.bank with XMemory -> Space.X | YMemory -> Space.Y
+  { space = space; ea = (if how = "cursor.up" || how = "cursor.putUp" then PostInc c.reg else PostDec c.reg) }
+
+/// A cursor bound for the scope of `body`: an address register at region + start (or at the
+/// state array's word start), modulo the region's or the array's size for a ring, its step in nn.
 and withCursor (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> unit) =
-  let (region: Region), start, step, ring, modulus =
+  let stateArray (arr: Expr) =
+    match arr with
+    | PropertyGet(Some(Var s), p, []) when s.Type = ctx.kernel.stateType ->
+      let f = field ctx p.Name
+      match f.ty with
+      | TArray n -> f, n
+      | _ -> fail $"{p.Name}: a cursor walks a [<Length n>] state array"
+    | _ -> fail $"a cursor walks a region or a state array field (s.name), not {arr}"
+  let inState arr start step ring =
+    let f, n = stateArray arr
+    let region = { name = f.name; bank = f.bank; abiSymbol = -1; address = 0; words = Array.zeroCreate n }
+    region, start, constInt ctx "a cursor step" step, ring, None, Some(f, n)
+  let (region: Region), start, step, ring, modulus, (over: (Field * int) option) =
     match value with
-    | Intr "cursor.linear" [r; start] -> constRegion ctx r, start, 1, false, None
-    | Intr "cursor.ring" [r; start; step] -> constRegion ctx r, start, constInt ctx "a cursor step" step, true, None
-    | Intr "cursor.modulo" [r; start; last] -> constRegion ctx r, start, 1, true, Some last
-    | _ -> fail $"a cursor is bound to Cursor.linear or Cursor.ring, not {value}"
+    | Intr "cursor.linear" [r; start] -> constRegion ctx r, start, 1, false, None, None
+    | Intr "cursor.ring" [r; start; step] -> constRegion ctx r, start, constInt ctx "a cursor step" step, true, None, None
+    | Intr "cursor.modulo" [r; start; last] -> constRegion ctx r, start, 1, true, Some last, None
+    | Intr "cursor.linearIn" [arr; start; step] -> inState arr start step false
+    | Intr "cursor.ringIn" [arr; start; step] -> inState arr start step true
+    | _ -> fail $"a cursor is bound to Cursor.linear, Cursor.ring, Cursor.modulo, Cursor.linearIn or Cursor.ringIn, not {value}"
+  match over with
+  | Some(f, n) when ring ->
+    // the DSP's ring is the aligned block of the power of two at or above n holding the address
+    let mutable size = 1
+    while size < n do size <- size * 2
+    let bankText = match f.bank with XMemory -> "X" | YMemory -> "Y"
+    if n < 2 then fail $"{f.name}: a ring needs two words or more"
+    if size > worksetAlignment ctx.target then
+      fail $"{f.name}: a {n}-word ring needs r6 on a multiple of {size}; on the {ctx.target.name} it is on a multiple of {worksetAlignment ctx.target}"
+    if f.offset % size <> 0 then
+      fail $"{f.name} at {bankText}+${f.offset:x}: a {n}-word ring starts on a multiple of {size} in the workset (move the field)"
+    if abs step > n then fail $"{f.name}: a ring's step is at most its {n} words"
+  | _ -> ()
   // cursors no code still to run reads give their registers back
   let ahead = value :: bodyExpr :: ctx.conts
   for KeyValue(w, c) in ctx.cursors do
@@ -941,21 +1081,35 @@ and withCursor (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit ->
     match ctx.freeRegs with
     | r :: rest -> ctx.freeRegs <- rest; r
     | [] -> fail "too many live cursors at once (r1..r5)"
-  match tryConst ctx start with
-  | Some(:? Frac as f) when f.Raw = 0 -> importHere ctx region.name region.abiSymbol (move (immL 0) (R reg))
-  | _ ->
+  match over, tryConst ctx start with
+  | None, Some(:? Frac as f) when f.Raw = 0 -> importHere ctx region.name region.abiSymbol (move (immL 0) (R reg))
+  | None, _ ->
     genWord ctx start
     importHere ctx region.name region.abiSymbol (move (immL 0) a)
     emit ctx (add x0 a)
+    emit ctx (move a1 (R reg))
+  | Some(f, n), Some(:? Frac as k) ->
+    if k.Raw < 0 || k.Raw >= n then fail $"{f.name}: a cursor starting at word {k.Raw} is outside its {n} words"
+    let d = f.offset + k.Raw
+    if d <= 63 then emit ctx (lua (disp r6 d) (R reg))
+    else
+      emit ctx (move r6 a)
+      emit ctx (add (immL d) a)
+      emit ctx (move a1 (R reg))
+  | Some(f, _), _ ->
+    genWord ctx start
+    emit ctx (move r6 a)
+    emit ctx (add x0 a)
+    if f.offset <> 0 then emit ctx (add (immL f.offset) a)
     emit ctx (move a1 (R reg))
   match modulus with
   | Some last ->
     genWord ctx last
     emit ctx (movec x0 (M reg))
   | None -> if ring then emit ctx (movec (immL (region.words.Length - 1)) (M reg))
-  if step <> 1 then emit ctx (move (immL step) (N reg))
+  if step <> 1 then emit ctx (move (immL (step &&& 0xffffff)) (N reg))
   let saved = ctx.cursors
-  ctx.cursors <- ctx.cursors.Add(v, { reg = reg; region = region; step = step; ring = ring })
+  ctx.cursors <- ctx.cursors.Add(v, { reg = reg; region = region; step = step; ring = ring; state = over |> Option.map (fun (f, _) -> f.offset) })
   body ()
   ctx.cursors <- saved
   if not (ctx.released.Remove v) then
@@ -1063,6 +1217,8 @@ and storeWordReg (ctx: Ctx) (e: Expr) (dst: Reg) =
   | _ when (wordLeaf ctx e).IsSome -> emitAll ctx (loadWord (wordLeaf ctx e).Value dst)
   | Call(Some(Var c), mi, []) when ctx.cursors.ContainsKey c && (intrinsic mi = Some "cursor.next" || intrinsic mi = Some "cursor.peek") ->
     emit ctx (move (cursorMem ctx.cursors[c] (intrinsic mi = Some "cursor.next")) dst)
+  | Call(Some(Var c), mi, []) when ctx.cursors.ContainsKey c && (intrinsic mi = Some "cursor.up" || intrinsic mi = Some "cursor.down") ->
+    emit ctx (move (cursorOne ctx.cursors[c] (intrinsic mi).Value) dst)
   | Intr "acc.sat" [x] -> emit ctx (move (accPart ctx x 2) dst)
   | Intr "acc.hi" [x] -> emit ctx (move (accPart ctx x 1) dst)
   | Intr "acc.lo" [x] -> emit ctx (move (accPart ctx x 0) dst)
@@ -1099,7 +1255,7 @@ and withLet (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> un
       let f =
         if s.Type = ctx.kernel.stateType then field ctx p.Name
         else ctx.layout.parameters |> Array.find (fun f -> f.name = p.Name)
-      ctx.vars <- ctx.vars.Add(v, { space = Space.Y; offset = f.offset; ty = TFrac; reg = None; bound = infinity })
+      ctx.vars <- ctx.vars.Add(v, { space = spaceOf f; offset = f.offset; ty = TFrac; reg = None; bound = infinity })
       body ()
       ctx.vars <- saved
     | _ -> fail "unreachable"
@@ -1204,6 +1360,11 @@ and genStmt (ctx: Ctx) (e: Expr) : unit =
     | None -> fail $"{v.Name} is not a kernel local"
   | PropertySet(Some(Var s), p, [], value) when s.Type = ctx.kernel.stateType ->
     store ctx (stateHome (field ctx p.Name)) value
+  | ComputedElement ctx (f, w, c, [ value ]) ->
+    computedStore ctx w (f.offset + c) (fun () -> emit ctx (move r6 r0)) (computedMem f.bank) value
+  | Intr "region.write" [ r; i; value ] ->
+    let region = constRegion ctx r
+    computedStore ctx i 0 (fun () -> regionInR0 ctx region) (computedMem region.bank) value
   | StateElement ctx (m, [ value ]) -> storeWord ctx value m
   | PropertySet(Some(Var p), f, _, _) when p.Type = ctx.kernel.paramsType ->
     fail $"parameter {f.Name} is read-only"
@@ -1243,13 +1404,20 @@ and genStmt (ctx: Ctx) (e: Expr) : unit =
     scan body
     if count > 0 then
       let savedIndexed, savedCounters = ctx.indexed, ctx.counters
+      // X and Y arrays stepped together: the X ones from r1..r3, the Y ones from r4, r5, so an
+      // X load and a Y load can share one instruction (an XY move takes a register of each bank)
+      let mixed = arrays.Keys |> Seq.map (fun name -> (field ctx name).bank) |> Seq.distinct |> Seq.length > 1
       let regs =
         [ for KeyValue(name, _) in arrays do
-            let reg =
-              match ctx.freeRegs with
-              | r :: rest -> ctx.freeRegs <- rest; r
-              | [] -> fail "too many live cursors and indexed arrays at once (r1..r5)"
             let f = field ctx name
+            let preferred =
+              if not mixed then None
+              else ctx.freeRegs |> List.tryFind (fun r -> (r >= 4) = (f.bank = YMemory))
+            let reg =
+              match preferred, ctx.freeRegs with
+              | Some r, _ -> ctx.freeRegs <- ctx.freeRegs |> List.filter ((<>) r); r
+              | None, r :: rest -> ctx.freeRegs <- rest; r
+              | None, [] -> fail "too many live cursors and indexed arrays at once (r1..r5)"
             emit ctx (move r6 a)
             emit ctx (add (immL (f.offset + lo)) a)
             emit ctx (move a1 (R reg))
@@ -1310,6 +1478,8 @@ and genStmt (ctx: Ctx) (e: Expr) : unit =
     storeWord ctx r (ym (inc r7))
   | Call(Some(Var c), mi, [x]) when ctx.cursors.ContainsKey c && intrinsic mi = Some "cursor.put" ->
     storeWord ctx x (cursorMem ctx.cursors[c] true)
+  | Call(Some(Var c), mi, [x]) when ctx.cursors.ContainsKey c && (intrinsic mi = Some "cursor.putUp" || intrinsic mi = Some "cursor.putDown") ->
+    storeWord ctx x (cursorOne ctx.cursors[c] (intrinsic mi).Value)
   | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone -> genStmt ctx (inlined mi args)
   | Value(null, _) -> ()
   | _ -> fail $"not a kernel statement: {e}"
@@ -1369,7 +1539,8 @@ type Compiled =
     items    : Item array
     lines    : int array        // per item, the F# line it came from (0: none)
     source   : string option    // the kernel's F# file, from the quotations' debug ranges
-    xWorkset : int }
+    xWorkset : int              // X words used: the [<XMemory>] state (layout.xWorkset), then locals and spills
+    yWorkset : int }            // Y words used: layout.yWorkset, then locals spilled past the X workset
 
 let entry (ctx: Ctx) (name: string) (mi: MethodInfo) =
   let def =
@@ -1383,7 +1554,7 @@ let entry (ctx: Ctx) (name: string) (mi: MethodInfo) =
         fail $"{mi.Name}: argument {v.Name} is a {v.Type.Name}, expected the parameters, the state or the output"
       body rest
     | e -> e
-  ctx.next <- 0
+  ctx.next <- ctx.layout.xWorkset
   ctx.line <- 0
   ctx.trackHome <- None
   let rec reads (e: Expr) =
@@ -1457,9 +1628,10 @@ let rec writes (e: Expr) : int option =
 
 let compile (target: Target) (k: Kernel) : Result<Compiled, string> =
   try
+    let layout = layout target k
     let ctx =
-      { target = target; kernel = k; layout = layout target k; items = ResizeArray(); lines = ResizeArray(); line = 0
-        vars = Map.empty; consts = Map.empty; next = 0; high = 0; labels = 0
+      { target = target; kernel = k; layout = layout; items = ResizeArray(); lines = ResizeArray(); line = 0
+        vars = Map.empty; consts = Map.empty; next = layout.xWorkset; high = layout.xWorkset; labels = 0
         cursors = Map.empty; freeRegs = [ 1; 2; 3; 4; 5 ]; tables = ResizeArray(); conts = []; released = Collections.Generic.HashSet(); trackHome = None
         indexed = Map.empty; counters = Map.empty; freeData = [ X1; Y1 ]; scores = Dictionary(); deadLocals = HashSet()
         unswitched = HashSet(); bHeld = false; bWrite = false }
@@ -1478,5 +1650,6 @@ let compile (target: Target) (k: Kernel) : Result<Compiled, string> =
         emit ctx (Dc(row |> Array.map (fun w -> Num(int64 w))))
     let source = Expr.TryGetReflectedDefinition k.render |> Option.bind debugRange |> Option.map fst
     Ok { kernel = k; target = target; layout = ctx.layout; items = ctx.items.ToArray(); lines = ctx.lines.ToArray()
-         source = source; xWorkset = ctx.high }
+         source = source; xWorkset = min ctx.high target.xLimit
+         yWorkset = ctx.layout.yWorkset + max 0 (ctx.high - target.xLimit) }
   with KernelError m -> Error m

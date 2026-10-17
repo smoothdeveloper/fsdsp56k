@@ -5,7 +5,8 @@
 ///   unchanged accumulator, a store of what the word holds, a tfr between equal accumulators),
 ///   and a load whose value a data register holds becomes a register move (which can then be
 ///   packed);
-/// - dead stores to the compiler's temporaries: words of the X workset no instruction reads;
+/// - dead stores to the compiler's temporaries: words of the X workset past the [<XMemory>]
+///   state that no instruction reads;
 /// - loads of workset words a DO loop does not write moved before the loop;
 /// - packing moves into the parallel slots of neighbouring instructions (Lower.pack).
 ///
@@ -302,13 +303,13 @@ let successors (items: Item array) =
     | _ -> next ()
   if followable then Some(succ |> Array.map (fun l -> l.ToArray())) else None
 
-/// Stores to the compiler's temporaries (X workset words below `temps`) that no path reads
-/// before the word is written again.
-let deadTemps (temps: int) (items: (Item * int) array) =
+/// Stores to the compiler's temporaries (X workset words from `first` up to `temps`; the words
+/// below `first` are [<XMemory>] state) that no path reads before the word is written again.
+let deadTempsFrom (first: int) (temps: int) (items: (Item * int) array) =
   let its = Array.map fst items
   let temp (space: Space) (ea: Ea) =
     match workset space ea with
-    | Some(SMem(Space.X, k)) when k < temps -> Some k
+    | Some(SMem(Space.X, k)) when k >= first && k < temps -> Some k
     | _ -> None
   let uses i =
     match its[i] with
@@ -343,6 +344,9 @@ let deadTemps (temps: int) (items: (Item * int) array) =
         | Some k -> liveOut[i].Contains k
         | None -> true
       | _ -> true) |> Array.map snd
+
+/// The dead temporaries of a kernel without [<XMemory>] state: X words below `temps`.
+let deadTemps (temps: int) (items: (Item * int) array) = deadTempsFrom 0 temps items
 
 /// Registers an instruction reads, as far as this pass needs (None: not known).
 let readsOf (instr: Instr) =
@@ -626,22 +630,26 @@ type Level =
   | Direct            // the compiler's translation as it is
   | Peephole          // value numbering, dead temporaries, packing
 
-let run (level: Level) (temps: int) (items: Item array) (lines: int array) =
+/// The passes of `level`; the compiler's temporaries are X words `first` up to `temps`.
+let runFrom (level: Level) (first: int) (temps: int) (items: Item array) (lines: int array) =
   match level with
   | Direct -> items, lines
   | Peephole ->
     let mutable cur = Array.zip items lines
     for _ in 1 .. 3 do
-      cur <- cur |> forward |> copyForward |> deadTemps temps
+      cur <- cur |> forward |> copyForward |> deadTempsFrom first temps
     for _ in 1 .. 2 do
-      cur <- cur |> forwardWith true |> copyForward |> deadTemps temps
+      cur <- cur |> forwardWith true |> copyForward |> deadTempsFrom first temps
     cur <- hoist cur
     cur <- pack cur |> rotate |> pack |> fixLoops
     Array.map fst cur, Array.map snd cur
+
+/// The passes of `level`, for a kernel without [<XMemory>] state: temporaries are X words below `temps`.
+let run (level: Level) (temps: int) (items: Item array) (lines: int array) = runFrom level 0 temps items lines
 
 /// Compile, then run the passes of `level` over the items.
 let compile (level: Level) (target: Kernel.Target) (k: Kernel.Kernel) =
   Compile.compile target k
   |> Result.map (fun c ->
-    let items, lines = run level c.xWorkset c.items c.lines
+    let items, lines = runFrom level c.layout.xWorkset c.xWorkset c.items c.lines
     { c with items = items; lines = lines })

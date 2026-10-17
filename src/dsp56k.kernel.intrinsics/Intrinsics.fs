@@ -5,7 +5,8 @@
 /// against each other on the emulator (tests/dsp56k.tests/KernelTests.fs).
 ///
 /// Storage types are Frac (one word) and Long (two words, a1:a0). Acc is the 56-bit accumulator:
-/// a value in flight, kept exact (with its extension byte) when the compiler spills it.
+/// a value in flight, kept exact (with its extension byte) when the compiler spills it. State
+/// fields live in Y unless marked [<XMemory>].
 namespace dsp56k.kernel
 
 open System
@@ -22,11 +23,19 @@ type ConstAttribute() =
   inherit Attribute()
 
 /// The number of words of a `Frac array` state field: `[<Length 4>] mutable history : Frac array`.
-/// Elements are read and written with constant indices.
+/// Elements are read and written with constant indices, the loop's index (`s.h[i + 1]`), or a
+/// word computed when running (`s.h[Frac.index k]`, `s.h[Frac.index k + 32]`).
 [<AttributeUsage(AttributeTargets.Property ||| AttributeTargets.Field, AllowMultiple = false)>]
 type LengthAttribute(words: int) =
   inherit Attribute()
   member _.Words = words
+
+/// A state field kept in X memory instead of Y: `[<XMemory>] mutable phase : Frac`,
+/// `[<XMemory; Length 32>] mutable residuals : Frac array`. X state words are X:(r6+0) on, in
+/// the order declared; the compiler's locals and spills follow them in the X workset.
+[<AttributeUsage(AttributeTargets.Property ||| AttributeTargets.Field, AllowMultiple = false)>]
+type XMemoryAttribute() =
+  inherit Attribute()
 
 module Bits =
   let sext24 (v: int) = (v <<< 8) >>> 8
@@ -57,6 +66,14 @@ type Frac =
   /// $7fffff, the largest fraction.
   [<Const>]
   static member one = { Frac.Raw = 0x7fffff }
+
+  /// The word as a signed integer, to index a state array with a value computed when running:
+  /// `s.residuals[Frac.index k]`, `s.residuals[Frac.index k + 32]` (`move k,n0` and an
+  /// `(r0+n0)` access from the array's first word). The address is the array's plus the index,
+  /// as the DSP adds them (linear, no wrap): an index outside the array fails on .NET and
+  /// touches whatever is there on the DSP. Only an array index takes it.
+  [<Intrinsic "frac.index">]
+  static member index (f: Frac) = f.Raw
 
   /// One step of a 24-bit shift register: shifted left, the taps XORed in when the bit shifted
   /// out was set (`lsl a` `bcc` `eor #taps,a`).
@@ -238,6 +255,16 @@ type Region =
   [<Intrinsic "region.address">]
   static member addressOf (r: Region) = Frac.ofRaw r.address
 
+  /// Word `index` of the region, the index computed when running: `move x:(r0+n0),d` with r0
+  /// the region (loader-patched) and n0 the index. Linear, as Frac.index: an index outside the
+  /// region fails on .NET.
+  [<Intrinsic "region.read">]
+  static member read (r: Region) (index: Frac) = Frac.ofRaw r.words[index.Raw]
+
+  /// Word `index` of the region set to `value`: `move s,x:(r0+n0)`.
+  [<Intrinsic "region.write">]
+  static member write (r: Region) (index: Frac) (value: Frac) = r.words[index.Raw] <- value.Word
+
 /// A firmware word at a loader-patched address (`move x:>cell,d`); `value` is what the harness
 /// puts there.
 type Cell =
@@ -249,40 +276,70 @@ type Cell =
   [<Intrinsic "cell.read">]
   static member read (c: Cell) = Frac.ofRaw c.value
 
-/// An address register walking a region: `(rn)+`, `(rn)+nn`, with modulo addressing over the
-/// region for a ring. Bind it with `let` (one register for the binding's scope).
+/// An address register walking a region or a [<Length n>] state array: `(rn)+`, `(rn)+nn`,
+/// `(rn)-`, with modulo addressing for a ring. Bind it with `let` (one register for the binding's
+/// scope).
 [<AllowNullLiteral>]
-type Cursor(region: Region, start: int, step: int, modulo: int) =
+type Cursor(read: int -> int, write: int -> int -> unit, address: int, start: int, step: int, modulo: int) =
   let mutable i = start
   // modulo addressing with M = modulo (0: linear): the ring is the M + 1 words from the multiple
   // of the next power of two at or below the address
-  let advance () =
-    let next = i + step
+  let advance by =
+    let next = i + by
     if modulo = 0 then i <- next
     else
       let mutable size = 1
       while size <= modulo do size <- size * 2
-      let lower = (region.address + i) / size * size - region.address
+      let lower = (address + i) / size * size - address
       i <- if next > lower + modulo then next - (modulo + 1) elif next < lower then next + (modulo + 1) else next
 
-  /// Read and move on: `move x:(rn)+,d`.
+  new(region: Region, start: int, step: int, modulo: int) =
+    Cursor((fun k -> region.words[k]), (fun k w -> region.words[k] <- w), region.address, start, step, modulo)
+
+  /// Read and move on by the step: `move x:(rn)+,d` (step 1) or `move x:(rn)+nn,d`.
   [<Intrinsic "cursor.next">]
   member _.Next() =
-    let v = region.words[i]
-    advance ()
+    let v = read i
+    advance step
     Frac.ofRaw v
 
   /// Read in place: `move x:(rn),d`.
   [<Intrinsic "cursor.peek">]
-  member _.Peek() = Frac.ofRaw region.words[i]
+  member _.Peek() = Frac.ofRaw (read i)
 
-  /// Write and move on: `move s,x:(rn)+`.
+  /// Write and move on by the step: `move s,x:(rn)+` or `move s,x:(rn)+nn`.
   [<Intrinsic "cursor.put">]
   member _.Put(f: Frac) =
-    region.words[i] <- f.Word
-    advance ()
+    write i f.Word
+    advance step
 
-  /// Where the cursor is, as an offset in the region.
+  /// Read and move up one word, whatever the step: `move x:(rn)+,d`.
+  [<Intrinsic "cursor.up">]
+  member _.Up() =
+    let v = read i
+    advance 1
+    Frac.ofRaw v
+
+  /// Read and move down one word: `move x:(rn)-,d`.
+  [<Intrinsic "cursor.down">]
+  member _.Down() =
+    let v = read i
+    advance -1
+    Frac.ofRaw v
+
+  /// Write and move up one word: `move s,x:(rn)+`.
+  [<Intrinsic "cursor.putUp">]
+  member _.PutUp(f: Frac) =
+    write i f.Word
+    advance 1
+
+  /// Write and move down one word: `move s,x:(rn)-`.
+  [<Intrinsic "cursor.putDown">]
+  member _.PutDown(f: Frac) =
+    write i f.Word
+    advance -1
+
+  /// Where the cursor is, as an offset in the region (or the array).
   [<Intrinsic "cursor.position">]
   member _.Position() = Frac.ofRaw i
 
@@ -298,6 +355,20 @@ type Cursor(region: Region, start: int, step: int, modulo: int) =
   /// is what goes in the M register), one word a step.
   [<Intrinsic "cursor.modulo">]
   static member modulo (r: Region) (start: Frac) (last: Frac) = Cursor(r, start.Raw, 1, last.Raw)
+
+  /// Linear addressing over a [<Length n>] state array (`Cursor.linearIn s.h k`) from word
+  /// `start`, `step` words a step: `lua (r6+field+start),rn`. Leaving the array fails on .NET.
+  [<Intrinsic "cursor.linearIn">]
+  static member linearIn (a: Frac array) (start: Frac) (step: int) =
+    Cursor((fun k -> a[k].Raw), (fun k w -> a[k] <- Frac.ofRaw w), 0, start.Raw, step, 0)
+
+  /// Modulo addressing over a [<Length n>] state array, as TX8-CY's six-word Y ring (`lua
+  /// (r6+$10),r4`, `movec #5,m4`, `move #3,n4`): M = n - 1, so the cursor wraps within the n
+  /// words whichever way it moves. The array must start on a multiple of the power of two at or
+  /// above n in the workset (the compiler checks), as the DSP's ring is that aligned block.
+  [<Intrinsic "cursor.ringIn">]
+  static member ringIn (a: Frac array) (start: Frac) (step: int) =
+    Cursor((fun k -> a[k].Raw), (fun k w -> a[k] <- Frac.ofRaw w), 0, start.Raw, step, a.Length - 1)
 
 /// The shared temporary memory (MDS imports 7 and 8): 32 words each, not kept between calls.
 module Scratch =

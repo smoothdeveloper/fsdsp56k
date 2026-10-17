@@ -1,6 +1,6 @@
 /// A kernel run as .NET code: the meaning the compiled program is checked against. Parameters
 /// arrive as the words the DSP finds at Y:(r6+1..), the state is read back as the workset words
-/// it occupies on the DSP.
+/// it occupies on the DSP: the Y state, then the [<XMemory>] state.
 module dsp56k.kernel.Host
 
 open System
@@ -18,11 +18,11 @@ type Instance(target: Target, kernel: Kernel) =
   let state : obj | null =
     if kernel.stateType = typeof<unit> then null
     else
-      let initial (f: Field) (p: PropertyInfo) =
-        match f.ty with
+      let initial (p: PropertyInfo) =
+        match (layout.field p.Name).ty with
         | TArray n -> box (Array.create n Frac.zero)
         | _ -> zero p.PropertyType
-      FSharpValue.MakeRecord(kernel.stateType, Array.map2 initial layout.state (FSharpType.GetRecordFields kernel.stateType))
+      FSharpValue.MakeRecord(kernel.stateType, FSharpType.GetRecordFields kernel.stateType |> Array.map initial)
   let mutable parameters = FSharpValue.MakeRecord(kernel.paramsType, FSharpType.GetRecordFields kernel.paramsType |> Array.map (fun p -> zero p.PropertyType))
   let output = Output()
 
@@ -42,10 +42,10 @@ type Instance(target: Target, kernel: Kernel) =
     call kernel.render [| parameters; state; output |]
     output.Words
 
-  /// The state as workset words, from Y:(r6+stateBase).
-  member _.StateWords() =
-    [| for f, p in Array.zip layout.state (if isNull state then [||] else FSharpType.GetRecordFields kernel.stateType) do
-         match p.GetValue(nonNull state) with
+  /// The words of some state fields, in their workset order.
+  member private _.Words(fields: Field array) =
+    [| for f in fields do
+         match (nonNull (kernel.stateType.GetProperty f.name)).GetValue(nonNull state) with
          | :? Frac as v -> v.Word
          | :? Long as v ->
            int ((v.Raw >>> 24) &&& 0xffffffL)
@@ -56,3 +56,12 @@ type Instance(target: Target, kernel: Kernel) =
            int ((v.Raw >>> 48) &&& 0xffffffL)
          | :? (Frac array) as v -> yield! v |> Array.map _.Word
          | v -> failwith $"state field {f.name}: {v}" |]
+
+  /// The Y state as workset words, from Y:(r6+stateBase).
+  member this.YStateWords() = this.Words layout.state
+
+  /// The [<XMemory>] state as workset words, from X:(r6+0).
+  member this.XStateWords() = this.Words layout.xState
+
+  /// The state as workset words: the Y state from Y:(r6+stateBase), then the X state from X:(r6+0).
+  member this.StateWords() = Array.append (this.YStateWords()) (this.XStateWords())
