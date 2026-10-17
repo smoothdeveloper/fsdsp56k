@@ -8,6 +8,8 @@
     <GenerateProgramFile>false</GenerateProgramFile>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="Kernels/Sine.fs" />
+    <Compile Include="Kernels/Grading.fs" />
     <Compile Include="Fixtures.fs" />
     <Compile Include="Catalogue.fs" />
     <Compile Include="OracleTests.fs" />
@@ -16,6 +18,7 @@
     <Compile Include="CorpusTests.fs" />
     <Compile Include="ImportTests.fs" />
     <Compile Include="ToolTests.fs" />
+    <Compile Include="KernelTests.fs" />
     <Compile Include="Main.fs" />
   </ItemGroup>
   <ItemGroup>
@@ -24,6 +27,9 @@
     <ProjectReference Include="../../src/machinedrum/machinedrum.fsproj" />
     <ProjectReference Include="../../src/machinedrum.run/machinedrum.run.fsproj" />
     <ProjectReference Include="../../src/dsp56k.tool/dsp56k.tool.fsproj" />
+    <ProjectReference Include="../../src/dsp56k.kernel.intrinsics/dsp56k.kernel.intrinsics.fsproj" />
+    <ProjectReference Include="../../src/dsp56k.kernel/dsp56k.kernel.fsproj" />
+    <ProjectReference Include="../../src/dsp56k.kernel.grade/dsp56k.kernel.grade.fsproj" />
   </ItemGroup>
   <Import Project="..\..\.paket\Paket.Restore.targets" />
 </Project>

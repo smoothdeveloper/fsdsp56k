@@ -6,4 +6,7 @@
   <Project Path="src/dsp56k.dsl/dsp56k.dsl.fsproj" />
   <Project Path="src/machinedrum.run/machinedrum.run.fsproj" />
   <Project Path="src/dsp56k.tool/dsp56k.tool.fsproj" />
+  <Project Path="src/dsp56k.kernel.intrinsics/dsp56k.kernel.intrinsics.fsproj" />
+  <Project Path="src/dsp56k.kernel/dsp56k.kernel.fsproj" />
+  <Project Path="src/dsp56k.kernel.grade/dsp56k.kernel.grade.fsproj" />
 </Solution>

@@ -14,10 +14,11 @@ type Layout =
     output      : int        // Y: the 32-word output buffer (R7, M7 = $1f), 32-aligned
     services    : int        // P: the service stand-ins
     stub        : int        // P: the jsr/stop call stub
-    trackMemory : int }      // X: track 0's external memory (import 6)
+    trackMemory : int        // X: track 0's external memory (import 6)
+    sineTable   : int }      // X: the sine resource (import symbol 1); its contents are the caller's
 
 let defaultLayout =
-  { programBase = 0x100; workset = 0x100; output = 0x200; services = 0xe00; stub = 0xef0; trackMemory = 0x10000 }
+  { programBase = 0x100; workset = 0x100; output = 0x200; services = 0xe00; stub = 0xef0; trackMemory = 0x10000; sineTable = 0 }
 
 type Bank =
   { words : int array
@@ -58,6 +59,7 @@ type Track(package: Mds.Package, machine: Mds.Machine option, layout: Layout, ba
         match kind, symbol with
         | 5, 9 -> serviceAt "SAMPLE_INFO"
         | 5, 10 -> serviceAt "SAMPLE_READ"
+        | 1, 1 -> layout.sineTable
         | 2, 6 -> layout.trackMemory
         | (3 | 4), _ -> 0                                   // temporary areas at X/Y:$0000
         | _ -> 0

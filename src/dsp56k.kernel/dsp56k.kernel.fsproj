@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Dsp56k.Kernel</AssemblyName>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Kernel.fs" />
+    <Compile Include="Compile.fs" />
+    <Compile Include="Host.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../dsp56k/dsp56k.fsproj" />
+    <ProjectReference Include="../dsp56k.dsl/dsp56k.dsl.fsproj" />
+    <ProjectReference Include="../machinedrum/machinedrum.fsproj" />
+    <ProjectReference Include="../dsp56k.kernel.intrinsics/dsp56k.kernel.intrinsics.fsproj" />
+  </ItemGroup>
+  <Import Project="..\..\.paket\Paket.Restore.targets" />
+</Project>

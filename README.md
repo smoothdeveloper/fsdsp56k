@@ -18,6 +18,10 @@ them; samples and the command-line tool sit on top.
 | **Machinedrum MDS** | |
 | `src/machinedrum` | MDS v1 packages (JSON definitions, byte-exact writer, reader, verification), the machine ABI as DSL helpers (workset, resources, services, patch markers), SysEx dumps |
 | `src/machinedrum.run` | A track on the emulator (loader relocation and imports, parameter conversion, sample-service stand-ins, cycle budgets), WAV I/O, binary import of packages to DSL items |
+| **Kernel F# (spike)** | |
+| `src/dsp56k.kernel.intrinsics` | `Frac`, `Acc`, `Long`, `Table`, `Output`: DSP56300 arithmetic as .NET code, each operation tagged with the compiler's intrinsic name |
+| `src/dsp56k.kernel` | Quotation compiler from `[<ReflectedDefinition>]` kernels to DSL items (direct translation, no optimisation yet), and a .NET host running the same kernel |
+| `src/dsp56k.kernel.grade` | Runs a scenario three ways (.NET kernel, compiled package, reference package) and reports correctness, fidelity, cost and listing alignment |
 | **On top** | |
 | `src/dsp56k.tool` | The `fsdsp56k` command line |
 | `samples` | DSL programs reproducing shipped machines word for word |
@@ -48,6 +52,35 @@ let words = Program.words clearWorkset        // assembled with the same encoder
 let listing = Program.source clearWorkset     // Motorola syntax, for asm56300 or review
 ```
 
+
+## Kernels
+
+A machine can also be written as ordinary F# over fixed-point types, run as .NET code and
+compiled to DSP56300 code (`tests/dsp56k.tests/Kernels/Sine.fs`, jmamma/MDS's sine example):
+
+```fsharp
+[<ReflectedDefinition>]
+module Sine
+let render (p: Params) (s: State) (out: Output) =
+  let step = Acc.ofFrac p.pitch >>> 6
+  let ramp = (Acc.ofFrac p.amp - Acc.ofFrac s.ampPrev) >>> 5
+  let mutable gain = Acc.ofFrac s.ampPrev
+  let mutable phase = Acc.ofLong s.phase
+  for _ in 0 .. 31 do
+    gain <- gain + ramp
+    let v = Table.read Rom.sine (Acc.hi phase)
+    out.Write(Acc.sat ((v * Acc.hi gain) >>> 2))
+    phase <- Acc.andHi 0x7fff (phase + step)
+  s.phase <- Long.ofAcc phase
+  s.ampPrev <- p.amp
+```
+
+The compiler translates directly (values through A, B, X0, Y0, spills to the X workset), so it
+is correct but slow. The tests grade it against the shipped
+`sine.mds`: output identical, word for word, to the .NET kernel and to the shipped machine;
+RENDER at 3.6 times the hand-written cycles; and each entry point's listing aligned with the
+reference disassembly. The tests run each intrinsic's .NET meaning against the emulator on
+random and extreme words.
 
 ## The tool
 

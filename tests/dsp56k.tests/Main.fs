@@ -12,6 +12,7 @@ let all =
     CorpusTests.tests
     ImportTests.tests
     ToolTests.tests
+    KernelTests.tests
   ]
 
 [<EntryPoint>]
