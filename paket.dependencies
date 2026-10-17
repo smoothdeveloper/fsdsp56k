@@ -6,3 +6,4 @@ nuget FSharp.Core
 nuget Expecto
 nuget UnMango.CliWrap.FSharp
 nuget Argu
+nuget Falco.Markup

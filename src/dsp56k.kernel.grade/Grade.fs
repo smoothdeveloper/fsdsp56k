@@ -620,6 +620,94 @@ type Report =
     reference   : Cost option
     shapes      : Shape array }
 
+// ---------------------------------------------------------------------------------------------
+// Runs through the grading cache (GradeCache: on when FSDSP56K_GRADE_CACHE names its folder).
+
+let private saveRun (r: Run) =
+  use m = new IO.MemoryStream()
+  use w = new IO.BinaryWriter(m)
+  let words (xs: int array array) =
+    w.Write xs.Length
+    for x in xs do
+      w.Write x.Length
+      for v in x do w.Write v
+  let cycles (xs: int64 list) =
+    w.Write xs.Length
+    for c in xs do w.Write c
+  words r.outputs; words r.states; cycles r.init; cycles r.trig; cycles r.render
+  w.Flush()
+  m.ToArray()
+
+let private loadRun (bytes: byte array) =
+  use r = new IO.BinaryReader(new IO.MemoryStream(bytes))
+  let words () = Array.init (r.ReadInt32()) (fun _ -> Array.init (r.ReadInt32()) (fun _ -> r.ReadInt32()))
+  let cycles () = List.init (r.ReadInt32()) (fun _ -> r.ReadInt64())
+  let outputs = words ()
+  let states = words ()
+  let init = cycles ()
+  let trig = cycles ()
+  { outputs = outputs; states = states; init = init; trig = trig; render = cycles () }
+
+/// The scenario as the run sees it: settings as the harness's parameter words.
+let private scenarioText (h: Harness) (scenario: Scenario) =
+  String.concat "\n"
+    [ for step in scenario.steps ->
+        match step with
+        | Settings s -> "words " + String.Join(",", h.settings s)
+        | Words w -> "words " + String.Join(",", w)
+        | Mark _ -> ""
+        | Init -> "init"
+        | Trig -> "trig"
+        | Render n -> $"render {n}" ]
+
+/// The parts of a key every run shares: the harness, the target, the scenario, this assembly.
+let private runKey (h: Harness) (scenario: Scenario) =
+  let key = GradeCache.Key()
+  key.Text("harness", h.name + "\n" + sprintf "%A" h.target + "\n" + sprintf "%A" h.cycleLimit)
+  key.Text("scenario", scenarioText h scenario)
+  GradeCache.assemblyHash typeof<Run>.Assembly |> Option.iter (fun a -> key.Hash("grade", a))
+  key
+
+/// A session's memory and registers as started, hashed: the program, the firmware and the tables.
+let private sessionHash (p: Program) =
+  use session = p.start ()
+  let emu = session.Emulator
+  let pw, xw, yw = emu.Sizes
+  use m = new IO.MemoryStream()
+  use w = new IO.BinaryWriter(m)
+  for space, n in [ Native.Space.P, pw; Native.Space.X, xw; Native.Space.Y, yw ] do
+    w.Write n
+    for a in 0 .. n - 1 do w.Write(emu.Read(space, a))
+  for r in 0 .. 63 do w.Write(emu.Reg r)
+  w.Write session.Workset
+  w.Flush()
+  GradeCache.sha (m.ToArray())
+
+let private emulatorHash =
+  lazy (match Native.locate () with Some path -> GradeCache.fileHash path | None -> "none")
+
+let private runNetCached (h: Harness) (k: Kernel.Kernel) (scenario: Scenario) =
+  match GradeCache.mode () with
+  | GradeCache.Off -> runNet h k scenario
+  | _ ->
+    let key = runKey h scenario
+    key.Text("kernel", k.name)
+    key.Text("definitions", GradeCache.definitionText [ k.init; k.trig; k.render ])
+    key.Text("types", GradeCache.typeText k.paramsType + "\n" + GradeCache.typeText k.stateType)
+    // the .NET host that runs it
+    GradeCache.assemblyHash typeof<Kernel.Kernel>.Assembly |> Option.iter (fun a -> key.Hash("host", a))
+    GradeCache.cached "net" $"{k.name} / {scenario.name}" key saveRun loadRun (fun () -> runNet h k scenario)
+
+let private runStatesCached (h: Harness) (p: Program) (stateWords: int) (xStateWords: int) (scenario: Scenario) =
+  match GradeCache.mode () with
+  | GradeCache.Off -> runStates h p stateWords xStateWords scenario
+  | _ ->
+    let key = runKey h scenario
+    key.Hash("session", sessionHash p)
+    key.Hash("emulator", emulatorHash.Value)
+    key.Text("program", $"{p.name}\n{p.programWords}\n{p.xWorkset}\n{p.yWorkset}\n{p.declaredCycles}\n{stateWords}\n{xStateWords}")
+    GradeCache.cached "dsp" $"{p.name} / {scenario.name}" key saveRun loadRun (fun () -> runStates h p stateWords xStateWords scenario)
+
 /// Compile for the harness's target with the optimizer at `level`, load, run and compare.
 /// `reference` is the program the kernel reproduces, when there is one.
 let gradeAt (level: Optimize.Level) (h: Harness) (k: Kernel.Kernel) (reference: Program option) (scenario: Scenario) =
@@ -629,10 +717,10 @@ let gradeAt (level: Optimize.Level) (h: Harness) (k: Kernel.Kernel) (reference: 
   |> Result.bind (fun (compiled, program) ->
     try
       let stateWords = compiled.layout.yWorkset - target.stateBase
-      let net = runNet h k scenario
-      let dsp = runStates h program stateWords compiled.layout.xWorkset scenario
+      let net = runNetCached h k scenario
+      let dsp = runStatesCached h program stateWords compiled.layout.xWorkset scenario
       let correctness = [ compare "output" net.outputs dsp.outputs; compare "state" net.states dsp.states ] |> List.choose id
-      let refRun = reference |> Option.map (fun r -> run h r 0 scenario)
+      let refRun = reference |> Option.map (fun r -> runStatesCached h r 0 0 scenario)
       let shapes =
         match reference with
         | Some r when r.items.Length > 0 ->

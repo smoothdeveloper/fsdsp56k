@@ -133,6 +133,8 @@ type Emulator(pWords: int, xWords: int, yWords: int) =
   let handle = Raw.fsd_emu_create(uint32 pWords, uint32 xWords, uint32 yWords)
   let mutable disposed = false
 
+  /// The P, X and Y words it was made with.
+  member _.Sizes = pWords, xWords, yWords
   member _.Read(space: Space, addr: int) = int (Raw.fsd_emu_read(handle, uint32 space, uint32 addr))
   member _.Write(space: Space, addr: int, value: int) = Raw.fsd_emu_write(handle, uint32 space, uint32 addr, uint32 (value &&& 0xffffff))
   member this.Load(space: Space, origin: int, words: int array) = words |> Array.iteri (fun i w -> this.Write(space, origin + i, w))

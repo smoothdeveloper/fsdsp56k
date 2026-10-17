@@ -6,6 +6,7 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="Cache.fs" />
     <Compile Include="Grade.fs" />
     <Compile Include="Html.fs" />
     <Compile Include="Audio.fs" />
