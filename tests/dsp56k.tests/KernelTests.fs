@@ -1074,6 +1074,38 @@ module IndexArg =
 
   let kernel = Kernel.define "probe-index-arg" <@ init @> <@ trig @> <@ render @>
 
+/// A region's address taken twice in one function, a branch between, then zeros stored: the
+/// second `move #>region,x0` is patched by the loader, so x0 does not hold the 0 the assembler
+/// wrote (MDX P-I-PN's INIT: its zeros took the region's address).
+[<ReflectedDefinition>]
+module AddressTwice =
+  type S =
+    { mutable base1 : Frac
+      mutable base2 : Frac
+      mutable z1 : Frac
+      mutable z2 : Frac }
+
+  let init (p: Banks.P) (s: S) =
+    let start = Acc.hi (Acc.ofFrac (Region.addressOf Track.memory) + Acc.hi (Acc.andHi 0x3ff (Acc.ofFrac p.a)))
+    let aligned = Acc.hi (Acc.andHi 0xfffc00 (Acc.ofFrac start + Frac.ofRaw 0x3ff))
+    let mutable second = Acc.ofFrac p.b
+    if start = aligned then second <- second + Frac.ofRaw 0x400
+    s.base1 <- Acc.hi (Acc.ofFrac aligned - Region.addressOf Track.memory)
+    s.base2 <- Acc.hi second
+    s.z1 <- Frac.zero
+    s.z2 <- Frac.zero
+
+  let trig (_: Banks.P) (_: S) = ()
+
+  let render (_: Banks.P) (s: S) (out: Output) =
+    for _ in 0 .. 7 do
+      out.Write s.base1
+      out.Write s.base2
+      out.Write s.z1
+      out.Write s.z2
+
+  let kernel = Kernel.define "probe-address-twice" <@ init @> <@ trig @> <@ render @>
+
 /// [<Length n>] Long arrays (element k hi:lo at words 2k, 2k+1), in Y and in X: constant
 /// indexes, the loop's index (its register stepping two words), two arrays in one loop, and a
 /// helper given the index.
@@ -1724,6 +1756,10 @@ let tests =
       test "[<Length n>] Long arrays in Y and X, by constant and loop index: compiled program equals the .NET kernel" {
         needNative ()
         conformance LongArray.kernel 60
+      }
+      test "a region's address taken twice, then zeros: the patched immediate is not a known 0" {
+        needNative ()
+        conformance AddressTwice.kernel 61
       }
       test "register locals read in both branches of an if: compiled program equals the .NET kernel" {
         needNative ()

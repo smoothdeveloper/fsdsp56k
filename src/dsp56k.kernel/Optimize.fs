@@ -192,6 +192,9 @@ let forwardWith (accCopies: bool) (items: (Item * int) array) =
   let f = Facts()
   let out = ResizeArray<Item * int>()
   let mutable i = 0
+  // the instruction after an `mds:` marker has a word the loader patches (an import's address,
+  // a relocated target): its immediate is not the value written, so it ends what is known
+  let mutable patched = false
   let single (it: Item) =
     match it with
     | Op(Par(None, [| m |])) -> Some m
@@ -219,7 +222,13 @@ let forwardWith (accCopies: bool) (items: (Item * int) array) =
         f.Clear()
         out.Add(it, line)
         i <- i + 1
-      | Comment _ ->
+      | Comment text ->
+        if text.StartsWith machinedrum.Abi.markerPrefix then patched <- true
+        out.Add(it, line)
+        i <- i + 1
+      | Op _ when patched ->
+        patched <- false
+        f.Clear()
         out.Add(it, line)
         i <- i + 1
       | Op(Par(alu, moves)) ->
@@ -475,7 +484,9 @@ let hoist (items: (Item * int) array) =
           match workset space ea with
           | Some(SMem(_, w)) -> Some(dst, Some(space, w))
           | _ -> None
-        | Op(Par(None, [| Imm(_, dst) |])) when data dst -> Some(dst, None)
+        // not a word the loader patches: it stays at its label
+        | Op(Par(None, [| Imm(_, dst) |])) when data dst && not (k > 0 && (match fst its[k - 1] with Comment t -> t.StartsWith machinedrum.Abi.markerPrefix | _ -> false)) ->
+          Some(dst, None)
         | _ -> None
       match source with
       | Some(dst, word) ->
