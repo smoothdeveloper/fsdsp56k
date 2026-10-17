@@ -142,6 +142,10 @@ type Ctx =
     mutable indexed : Map<Var * string, int * int>  // (loop index, state array) -> its address register,
                                                     // the array's distance from what that register steps
     mutable counters : Map<Var, Home>         // loop index -> the word counting it, when read
+    mutable inductions : Map<Var * string, int> // (a local stepped by a constant, a region) -> the
+                                              // address register at region + local, in a DO loop
+    affineAt : Dictionary<Expr, Mem>          // region index expressions (by reference) affine in a
+                                              // DO loop's index -> the word through its register
     mutable freeData : Reg list               // X1, Y1 when no local holds them
     scores   : Dictionary<Var, int>           // uses of each local, weighted by loop trip counts
     deadLocals : HashSet<Var>                 // register locals given back before their scope ended
@@ -658,6 +662,21 @@ let rec loopOffset (ctx: Ctx) (isIndex: Var -> bool) (e: Expr) =
     loopOffset ctx isIndex x |> Option.map (fun (v, k) -> v, k - (offset c).Value)
   | _ -> None
 
+/// A region index `v` or `Acc.hi (Acc.ofFrac v + d)` / `- d`, d a constant word: (v, d signed).
+let stepIndex (ctx: Ctx) (e: Expr) =
+  let word (x: Expr) =
+    match tryConst ctx x with
+    | Some(:? Frac as f) -> Some((f.Word <<< 8) >>> 8)
+    | _ -> None
+  match e with
+  | Var v -> Some(v, 0)
+  | Intr "acc.hi" [ Intr "acc.addFrac" [ Intr "acc.ofFrac" [ Var v ]; d ] ] when (word d).IsSome -> Some(v, (word d).Value)
+  | Intr "acc.hi" [ Intr "acc.add" [ Intr "acc.ofFrac" [ Var v ]; d ] ] when (word d).IsSome -> Some(v, (word d).Value)
+  | Intr "acc.hi" [ Intr "acc.add" [ d; Intr "acc.ofFrac" [ Var v ] ] ] when (word d).IsSome -> Some(v, (word d).Value)
+  | Intr "acc.hi" [ Intr "acc.subFrac" [ Intr "acc.ofFrac" [ Var v ]; d ] ] when (word d).IsSome -> Some(v, -(word d).Value)
+  | Intr "acc.hi" [ Intr "acc.sub" [ Intr "acc.ofFrac" [ Var v ]; d ] ] when (word d).IsSome -> Some(v, -(word d).Value)
+  | _ -> None
+
 /// `Frac.index w`, `Frac.index w + c` or `Frac.index w - c`, not known when compiling: (w, c).
 let computedIndex (ctx: Ctx) (e: Expr) =
   if (tryConst ctx e).IsSome then None
@@ -825,11 +844,71 @@ let rec acrossControl (v: Var) (e: Expr) =
   | ExprShape.ShapeCombination(_, xs) -> List.exists (acrossControl v) xs
 
 /// Everything compiling a scope changes but the label counter, to compile it again.
+/// Every node of an expression, outermost first; `enter e` says whether to look inside e. With an
+/// explicit stack: a long kernel's bodies nest lets thousands deep.
+let visit (enter: Expr -> bool) (root: Expr) =
+  let todo = Stack<Expr>()
+  todo.Push root
+  while todo.Count > 0 do
+    let e = todo.Pop()
+    if enter e then
+      match e with
+      | ExprShape.ShapeVar _ -> ()
+      | ExprShape.ShapeLambda(_, b) -> todo.Push b
+      | ExprShape.ShapeCombination(_, xs) -> for x in List.rev xs do todo.Push x
+
+/// The locals a DO loop's body steps by a constant (one `v <- v + c` at its top level, c a constant
+/// word) and otherwise reads only as the index of constant regions (`Region.read r v`,
+/// `Region.write r (v + d) x`): (v, c, the regions).
+let inductionsOf (ctx: Ctx) (body: Expr) =
+  let steps = Dictionary<Var, int>()
+  // the body's top level: its statements and the bodies of its lets
+  let spine = Stack<Expr>()
+  spine.Push body
+  while spine.Count > 0 do
+    match spine.Pop() with
+    | Sequential(a, b) -> spine.Push b; spine.Push a
+    | Let(_, _, b) -> spine.Push b
+    | VarSet(w, x) ->
+      match stepIndex ctx x with
+      | Some(v, c) when v = w && ctx.vars.ContainsKey w && not (steps.ContainsKey w) -> steps[w] <- c
+      | Some(v, _) when v = w -> steps[w] <- System.Int32.MinValue        // stepped twice
+      | _ -> ()
+    | _ -> ()
+  let bad = HashSet<Var>()
+  let regions = Dictionary<Var, ResizeArray<Region>>()
+  let assigned = Dictionary<Var, int>()
+  let index (r: Expr) (i: Expr) =
+    match stepIndex ctx i, constObject ctx r with
+    | Some(v, _), Some(:? Region as region) when steps.ContainsKey v ->
+      if not (regions.ContainsKey v) then regions[v] <- ResizeArray()
+      if not (regions[v] |> Seq.exists (fun x -> x.name = region.name)) then regions[v].Add region
+      true
+    | _ -> false
+  let skipIndex = HashSet<Expr>(HashIdentity.Reference)
+  body |> visit (fun e ->
+    match e with
+    | _ when skipIndex.Contains e -> false
+    | Intr "region.read" [ r; i ] when index r i -> false
+    | Intr "region.write" [ r; i; _ ] when index r i -> skipIndex.Add i |> ignore; skipIndex.Add r |> ignore; true
+    | VarSet(w, x) when steps.ContainsKey w ->
+      assigned[w] <- (match assigned.TryGetValue w with | true, n -> n + 1 | _ -> 1)
+      match stepIndex ctx x with
+      | Some(v, _) when v = w -> false
+      | _ -> bad.Add w |> ignore; true
+    | Var w -> bad.Add w |> ignore; false
+    | _ -> true)
+  [ for KeyValue(w, c) in steps do
+      if c <> System.Int32.MinValue && not (bad.Contains w) && regions.ContainsKey w
+         && assigned.TryGetValue w = (true, 1) && ctx.vars[w].ty = TFrac then
+        yield w, c, List.ofSeq regions[w] ]
+
 let snapshot (ctx: Ctx) =
   let count = ctx.items.Count
   let line, vars, consts, next, high, cursors, freeRegs, conts = ctx.line, ctx.vars, ctx.consts, ctx.next, ctx.high, ctx.cursors, ctx.freeRegs, ctx.conts
   let released, deadLocals = List.ofSeq ctx.released, List.ofSeq ctx.deadLocals
   let trackHome, indexed, counters, freeData, tables = ctx.trackHome, ctx.indexed, ctx.counters, ctx.freeData, ctx.tables.Count
+  let inductions = ctx.inductions
   let bHeld, bWrite = ctx.bHeld, ctx.bWrite
   let unswitched = List.ofSeq ctx.unswitched
   fun () ->
@@ -841,6 +920,7 @@ let snapshot (ctx: Ctx) =
     ctx.released.Clear(); ctx.released.UnionWith released
     ctx.deadLocals.Clear(); ctx.deadLocals.UnionWith deadLocals
     ctx.trackHome <- trackHome; ctx.indexed <- indexed; ctx.counters <- counters; ctx.freeData <- freeData
+    ctx.inductions <- inductions
     ctx.bHeld <- bHeld; ctx.bWrite <- bWrite
     // a loop split in the attempt given up is split again (it is not left as seen)
     ctx.unswitched.Clear(); ctx.unswitched.UnionWith unswitched
@@ -1233,6 +1313,10 @@ and genWord (ctx: Ctx) (e: Expr) : unit =
       | Some "acc.sat", [x] -> emit ctx (move (accPart ctx x 2) x0)
       | Some "frac.ofBool", [c] -> genWord ctx (selection ctx (Expr.IfThenElse(c, <@@ Frac.ofRaw 1 @@>, <@@ Frac.zero @@>)))
       | Some "table.read", [t; i] -> tableRead ctx t i 1 0 x0
+      | Some "region.read", [_; i] when ctx.affineAt.ContainsKey i ->
+        emit ctx (move ctx.affineAt[i] x0)
+      | Some "region.read", [r; i] when (inducted ctx r i).IsSome ->
+        emit ctx (move (inducted ctx r i).Value x0)
       | Some "region.read", [r; i] ->
         let region = constRegion ctx r
         indexInN0 ctx i 0
@@ -1338,6 +1422,19 @@ and indexInN0 (ctx: Ctx) (w: Expr) (extra: int) =
     genAcc ctx (Expr.Call(nonNull (typeof<Acc>.GetMethod "ofFrac"), [ w ]))
     if extra <> 0 then emit ctx (add (immL (extra &&& 0xffffff)) a)
     emit ctx (move a1 (N 0))
+
+/// The word a region access reads or writes through a loop's induction register, when its index
+/// is a local the loop steps (`v` or `v + d`): x:(rk) or x:(rk+d).
+and inducted (ctx: Ctx) (r: Expr) (i: Expr) : Mem option =
+  if ctx.inductions.IsEmpty then None
+  else
+    match stepIndex ctx i with
+    | Some(v, d) ->
+      let region = constRegion ctx r
+      ctx.inductions.TryFind((v, region.name)) |> Option.map (fun reg ->
+        { space = (match region.bank with XMemory -> Space.X | YMemory -> Space.Y)
+          ea = if d = 0 then Ind reg else Disp(reg, Operand.num d) })
+    | None -> None
 
 /// r0 at a region's first word (the loader patches the address in).
 and regionInR0 (ctx: Ctx) (region: Region) =
@@ -1758,6 +1855,12 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
   match e with
   | Sequential(s1, s2) -> thenRun ctx s2 (fun () -> genStmt ctx s1); genStmt ctx s2
   | Let(v, value, body) -> withLet ctx v value body (fun () -> genStmt ctx body)
+  | VarSet(v, value) when ctx.inductions |> Map.exists (fun (w, _) _ -> w = v) ->
+    // a stepped local: its address registers step instead (the local is set after the loop)
+    let _, c = (stepIndex ctx value).Value
+    for KeyValue((w, _), reg) in ctx.inductions do
+      if w = v && c <> 0 then
+        if c = 1 then emit ctx (update (inc (R reg))) else emit ctx (lua (Disp(reg, Operand.num c)) (R reg))
   | VarSet(v, value) ->
     match Map.tryFind v ctx.vars with
     | Some h -> store ctx h value
@@ -1766,6 +1869,10 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
     store ctx (stateHome (field ctx p.Name)) value
   | ComputedElement ctx (f, w, c, [ value ]) ->
     computedStore ctx w (f.offset + c) (fun () -> emit ctx (move r6 r0)) (computedMem f.bank) value
+  | Intr "region.write" [ _; i; value ] when ctx.affineAt.ContainsKey i ->
+    storeWord ctx value ctx.affineAt[i]
+  | Intr "region.write" [ r; i; value ] when (inducted ctx r i).IsSome ->
+    storeWord ctx value (inducted ctx r i).Value
   | Intr "region.write" [ r; i; value ] ->
     let region = constRegion ctx r
     computedStore ctx i 0 (fun () -> regionInR0 ctx region) (computedMem region.bank) value
@@ -1838,10 +1945,112 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
     let count = hi - lo + 1
     // what reads the index: state arrays (an address register each, stepping once a pass) and
     // Frac.ofRaw i (a counter word); anything else is refused
+    // region indexes affine in the index (inv + c·v + d, through lets, helpers, sums and shifts):
+    // grouped by region, invariant part and stride, an address register each
+    let assignedIn = HashSet<Var>()
+    let boundIn = HashSet<Var>()
+    let lets = Dictionary<Var, Expr>()
+    body |> visit (fun e ->
+      match e with
+      | VarSet(w, _) -> assignedIn.Add w |> ignore
+      | Let(w, x, _) -> boundIn.Add w |> ignore; (if not w.IsMutable then lets[w] <- x)
+      | ForIntegerRangeLoop(w, _, _, _) -> boundIn.Add w |> ignore
+      | _ -> ()
+      true)
+    let sext (w: int) = (w <<< 8) >>> 8
+    let plus (a: Expr option) (b: Expr option) =
+      match a, b with
+      | None, x | x, None -> x
+      | Some x, Some y -> Some(<@@ Acc.hi (Acc.ofFrac (%%x : Frac) + (%%y : Frac)) @@>)
+    let rec affine (env: Map<Var, Expr>) (e: Expr) : (Expr option * int * int) option =
+      match tryConst ctx e with
+      | Some(:? Frac as f) -> Some(None, 0, sext f.Word)
+      | _ ->
+        match e with
+        | Call(None, mi, [ Var i ]) when i = v && mi.Name = "ofRaw" && mi.DeclaringType = typeof<Frac> -> Some(None, 1, 0)
+        | Var x when env.ContainsKey x -> affine env env[x]
+        | Var x when lets.ContainsKey x -> affine env lets[x]
+        | Var x when x.Type = typeof<Frac> && not (assignedIn.Contains x) && not (boundIn.Contains x) && ctx.vars.ContainsKey x ->
+          Some(Some e, 0, 0)
+        | Let(w, x, b) when not w.IsMutable -> affine (env.Add(w, x)) b
+        | Intr "acc.hi" [ Intr "acc.addFrac" [ Intr "acc.ofFrac" [ a ]; b ] ] ->
+          match affine env a, affine env b with
+          | Some(ia, ca, ka), Some(ib, cb, kb) -> Some(plus ia ib, ca + cb, ka + kb)
+          | _ -> None
+        | Intr "acc.hi" [ Intr "acc.subFrac" [ Intr "acc.ofFrac" [ a ]; b ] ] ->
+          match affine env a, affine env b with
+          | Some(ia, ca, ka), Some(None, cb, kb) -> Some(ia, ca - cb, ka - kb)
+          | _ -> None
+        | Intr "acc.hi" [ Intr "acc.asl" [ Intr "acc.ofFrac" [ a ]; n ] ] ->
+          match affine env a, tryConst ctx n with
+          | Some(None, c, k), Some(:? int as n) when n >= 0 && n < 16 -> Some(None, c <<< n, k <<< n)
+          | _ -> None
+        | Call(None, mi, args) when intrinsic (resolve mi args) = None && not (isSubroutine mi) && (reflected mi).IsSome ->
+          affine env (inlined mi args)
+        | _ -> None
+    let consumed = HashSet<Expr>(HashIdentity.Reference)
+    let groups = Dictionary<string, Region * Expr option * int * int>()   // key -> region, inv, stride, register (-1: none yet)
+    let accessAt = Dictionary<Expr, string * int>(HashIdentity.Reference) // index -> group key, displacement
+    let take (r: Expr) (i: Expr) =
+      match constObject ctx r, affine Map.empty i with
+      | Some(:? Region as region), Some(inv, c, d) when c <> 0 ->
+        let key = $"{region.name}|{c}|%A{inv}"
+        if not (groups.ContainsKey key) then groups[key] <- (region, inv, c, -1)
+        accessAt[i] <- (key, d)
+        consumed.Add i |> ignore
+        true
+      | _ -> false
+    // a taken index is not looked into (the written value is)
+    body |> visit (fun e ->
+      match e with
+      | Intr "region.read" [ r; i ] -> not (take r i)
+      | Intr "region.write" [ r; i; _ ] -> take r i |> ignore; true
+      | _ when consumed.Contains e -> false
+      | _ -> true)
+    // lets read only by those indexes (or by other such lets) are not computed
+    let mutable skipped =
+      if groups.Count = 0 then Set.empty
+      else lets.Keys |> Seq.filter (fun w -> (affine Map.empty (Expr.Var w)).IsSome) |> Set.ofSeq
+    let mutable settled = false
+    while not settled do
+      let others = HashSet<Var>()
+      let skippedValues = HashSet<Expr>(HashIdentity.Reference)
+      body |> visit (fun e ->
+        match e with
+        | _ when consumed.Contains e || skippedValues.Contains e -> false
+        | Let(w, x, _) when skipped.Contains w -> skippedValues.Add x |> ignore; true
+        | Var x -> others.Add x |> ignore; false
+        | _ -> true)
+      let next = skipped |> Set.filter (fun w -> not (others.Contains w))
+      settled <- next = skipped
+      skipped <- next
+    // the lets only those indexes read go: their values written into the indexes, so the body is
+    // generated without them, and a copy of a part of it (an inner loop unswitched) still reads
+    // whole indexes; the accesses are found again in the body as it now is
+    let body =
+      if skipped.IsEmpty then body
+      else
+        let rec drop (e: Expr) : Expr =
+          match e with
+          | Let(w, x, b) when skipped.Contains w -> (drop b).Substitute(fun u -> if u = w then Some(drop x) else None)
+          | ExprShape.ShapeVar _ -> e
+          | ExprShape.ShapeLambda(u, b) -> Expr.Lambda(u, drop b)
+          | ExprShape.ShapeCombination(o, xs) -> ExprShape.RebuildShapeCombination(o, List.map drop xs)
+        let rewritten = drop body
+        consumed.Clear(); accessAt.Clear(); groups.Clear()
+        rewritten |> visit (fun e ->
+          match e with
+          | Intr "region.read" [ r; i ] -> not (take r i)
+          | Intr "region.write" [ r; i; _ ] -> take r i |> ignore; true
+          | _ when consumed.Contains e -> false
+          | _ -> true)
+        rewritten
     let arrays = Collections.Generic.Dictionary<string, int * int>()   // field -> lowest, highest offset
     let mutable counted = false
     let rec scan (e: Expr) =
       match e with
+      | _ when consumed.Contains e -> ()
+      | Let(w, _, b) when skipped.Contains w -> scan b
       | Call(None, mi, PropertyGet(Some(Var s), p, []) :: index :: rest)
           when (mi.Name = "GetArray" || mi.Name = "SetArray") && s.Type = ctx.kernel.stateType
                && (loopOffset ctx (fun i -> i = v) index).IsSome ->
@@ -1906,6 +2115,36 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
               let holders = String.Join(", ", held @ others |> List.distinct)
               fail ($"{name}[{v.Name}]: no address register is free for the loop over {v.Name} (r1..r5 hold {holders}). " +
                     $"End a cursor before the loop, or index with a word counted when running: s.{name}[Frac.index (Frac.ofRaw {v.Name})] (r0 and n0, no register held)") ]
+      // the affine groups' registers, after the arrays' (which must have one): all or none, and
+      // with none the indexes and lets are compiled as they are (scanned again for a counter)
+      let affineRegs =
+        if groups.Count > 0 && ctx.freeRegs.Length >= groups.Count then
+          [ for KeyValue(key, (region, inv, c, _)) in Array.ofSeq groups do
+              let reg =
+                match ctx.freeRegs |> List.tryFind (fun r -> (r >= 4) = (region.bank = YMemory)) with
+                | Some r -> r
+                | None -> ctx.freeRegs.Head
+              ctx.freeRegs <- ctx.freeRegs |> List.filter ((<>) reg)
+              match inv with
+              | Some e -> genAcc ctx (Expr.Call(nonNull (typeof<Acc>.GetMethod "ofFrac"), [ e ]))
+              | None -> emit ctx (move (immL 0) a)
+              if c * lo <> 0 then emit ctx (add (immL ((c * lo) &&& 0xffffff)) a)
+              importHere ctx region.name region.abiSymbol (move (immL 0) x0)
+              emit ctx (add x0 a)
+              emit ctx (move a1 (R reg))
+              groups[key] <- (region, inv, c, reg)
+              yield reg, c ]
+        else
+          if groups.Count > 0 then
+            consumed.Clear()
+            skipped <- Set.empty
+            scan body
+          []
+      for KeyValue(i, (key, d)) in accessAt do
+        if consumed.Contains i then
+          let region, _, _, reg = groups[key]
+          ctx.affineAt[i] <- { space = (match region.bank with XMemory -> Space.X | YMemory -> Space.Y)
+                               ea = if d = 0 then Ind reg else Disp(reg, Operand.num d) }
       let counter =
         if counted then
           let h = alloc ctx TFrac
@@ -1914,6 +2153,31 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
           ctx.counters <- ctx.counters.Add(v, h)
           Some h
         else None
+      // locals the body steps by a constant and reads only as region indexes: an address
+      // register at region + local each, stepped where the local was (the local set after)
+      let savedInductions = ctx.inductions
+      let stepLocals =
+        [ for w, c, regions in inductionsOf ctx body do
+            let banks = regions |> List.map (fun (r: Region) -> r.bank)
+            let pick (bank: Bank) =
+              match ctx.freeRegs |> List.tryFind (fun r -> (r >= 4) = (bank = YMemory)), ctx.freeRegs with
+              | Some r, _ -> Some r
+              | None, r :: _ -> Some r
+              | None, [] -> None
+            let taken = ResizeArray<int>()
+            for b in banks do
+              match pick b with
+              | Some r -> ctx.freeRegs <- ctx.freeRegs |> List.filter ((<>) r); taken.Add r
+              | None -> ()
+            if taken.Count = regions.Length then
+              for region, reg in List.zip regions (List.ofSeq taken) do
+                genAcc ctx (Expr.Call(nonNull (typeof<Acc>.GetMethod "ofFrac"), [ Expr.Var w ]))
+                importHere ctx region.name region.abiSymbol (move (immL 0) x0)
+                emit ctx (add x0 a)
+                emit ctx (move a1 (R reg))
+                ctx.inductions <- ctx.inductions.Add((w, region.name), reg)
+              yield w, c, List.ofSeq taken
+            else ctx.freeRegs <- List.ofSeq taken @ ctx.freeRegs ]
       let endLabel = fresh ctx "LOOP"
       // the loop's end address is absolute: the loader relocates it
       emit ctx (Label(endLabel + "_DO"))
@@ -1924,7 +2188,7 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
       ctx.deepest <- max ctx.deepest ctx.depth
       thenRun ctx body (fun () -> genStmt ctx body)     // the body runs again
       ctx.depth <- ctx.depth - 2
-      let stepped = not regs.IsEmpty || counter.IsSome
+      let stepped = not regs.IsEmpty || counter.IsSome || not affineRegs.IsEmpty
       // DO needs an instruction to end on: the body's end cannot be a branch target
       let last = if ctx.items.Count > first then Some ctx.items[ctx.items.Count - 1] else None
       match last with
@@ -1933,6 +2197,8 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
       for reg in regs do
         emit ctx (update (inc (R reg)))
         if longRegs.Contains reg then emit ctx (update (inc (R reg)))
+      for reg, c in affineRegs do
+        if c = 1 then emit ctx (update (inc (R reg))) else emit ctx (lua (Disp(reg, Operand.num c)) (R reg))
       match counter with
       | Some h ->
         emit ctx (move (at h 0) a)
@@ -1943,6 +2209,14 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
       ctx.freeRegs <- regs @ ctx.freeRegs
       ctx.indexed <- savedIndexed
       ctx.counters <- savedCounters
+      ctx.inductions <- savedInductions
+      for i in accessAt.Keys do ctx.affineAt.Remove i |> ignore
+      ctx.freeRegs <- (affineRegs |> List.map fst) @ ctx.freeRegs
+      for w, c, taken in stepLocals do
+        ctx.freeRegs <- taken @ ctx.freeRegs
+        let k = c * count
+        if k <> 0 then
+          genStmt ctx (Expr.VarSet(w, <@@ Acc.hi (Acc.ofFrac (%%(Expr.Var w) : Frac) + Frac.ofRaw k) @@>))
   | WhileLoop(cond, body) ->
     // the condition at the top, tested before each pass (none when it is false at once); the
     // condition and the body are compiled knowing the whole loop runs again after them
@@ -2418,7 +2692,7 @@ let rec generateWith (floors: Map<string, int>) (unswitchMax: int option) (targe
       { target = target; kernel = k; layout = layout; items = ResizeArray(); lines = ResizeArray(); line = 0
         vars = Map.empty; consts = Map.empty; next = layout.xWorkset; high = layout.xWorkset; labels = 0
         cursors = Map.empty; freeRegs = [ 1; 2; 3; 4; 5 ]; tables = ResizeArray(); conts = []; released = Collections.Generic.HashSet(); trackHome = None
-        indexed = Map.empty; counters = Map.empty; freeData = [ X1; Y1 ]; scores = Dictionary(); deadLocals = HashSet()
+        indexed = Map.empty; counters = Map.empty; inductions = Map.empty; affineAt = Dictionary(HashIdentity.Reference); freeData = [ X1; Y1 ]; scores = Dictionary(); deadLocals = HashSet()
         unswitched = HashSet(); bHeld = false; bWrite = false
         subs = Dictionary(); inSub = None; depth = 0; deepest = 0; floors = floors
         kept = keptLoops k; unrolled = unrolledLoops k; pending = []; unswitchMax = unswitchMax; unswitchCosts = ResizeArray() }
@@ -2470,7 +2744,22 @@ let rec generateWith (floors: Map<string, int>) (unswitchMax: int option) (targe
 
 /// The compiled kernel, its size not checked, each loop unswitched only when its copy takes at
 /// most `unswitchMax` words (None: any); and what each unswitched loop's copy took.
-let generateUnswitching (unswitchMax: int option) (target: Target) (k: Kernel) = generateWith Map.empty unswitchMax target k
+/// Code generation recurses once per nested let and statement: a long kernel nests thousands, more
+/// than a thread pool thread's stack holds. It runs on its own thread with a 256 MB stack.
+let generateUnswitching (unswitchMax: int option) (target: Target) (k: Kernel) =
+  let mutable result = Unchecked.defaultof<Result<Compiled * int list, string>>
+  let mutable failure : System.Runtime.ExceptionServices.ExceptionDispatchInfo option = None
+  let t =
+    System.Threading.Thread(
+      (fun () ->
+        try result <- generateWith Map.empty unswitchMax target k
+        with e -> failure <- Some(System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture e)),
+      256 * 1024 * 1024)
+  t.Start()
+  t.Join()
+  // what it raised, as raised (callers catch KernelError)
+  failure |> Option.iter (fun f -> f.Throw())
+  result
 
 /// The compiled kernel, its size not checked (Optimize.compile checks it after its passes).
 let generate (target: Target) (k: Kernel) = generateUnswitching None target k |> Result.map fst

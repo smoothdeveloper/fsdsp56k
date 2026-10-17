@@ -1074,6 +1074,43 @@ module IndexArg =
 
   let kernel = Kernel.define "probe-index-arg" <@ init @> <@ trig @> <@ render @>
 
+/// Region indexes a DO loop steps: a local stepped by a constant (`w <- w + 2`, read as w and
+/// w + 1, its value used after the loop) and indexes affine in the loop index through lets and a
+/// helper (`n = h + 2k`, `n + 1`): address registers stepped instead of r0/n0 rebuilt each access.
+[<ReflectedDefinition>]
+module RegionInduction =
+  type S =
+    { mutable at : Frac
+      mutable last : Frac }
+
+  let inc (v: Frac) (d: Frac) = Acc.hi (Acc.ofFrac v + d)
+
+  let init (_: Banks.P) (s: S) =
+    s.at <- Frac.zero
+    s.last <- Frac.zero
+
+  let trig (_: Banks.P) (_: S) = ()
+
+  let render (p: Banks.P) (s: S) (out: Output) =
+    let mutable w = Acc.hi (Acc.andHi 0x3 (Acc.ofFrac p.a))
+    for k in 0 .. 9 do
+      Region.write Scratch.x w (Acc.hi (Acc.ofFrac p.c + Frac.ofRaw k))
+      Region.write Scratch.y (Acc.hi (Acc.ofFrac w + Frac.ofRaw 1)) p.d
+      w <- Acc.hi (Acc.ofFrac w + Frac.ofRaw 2)
+    let h = Acc.hi (Acc.andHi 0x7 (Acc.ofFrac p.b))
+    for k in 0 .. 3 do
+      let n = inc h (Acc.hi (Acc.ofFrac (Frac.ofRaw k) <<< 1))
+      Region.write Scratch.x (inc n (Frac.ofRaw 1)) (Acc.hi (Acc.ofFrac (Region.read Scratch.y n) + p.a))
+    let mutable r = Acc.hi (Acc.andHi 0x1 (Acc.ofFrac p.b))
+    for _ in 0 .. 15 do
+      out.Write(Region.read Scratch.x r)
+      out.Write(Region.read Scratch.y (Acc.hi (Acc.ofFrac r + Frac.ofRaw 1)))
+      r <- Acc.hi (Acc.ofFrac r + Frac.ofRaw 1)
+    s.at <- w
+    s.last <- r
+
+  let kernel = Kernel.define "probe-region-induction" <@ init @> <@ trig @> <@ render @>
+
 /// A region's address taken twice in one function, a branch between, then zeros stored: the
 /// second `move #>region,x0` is patched by the loader, so x0 does not hold the 0 the assembler
 /// wrote (MDX P-I-PN's INIT: its zeros took the region's address).
@@ -1760,6 +1797,18 @@ let tests =
       test "a region's address taken twice, then zeros: the patched immediate is not a known 0" {
         needNative ()
         conformance AddressTwice.kernel 61
+      }
+      test "region indexes a loop steps (a stepped local, affine in the index): compiled program equals the .NET kernel" {
+        needNative ()
+        conformance RegionInduction.kernel 62
+      }
+      test "region indexes a loop steps: no r0/n0 rebuilt in the loops" {
+        match Optimize.compile Optimize.Direct Kernel.mds RegionInduction.kernel with
+        | Error e -> failtest e
+        | Ok c ->
+          let text = c.items |> Array.map dsp56k.dsl.Transcribe.item
+          Expect.isFalse (text |> Array.exists (fun l -> l.Contains "(idx r0)")) "no (r0+n0) access left"
+          Expect.isTrue (text |> Array.exists (fun l -> l.StartsWith "lua")) "a register stepped by lua"
       }
       test "register locals read in both branches of an if: compiled program equals the .NET kernel" {
         needNative ()
