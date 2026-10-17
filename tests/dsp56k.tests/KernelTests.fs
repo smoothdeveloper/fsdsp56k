@@ -169,6 +169,52 @@ module Probes =
       x <- (x >>> 5) + p.b * p.c
     s.acc <- Long.ofAcc x
 
+  /// LSR (a1 only, a2 and a0 kept) and shifts by a count computed when running (`asr s,a,a`,
+  /// `asl s,a,a`, `lsr s,a`), the count from a word's top bits as TXZ-EP takes it from its exp
+  /// table. The logical counts stay under 32: past that the emulator's LSR by a register differs
+  /// from the chip (it takes the count modulo 32 on a1).
+  let shifts (p: P) (s: S) (out: Output) =
+    let mutable x = Acc.ofLong s.acc + p.a * p.b
+    for _ in 0 .. 1 do
+      out.Write(Frac.lsr 9 p.c)
+      out.Write(Frac.lsr 23 p.c)
+      let l = Acc.lsr 5 x
+      out.Write(Acc.hi l)
+      out.Write(Acc.lo l)
+      out.Write(Acc.sat l)
+      out.Write(Acc.sat (Acc.lsr 1 x))
+      let k = Frac.lsr 18 p.b
+      let k31 = Acc.hi (Acc.andHi 0xffffdf (Acc.ofFrac p.a))
+      let r = Acc.asrBy k x
+      out.Write(Acc.sat r)
+      out.Write(Acc.lo r)
+      let up = Acc.aslBy k x
+      out.Write(Acc.sat up)
+      let lr = Acc.lsrBy k31 x
+      out.Write(Acc.hi lr)
+      out.Write(Acc.lo lr)
+      out.Write(Acc.sat lr)
+      out.Write(Frac.lsrBy k31 p.d)
+      out.Write(Acc.sat (Acc.asrBy (Frac.ofRaw 0x47) x))
+      out.Write(Acc.hi (Acc.lsrBy (Frac.ofRaw 26) x))
+      out.Write(Acc.lo (Acc.aslBy (Frac.ofRaw 13) x))
+      x <- Acc.asrBy k x + p.c * p.d
+    s.acc <- Long.ofAcc x
+
+  /// Bit tests as conditions (`btst #n,d`, a branch on the carry): the half sine's sign bit as
+  /// TXZ-EP reads it, a parameter's low bit, `not` a bit.
+  let bits (p: P) (s: S) (out: Output) =
+    let mutable phase = Acc.ofLong s.acc
+    for _ in 0 .. 7 do
+      let ph = Acc.hi phase
+      let v = Acc.ofFrac (Frac.lsr 9 ph)
+      out.Write(if Frac.bit 23 ph then Acc.sat (-v) else Acc.sat v)
+      if Frac.bit 0 p.a then out.Write(p.b) else out.Write(p.c)
+      if not (Frac.bit 14 ph) then out.Write(Acc.hi (Acc.ofFrac p.d >>> 1)) else out.Write(ph)
+      out.Write(if Frac.bit 5 p.b then p.c else p.d)
+      phase <- phase + Acc.ofFrac p.c
+    s.acc <- Long.ofAcc phase
+
   let readsIndex (_: P) (_: S) (out: Output) =
     for i in 0 .. 31 do
       out.Write(Frac.ofRaw i)
@@ -184,6 +230,8 @@ module Probes =
   let mulSuKernel = Kernel.define "probe-mulsu-dmac" <@ init @> <@ trig @> <@ mulSu @>
   let normaliseKernel = Kernel.define "probe-clb-normf" <@ init @> <@ trig @> <@ normalise @>
   let normaliseEdgesKernel = Kernel.define "probe-clb-normf-edges" <@ init @> <@ trig @> <@ normaliseEdges @>
+  let shiftsKernel = Kernel.define "probe-shifts" <@ init @> <@ trig @> <@ shifts @>
+  let bitsKernel = Kernel.define "probe-bit-test" <@ init @> <@ trig @> <@ bits @>
   let pipedKernel = Kernel.define "probe-piped" <@ init @> <@ trig @> <@ piped @>
   let memoryKernel = Kernel.define "probe-memory" <@ init @> <@ trig @> <@ memory @>
   let indexKernel = Kernel.define "probe-index" <@ init @> <@ trig @> <@ readsIndex @>
@@ -900,6 +948,108 @@ module Frames =
 
   let kernel = Kernel.define "probe-subroutine-frames" <@ init @> <@ trig @> <@ render @>
 
+/// [<Unroll>]: four calls deep, a DO loop at each level, then an 8-tap loop: 14 system stack
+/// levels with the taps a DO loop, 12 with them written out.
+[<ReflectedDefinition>]
+module Unrolled =
+  type S =
+    { mutable acc : Acc
+      [<Length 8>] mutable taps : Frac array
+      [<Length 8>] mutable line : Frac array }
+
+  let tapsBody (s: S) (x: Frac) =
+    let mutable sum = Acc.ofFrac x >>> 2
+    for i in 0 .. 7 do
+      sum <- sum + s.taps[i] * s.line[i]
+      s.line[i] <- Acc.hi (Acc.ofFrac s.line[i] + x * s.taps[i])
+    Acc.sat sum
+
+  [<Subroutine>]
+  let taps (s: S) (x: Frac) = tapsBody s x
+
+  /// The same taps written out ([<Unroll>] reaches the loops of the function it marks, not
+  /// those of the helpers it inlines).
+  [<Subroutine; Unroll>]
+  let tapsOut (s: S) (x: Frac) =
+    let mutable sum = Acc.ofFrac x >>> 2
+    for i in 0 .. 7 do
+      sum <- sum + s.taps[i] * s.line[i]
+      s.line[i] <- Acc.hi (Acc.ofFrac s.line[i] + x * s.taps[i])
+    Acc.sat sum
+
+  [<Subroutine>]
+  let level3 (s: S) (x: Frac) =
+    let mutable y = x
+    for _ in 0 .. 1 do
+      y <- taps s y
+    y
+
+  [<Subroutine>]
+  let level2 (s: S) (x: Frac) =
+    let mutable y = x
+    for _ in 0 .. 1 do
+      y <- level3 s y
+    y
+
+  [<Subroutine>]
+  let level1 (s: S) (x: Frac) =
+    let mutable y = x
+    for _ in 0 .. 1 do
+      y <- level2 s y
+    y
+
+  [<Subroutine>]
+  let level3Out (s: S) (x: Frac) =
+    let mutable y = x
+    for _ in 0 .. 1 do
+      y <- tapsOut s y
+    y
+
+  [<Subroutine>]
+  let level2Out (s: S) (x: Frac) =
+    let mutable y = x
+    for _ in 0 .. 1 do
+      y <- level3Out s y
+    y
+
+  [<Subroutine>]
+  let level1Out (s: S) (x: Frac) =
+    let mutable y = x
+    for _ in 0 .. 1 do
+      y <- level2Out s y
+    y
+
+  [<Unroll>]
+  let init (_: Banks.P) (s: S) =
+    s.acc <- Acc.zero
+    for i in 0 .. 7 do
+      s.taps[i] <- Frac.ofRaw (0x100000 - i * 0x020000)
+      s.line[i] <- Frac.zero
+
+  let trig (_: Banks.P) (_: S) = ()
+
+  let render (p: Banks.P) (s: S) (out: Output) =
+    for _ in 0 .. 31 do
+      let y = level1Out s p.a
+      out.Write y
+      s.acc <- Acc.ofFrac y + p.b * p.c
+
+  let renderDeep (p: Banks.P) (s: S) (out: Output) =
+    for _ in 0 .. 31 do
+      out.Write(level1 s p.a)
+
+  /// Unrolled in RENDER itself, nested loops included, the indices constants in each copy.
+  [<Unroll>]
+  let renderFlat (p: Banks.P) (s: S) (out: Output) =
+    for k in 0 .. 3 do
+      for i in 0 .. 7 do
+        out.Write(Acc.sat (s.taps[i] * p.a + Acc.ofFrac (Frac.ofRaw (k * 8 + i))))
+      s.line[k + 1] <- Acc.hi (Acc.ofFrac s.line[k] + p.d)
+
+  let kernel = Kernel.define "probe-unroll" <@ init @> <@ trig @> <@ render @>
+  let deepKernel = Kernel.define "probe-unroll-deep" <@ init @> <@ trig @> <@ renderDeep @>
+  let flatKernel = Kernel.define "probe-unroll-flat" <@ init @> <@ trig @> <@ renderFlat @>
+
 /// Loops counted when running (TX8-CY's samples to the next oscillator edge): `for _ in 1 ..
 /// Frac.index n`, zero passes for a count of zero or less, a block split at a computed edge.
 [<ReflectedDefinition>]
@@ -1367,6 +1517,31 @@ let tests =
           Expect.isLessThanOrEqual c.xWorkset 17 "t1..t4 and middle's dead locals given to the frames"
       } ]
 
+    testList "[<Unroll>]" [
+      test "written out: compiled program equals the .NET kernel" {
+        needNative ()
+        conformance Unrolled.kernel 53
+      }
+      test "in an entry, nested, the index a constant: compiled program equals the .NET kernel" {
+        needNative ()
+        conformance Unrolled.flatKernel 54
+      }
+      test "no DO loop left where the loops are unrolled" {
+        match Optimize.compile Optimize.Peephole Kernel.mds Unrolled.flatKernel with
+        | Error e -> failtest e
+        | Ok c ->
+          let loops = c.items |> Array.filter (fun it -> match it with dsp56k.Item.Op(dsp56k.Loop _) -> true | _ -> false)
+          Expect.isEmpty loops "RENDER's two loops written out"
+      }
+      test "the system stack: the taps as a DO loop take 14 levels, written out 12" {
+        match Optimize.compile Optimize.Peephole Kernel.mds Unrolled.deepKernel with
+        | Ok _ -> failtest "compiled"
+        | Error e -> Expect.stringContains e "takes 14 system stack levels" "four calls, five DO loops"
+        match Optimize.compile Optimize.Peephole Kernel.mds Unrolled.kernel with
+        | Error e -> failtest e
+        | Ok _ -> ()
+      } ]
+
     test "loops counted when running: compiled program equals the .NET kernel" {
       needNative ()
       conformance Counted.kernel 61
@@ -1459,6 +1634,56 @@ let tests =
     test "CLB and NORMF, edges (zero, all ones, extension, counts past 23): compiled program equals the .NET kernel" {
       needNative ()
       conformance Probes.normaliseEdgesKernel 7
+    }
+
+    test "LSR and shifts by a count when running: compiled program equals the .NET kernel" {
+      needNative ()
+      conformance Probes.shiftsKernel 8
+    }
+
+    test "LSR and shifts by a count, .NET: a1 alone, the count's low six bits" {
+      let acc (v: int64) = Acc.ofRaw v
+      let w (v: int) = Frac.ofRaw v
+      Expect.equal (Frac.lsr 4 (w 0x800000)).Raw 0x080000 "zeros in from the top"
+      Expect.equal (Frac.lsr 24 (w 0xffffff)).Raw 0 "24 on gives 0"
+      Expect.equal (Frac.lsrBy (w 0x41) (w 0xfffffe)).Raw 0x7fffff "the count's low six bits"
+      Expect.equal (Frac.lsrBy (w 30) (w 0xffffff)).Raw 0 "a count of 24 on gives 0"
+      Expect.equal (Acc.lsr 4 (acc 0xff800000123456L)).Raw (Bits.sext56 0xff080000123456L) "a2 and a0 kept"
+      Expect.equal (Acc.lsrBy (w 25) (acc 0x12abcdef654321L)).Raw 0x12000000654321L "a1 cleared, a2 and a0 kept"
+      Expect.equal (Acc.asrBy (w 0x43) (acc -0x80L)).Raw -0x10L "arithmetic, by the low six bits"
+      Expect.equal (Acc.asrBy (w 63) (acc -5L)).Raw -1L "all sign"
+      Expect.equal (Acc.aslBy (w 4) (acc 0x10000000000000L)).Raw 0L "bits past bit 55 are lost"
+      Expect.equal (Acc.aslBy (w 0x7fffc1) (acc 3L)).Raw 6L "the count's low six bits"
+      Expect.equal (Acc.aslBy (w 56) (acc -1L)).Raw 0L "56 on gives 0"
+    }
+
+    test "LSR and shifts by a count: the register forms, no loop" {
+      match Optimize.compile Optimize.Peephole Kernel.mds Probes.shiftsKernel with
+      | Error e -> failtest e
+      | Ok c ->
+        let has f = c.items |> Array.exists (fun it -> match it with dsp56k.Item.Op i -> f i | _ -> false)
+        Expect.isTrue (has (function dsp56k.ShiftReg(dsp56k.ShAsr, _, _, _) -> true | _ -> false)) "asr s,a,a"
+        Expect.isTrue (has (function dsp56k.ShiftReg(dsp56k.ShAsl, _, _, _) -> true | _ -> false)) "asl s,a,a"
+        Expect.isTrue (has (function dsp56k.ShiftReg(dsp56k.ShLsr, _, _, _) -> true | _ -> false)) "lsr s,a"
+        Expect.isTrue (has (function dsp56k.ShiftImm(dsp56k.ShLsr, 26, _, _) -> true | _ -> false)) "a constant count: lsr #26,a"
+        Expect.isTrue (has (function dsp56k.ShiftImm(dsp56k.ShAsr, 7, _, _) -> true | _ -> false)) "the low six bits of $47: asr #7"
+        Expect.isFalse (has (function dsp56k.Rep _ -> true | _ -> false)) "no REP"
+    }
+
+    test "bit tests as conditions: compiled program equals the .NET kernel" {
+      needNative ()
+      conformance Probes.bitsKernel 9
+    }
+
+    test "bit tests: btst and a branch on the carry, the bit checked on .NET" {
+      Expect.isTrue (Frac.bit 23 (Frac.ofRaw 0x800000)) "the sign bit"
+      Expect.isFalse (Frac.bit 22 (Frac.ofRaw 0x800000)) "another"
+      Expect.isTrue (Frac.bit 0 (Frac.ofRaw -1)) "bit 0 of all ones"
+      match Optimize.compile Optimize.Peephole Kernel.mds Probes.bitsKernel with
+      | Error e -> failtest e
+      | Ok c ->
+        let tests = c.items |> Array.filter (fun it -> match it with dsp56k.Item.Op(dsp56k.BitOp(dsp56k.Btst, _, _)) -> true | _ -> false)
+        Expect.isGreaterThanOrEqual tests.Length 3 "a btst per test"
     }
 
     test "more arrays than address registers in one loop: compiled program equals the .NET kernel" {

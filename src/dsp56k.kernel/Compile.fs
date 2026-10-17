@@ -152,6 +152,7 @@ type Ctx =
     subs     : Dictionary<MethodInfo, Sub>   // [<Subroutine>] helpers called, compiled after the entries
     floors   : Map<string, int>          // the least first word of a subroutine's (Refloor)
     kept     : HashSet<Var>                  // loops not unswitched: in [<NoUnswitch>] functions
+    unrolled : HashSet<Var>                  // loops written out: in [<Unroll>] functions
     mutable pending : Expr list              // code being generated that conts may not hold (a
                                              // subroutine's body, a loop count, a cursor's start):
                                              // what a call's frame must not overwrite either
@@ -999,6 +1000,26 @@ let rec genAcc (ctx: Ctx) (e: Expr) : unit =
         let n = constInt ctx "a shift" n
         genAcc ctx x
         if n = 1 then emit ctx (asl a) elif n > 1 then emit ctx (asli n a a)
+      | Some "acc.lsr", [n; x] ->
+        let n = constInt ctx "a shift" n
+        if n < 0 || n > 31 then fail $"a logical shift is 0 to 31 bits, not {n}"
+        genAcc ctx x
+        if n = 1 then emit ctx (lsr a) elif n > 1 then emit ctx (lsri n a)
+      // by a count when running: `asr s,a,a` `asl s,a,a` `lsr s,a`, s a data register (the
+      // immediate form for a constant count)
+      | Some("acc.asrBy" | "acc.aslBy" | "acc.lsrBy" as op), [k; x] ->
+        let shift = match op with "acc.asrBy" -> ShAsr | "acc.aslBy" -> ShAsl | _ -> ShLsr
+        match tryConst ctx k with
+        | Some(:? Frac as c) when shift <> ShLsr || c.Raw &&& 0x3f < 32 ->
+          let n = c.Raw &&& 0x3f
+          genAcc ctx x
+          if n > 0 then emit ctx (Op(ShiftImm(shift, n, dsp56k.Acc.A, dsp56k.Acc.A)))
+        | _ ->
+          let w = (operands ctx [ k ])[0]
+          genAcc ctx x
+          let r, loads = match w with WReg r when r = X0 || r = X1 || r = Y0 || r = Y1 -> r, [] | _ -> X0, loadWord w X0
+          emitAll ctx loads
+          emit ctx (Op(ShiftReg(shift, r, dsp56k.Acc.A, dsp56k.Acc.A)))
       | Some "acc.andHi", [m; x] ->
         let m = constInt ctx "andHi's mask" m
         genAcc ctx x
@@ -1157,6 +1178,11 @@ and genWord (ctx: Ctx) (e: Expr) : unit =
           | Some(:? Cell as c) -> c
           | _ -> fail $"a cell must be a constant, got {c}"
         importHere ctx cell.name cell.abiSymbol (move (xm (absL 0)) x0)
+      // the word in a1: `lsr #n,a` or `lsr s,a`, then a1
+      | Some("frac.lsr" | "frac.lsrBy" as op), [n; f] ->
+        let ofFrac = Expr.Call(nonNull (typeof<Acc>.GetMethod "ofFrac"), [ f ])
+        let shifted = Expr.Call(nonNull (typeof<Acc>.GetMethod(if op = "frac.lsr" then "lsr" else "lsrBy")), [ n; ofFrac ])
+        genWord ctx (Expr.Call(nonNull (typeof<Acc>.GetMethod "hi"), [ shifted ]))
       | Some "frac.lfsr", [taps; st] ->
         let taps = constInt ctx "LFSR taps" taps
         genAcc ctx (Expr.Call(nonNull (typeof<Acc>.GetMethod "ofFrac"), [ st ]))
@@ -1657,6 +1683,12 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
   | StateElement ctx (m, [ value ]) -> storeWord ctx value m
   | PropertySet(Some(Var p), f, _, _) when p.Type = ctx.kernel.paramsType ->
     fail $"parameter {f.Name} is read-only"
+  | ForIntegerRangeLoop(v, lo, hi, body) when ctx.unrolled.Contains v && (tryConst ctx lo).IsSome && (tryConst ctx hi).IsSome ->
+    // [<Unroll>]: the body once for each pass, the index a constant in each copy (no DO)
+    let lo = constInt ctx "a loop bound" lo
+    let hi = constInt ctx "a loop bound" hi
+    let copies = [ for k in lo .. hi -> body.Substitute(fun x -> if x = v then Some(Expr.Value k) else None) ]
+    if not copies.IsEmpty then genStmt ctx (copies |> List.reduceBack (fun a b -> Expr.Sequential(a, b)))
   | ForIntegerRangeLoop(v, lo, hi, body) when not (ctx.unswitched.Contains v) && not (ctx.kept.Contains v) && (invariantIf ctx v body).IsSome ->
     // a condition the loop does not change, tested once: a copy of the loop for each outcome,
     // unless the copy takes more words than unswitchMax allows
@@ -2032,6 +2064,14 @@ and compileSub (ctx: Ctx) (sub: Sub) =
   ctx.inSub <- None
 
 /// Branch to `target` when the comparison is false.
+and bitTest (ctx: Ctx) (n: Expr) (f: Expr) =
+  let n = constInt ctx "a bit number" n
+  if n < 0 || n > 23 then fail $"a word's bits are 0 to 23, not {n}"
+  let w = (operands ctx [ f ])[0]
+  let r, loads = match w with WReg r when r = X0 || r = X1 || r = Y0 || r = Y1 -> r, [] | _ -> X0, loadWord w X0
+  emitAll ctx loads
+  emit ctx (Op(BitOp(Btst, n, BitReg r)))
+
 and branchUnless (ctx: Ctx) (cond: Expr) (target: string) =
   let asAcc (x: Expr) =
     if x.Type = typeof<Frac> then Expr.Call(nonNull (typeof<Acc>.GetMethod "ofFrac"), [ x ])
@@ -2039,6 +2079,9 @@ and branchUnless (ctx: Ctx) (cond: Expr) (target: string) =
     else fail $"comparisons are on Frac or Acc values, not {x.Type.Name}"
   match cond with
   | Intr "loop.everyPass" [ c ] -> branchUnless ctx c target
+  // a bit of a word: `btst #n,d`, the bit in the carry
+  | Intr "frac.bit" [ n; f ] -> bitTest ctx n f; emit ctx (bcc Cond.Cc target)
+  | Call(None, mi, [ Intr "frac.bit" [ n; f ] ]) when mi.Name = "Not" -> bitTest ctx n f; emit ctx (bcc Cond.Cs target)
   | Call(None, mi, [l; r]) when owner mi = operators ->
     let unless name =
       match name with
@@ -2232,6 +2275,9 @@ let markedLoops (attr: Type) (k: Kernel) =
 /// The loops of [<NoUnswitch>] functions (or functions of [<NoUnswitch>] modules).
 let keptLoops (k: Kernel) = markedLoops typeof<NoUnswitchAttribute> k
 
+/// The loops of [<Unroll>] functions (or functions of [<Unroll>] modules).
+let unrolledLoops (k: Kernel) = markedLoops typeof<UnrollAttribute> k
+
 /// A subroutine compiled below a call found later: compiled again from the start, each one's
 /// words from at least the given word.
 exception Refloor of Map<string, int>
@@ -2246,7 +2292,7 @@ let rec generateWith (floors: Map<string, int>) (unswitchMax: int option) (targe
         indexed = Map.empty; counters = Map.empty; freeData = [ X1; Y1 ]; scores = Dictionary(); deadLocals = HashSet()
         unswitched = HashSet(); bHeld = false; bWrite = false
         subs = Dictionary(); inSub = None; depth = 0; deepest = 0; floors = floors
-        kept = keptLoops k; pending = []; unswitchMax = unswitchMax; unswitchCosts = ResizeArray() }
+        kept = keptLoops k; unrolled = unrolledLoops k; pending = []; unswitchMax = unswitchMax; unswitchCosts = ResizeArray() }
     entry ctx "INIT" k.init
     entry ctx "TRIG" k.trig
     entry ctx "RENDER" k.render

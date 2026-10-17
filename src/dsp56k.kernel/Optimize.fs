@@ -379,6 +379,7 @@ let readsOf (instr: Instr) =
   | Div(src, d) | Normf(src, d) -> Some [| src; Acc.reg d |]
   | Clb(src, _) -> Some [| Acc.reg src |]
   | AluImm(_, _, d) | ShiftImm(_, _, _, d) | Inc d | Dec d -> Some [| Acc.reg d |]
+  | ShiftReg(_, r, s, _) -> Some [| r; Acc.reg s |]
   | Nop -> Some [||]
   | _ -> None
 

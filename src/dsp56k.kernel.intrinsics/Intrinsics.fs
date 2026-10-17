@@ -54,6 +54,14 @@ type SubroutineAttribute() =
 type NoUnswitchAttribute() =
   inherit Attribute()
 
+/// Loops with constant bounds in this function (or every function of this module) are written
+/// out: the body once for each pass, the index a constant in each copy. No DO loop, so no system
+/// stack levels (a DO takes two) and no address register stepped, for a copy of the body a pass.
+/// The function's own loops only: a helper it inlines keeps its DO loops unless marked too.
+[<AttributeUsage(AttributeTargets.Method ||| AttributeTargets.Class, AllowMultiple = false)>]
+type UnrollAttribute() =
+  inherit Attribute()
+
 module Bits =
   let sext24 (v: int) = (v <<< 8) >>> 8
   let sext48 (v: int64) = (v <<< 16) >>> 16
@@ -99,6 +107,23 @@ type Frac =
     let w = state.Word
     let shifted = (w <<< 1) &&& 0xffffff
     Frac.ofRaw (if w &&& 0x800000 <> 0 then shifted ^^^ Bits.word taps else shifted)
+
+  /// The word shifted right, zeros in from the top (logical): `lsr #n,a` on the word in a1. n is
+  /// a constant, 0 to 31 (24 on gives 0).
+  [<Intrinsic "frac.lsr">]
+  static member lsr (n: int) (f: Frac) = Frac.ofRaw (f.Word >>> n)
+
+  /// The word shifted right (logical) by a count computed when running: `lsr s,a`, the count the
+  /// low six bits of s (0 to 63; 24 on gives 0).
+  [<Intrinsic "frac.lsrBy">]
+  static member lsrBy (s: Frac) (f: Frac) =
+    let n = s.Raw &&& 0x3f
+    Frac.ofRaw (if n >= 24 then 0 else f.Word >>> n)
+
+  /// Whether bit n (a constant, 0 to 23) of the word is set. A condition only: `if Frac.bit 23 x
+  /// then ...` (or `not (Frac.bit n x)`) is `btst #n,d` and a branch on the carry.
+  [<Intrinsic "frac.bit">]
+  static member bit (n: int) (f: Frac) = (f.Word >>> n) &&& 1 = 1
 
   /// Frac * Frac: `mpy`, the 48-bit fractional product in an accumulator (-1 * -1 is +1, held
   /// in the extension).
@@ -165,6 +190,33 @@ and [<Struct>] Acc =
   /// `asl #n,a,a`, n constant.
   [<Intrinsic "acc.asl">]
   static member (<<<) (a: Acc, n: int) = { Acc.Raw = Bits.sext56 (a.Raw <<< n) }
+
+  /// `lsr #n,a`: a1 shifted right, zeros in from bit 47 (logical); a2 and a0 as they were. n is
+  /// a constant, 0 to 31 (24 on clears a1).
+  [<Intrinsic "acc.lsr">]
+  static member lsr (n: int) (a: Acc) = Acc.withHi a (((a.Raw >>> 24) &&& 0xffffffL) >>> n)
+
+  /// `lsr s,a`: as `Acc.lsr`, by a count computed when running, the low six bits of s (0 to
+  /// 63; 24 on clears a1).
+  [<Intrinsic "acc.lsrBy">]
+  static member lsrBy (s: Frac) (a: Acc) =
+    let n = s.Raw &&& 0x3f
+    Acc.withHi a (if n >= 24 then 0L else ((a.Raw >>> 24) &&& 0xffffffL) >>> n)
+
+  /// `asr s,a,a`: a shifted right (arithmetic) by a count computed when running, the low six
+  /// bits of s (0 to 63).
+  [<Intrinsic "acc.asrBy">]
+  static member asrBy (s: Frac) (a: Acc) = { Acc.Raw = a.Raw >>> (s.Raw &&& 0x3f) }
+
+  /// `asl s,a,a`: a shifted left by a count computed when running, the low six bits of s (0 to
+  /// 63); bits shifted past bit 55 are lost.
+  [<Intrinsic "acc.aslBy">]
+  static member aslBy (s: Frac) (a: Acc) = { Acc.Raw = Bits.sext56 (a.Raw <<< (s.Raw &&& 0x3f)) }
+
+  /// a with a1 replaced by the low 24 bits of `hi`, a2 and a0 kept.
+  static member private withHi (a: Acc) (hi: int64) =
+    let u = a.Raw &&& 0xffffffffffffffL
+    { Acc.Raw = Bits.sext56 ((u &&& ~~~(0xffffffL <<< 24)) ||| ((hi &&& 0xffffffL) <<< 24)) }
 
   /// `and #mask,a`: a1 masked, a2 and a0 kept.
   [<Intrinsic "acc.andHi">]
