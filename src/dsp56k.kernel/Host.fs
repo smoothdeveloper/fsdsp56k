@@ -21,6 +21,7 @@ type Instance(target: Target, kernel: Kernel) =
       let initial (p: PropertyInfo) =
         match (layout.field p.Name).ty with
         | TArray n -> box (Array.create n Frac.zero)
+        | TLongArray n -> box (Array.create n Long.zero)
         | _ -> zero p.PropertyType
       FSharpValue.MakeRecord(kernel.stateType, FSharpType.GetRecordFields kernel.stateType |> Array.map initial)
   let mutable parameters = FSharpValue.MakeRecord(kernel.paramsType, FSharpType.GetRecordFields kernel.paramsType |> Array.map (fun p -> zero p.PropertyType))
@@ -55,6 +56,10 @@ type Instance(target: Target, kernel: Kernel) =
            int (v.Raw &&& 0xffffffL)
            int ((v.Raw >>> 48) &&& 0xffffffL)
          | :? (Frac array) as v -> yield! v |> Array.map _.Word
+         | :? (Long array) as v ->
+           for l in v do
+             int ((l.Raw >>> 24) &&& 0xffffffL)
+             int (l.Raw &&& 0xffffffL)
          | v -> failwith $"state field {f.name}: {v}" |]
 
   /// The Y state as workset words, from Y:(r6+stateBase).

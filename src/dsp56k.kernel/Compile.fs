@@ -304,6 +304,10 @@ let rec tryConst (ctx: Ctx) (e: Expr) : obj option =
   | PropertyGet(None, p, []) when foldable p.PropertyType -> someValue (p.GetValue null)
   | PropertyGet(Some o, p, []) when foldable p.PropertyType ->
     constObject ctx o |> Option.bind (fun x -> someValue (p.GetValue x))
+  | IfThenElse(c, t, f) ->
+    match tryConst ctx c with
+    | Some(:? bool as b) -> tryConst ctx (if b then t else f)
+    | _ -> None
   // `match voice.layer with Metal t -> ...` on a constant: decided when compiling
   | UnionCaseTest(o, case) ->
     constObject ctx o |> Option.map (fun x ->
@@ -344,6 +348,13 @@ let rec normalize (e: Expr) : Expr =
     | Application(f, a) -> spine f (a :: args)
     | f -> f, args
   match e with
+  // `let b = condition`: a word, Frac.ofBool, its uses tests of the word (a constant condition
+  // stays a constant, the tests folded with it)
+  | Let(v, value, body) when v.Type = typeof<bool> && not v.IsMutable ->
+    let w = Var(v.Name, typeof<Frac>)
+    let test = <@@ (%%(Expr.Var w) : Frac) <> Frac.zero @@>
+    Expr.Let(w, Expr.Call(nonNull (typeof<Frac>.GetMethod "ofBool"), [ normalize value ]),
+             normalize (body.Substitute(fun x -> if x = v then Some test else None)))
   // x |> f, f <| x, (a, b) ||> f: plain applications
   | Call(None, mi, [ x; f ]) when mi.Name = "op_PipeRight" && owner mi = operators -> normalize (Expr.Application(f, x))
   | Call(None, mi, [ f; x ]) when mi.Name = "op_PipeLeft" && owner mi = operators -> normalize (Expr.Application(f, x))
@@ -472,6 +483,14 @@ let rec ordered (e: Expr) : Expr =
     if List.forall2 (fun (x: Expr) y -> obj.ReferenceEquals(x, y)) xs xs' then e
     else ExprShape.RebuildShapeCombination(shape, xs')
 
+/// An int computed from variables and constants by + and -.
+let rec intOfVars (e: Expr) =
+  match e with
+  | Var _ | Value(_, _) -> true
+  | Call(None, mi, [ x; y ]) when (mi.Name = "op_Addition" || mi.Name = "op_Subtraction") && owner mi = operators ->
+    intOfVars x && intOfVars y
+  | _ -> false
+
 /// A call to a kernel helper: its parameters bound to the arguments.
 let inlined (mi: MethodInfo) (args: Expr list) =
   match reflected mi with
@@ -482,6 +501,10 @@ let inlined (mi: MethodInfo) (args: Expr list) =
       // so is a record field the body does not assign (read where it is used, as the caller's
       // own reads are); anything else is bound, evaluated once
       | Lambda(v, rest), (Var _ as a) :: more -> (bind rest more : Expr).Substitute(fun x -> if x = v then Some a else None)
+      // and an int of variables and constants (`i - 1`, a loop index): substituted, so the
+      // body's s.field[k + 1] is the caller's s.field[i - 1 + 1]
+      | Lambda(v, rest), a :: more when a.Type = typeof<int> && intOfVars a ->
+        (bind rest more : Expr).Substitute(fun x -> if x = v then Some a else None)
       | Lambda(v, rest), (PropertyGet(Some(Var _), p, []) as a) :: more when not (writesField p.Name rest) ->
         (bind rest more : Expr).Substitute(fun x -> if x = v then Some a else None)
       | Lambda(v, rest), a :: more -> Expr.Let(v, a, bind rest more)
@@ -607,7 +630,7 @@ let storeA (h: Home) =
   | TAcc -> [| move a1 (at h 0); move a0 (at h 1); move a2 (at h 2) |]
   | TLong -> [| move a1 (at h 0); move a0 (at h 1) |]
   | TFrac -> fail "a Frac home takes a word, not an accumulator"
-  | TArray _ -> fail "an array is written element by element"
+  | TArray _ | TLongArray _ -> fail "an array is written element by element"
   | TOther t -> fail $"{t.Name} has no home"
 
 /// The arguments of a call to intrinsic `name`.
@@ -621,13 +644,18 @@ let callName (ctx: Ctx) (e: Expr) =
   | Call(_, mi, args) -> intrinsic (resolve mi args)
   | _ -> None
 
-/// `i`, `i + c` or `i - c` for a loop index i: (i, c).
-let loopOffset (ctx: Ctx) (isIndex: Var -> bool) (e: Expr) =
+/// `i`, `i + c` or `i - c` for a loop index i (nested, as a helper given `i - 1` adds its own
+/// offset): (i, c).
+let rec loopOffset (ctx: Ctx) (isIndex: Var -> bool) (e: Expr) =
+  let offset (c: Expr) = match tryConst ctx c with Some(:? int as n) -> Some n | _ -> None
   match e with
   | Var v when isIndex v -> Some(v, 0)
-  | Call(None, mi, [ Var v; c ]) when isIndex v && mi.Name = "op_Addition" -> Some(v, constInt ctx "an index offset" c)
-  | Call(None, mi, [ c; Var v ]) when isIndex v && mi.Name = "op_Addition" -> Some(v, constInt ctx "an index offset" c)
-  | Call(None, mi, [ Var v; c ]) when isIndex v && mi.Name = "op_Subtraction" -> Some(v, -(constInt ctx "an index offset" c))
+  | Call(None, mi, [ x; c ]) when mi.Name = "op_Addition" && (offset c).IsSome ->
+    loopOffset ctx isIndex x |> Option.map (fun (v, k) -> v, k + (offset c).Value)
+  | Call(None, mi, [ c; x ]) when mi.Name = "op_Addition" && (offset c).IsSome ->
+    loopOffset ctx isIndex x |> Option.map (fun (v, k) -> v, k + (offset c).Value)
+  | Call(None, mi, [ x; c ]) when mi.Name = "op_Subtraction" && (offset c).IsSome ->
+    loopOffset ctx isIndex x |> Option.map (fun (v, k) -> v, k - (offset c).Value)
   | _ -> None
 
 /// `Frac.index w`, `Frac.index w + c` or `Frac.index w - c`, not known when compiling: (w, c).
@@ -673,6 +701,30 @@ let (|StateElement|_|) (ctx: Ctx) (e: Expr) =
     | _ -> None
   | _ -> None
 
+/// `s.field[k]` on a [<Length n>] Long array: the element's hi and lo words, for a constant k or
+/// k = i + c on the loop's address register (stepping two words a pass).
+let (|LongElement|_|) (ctx: Ctx) (e: Expr) =
+  match e with
+  | Call(None, mi, PropertyGet(Some(Var v), p, []) :: index :: rest)
+      when (mi.Name = "GetArray" || mi.Name = "SetArray") && v.Type = ctx.kernel.stateType ->
+    let f = field ctx p.Name
+    match f.ty with
+    | TLongArray n ->
+      let mem ea : Mem = { space = spaceOf f; ea = ea }
+      match loopOffset ctx (fun i -> ctx.indexed.ContainsKey(i, p.Name)) index with
+      | Some(i, c) ->
+        let reg, bias = ctx.indexed[i, p.Name]
+        let d = bias + 2 * c
+        Some(mem (if d = 0 then Ind reg else Disp(reg, Operand.num d)), mem (Disp(reg, Operand.num (d + 1))), rest)
+      | None ->
+        if (computedIndex ctx index).IsSome then
+          fail $"{p.Name}: a Long array is indexed by a constant or the loop's index plus or minus a constant, not a Frac.index"
+        let k = constInt ctx $"the index into {p.Name} (a constant, or the loop's index plus or minus a constant)" index
+        if k < 0 || k >= n then fail $"{p.Name}[{k}] is outside its {n} Longs"
+        Some(mem (disp r6 (f.offset + 2 * k)), mem (disp r6 (f.offset + 2 * k + 1)), rest)
+    | _ -> None
+  | _ -> None
+
 let rec wordLeaf (ctx: Ctx) (e: Expr) : Word option =
   match tryConst ctx e with
   | Some(:? Frac as f) -> Some(WImm f.Word)
@@ -714,6 +766,7 @@ and longLeaf (ctx: Ctx) (e: Expr) : AccLeaf option =
     | PropertyGet(Some(Var v), p, []) when v.Type = ctx.kernel.stateType && (field ctx p.Name).ty = TLong ->
       let h = stateHome (field ctx p.Name)
       Some(AOfLong(at h 0, at h 1))
+    | LongElement ctx (hi, lo, []) -> Some(AOfLong(hi, lo))
     | _ -> None
 
 and accLeaf (ctx: Ctx) (e: Expr) : AccLeaf option =
@@ -1134,6 +1187,19 @@ and genLong (ctx: Ctx) (e: Expr) =
       let t = alloc ctx TLong
       emitAll ctx (storeA t)
       emitAll ctx (loadAccLeaf (AOfLong(at t 0, at t 1)) A)
+    | Call(None, mi, [x]) when intrinsic (resolve mi [x]) = Some "long.ofAccSat" ->
+      // the E bit clear: the value fits in a1:a0 (a2 its sign) as it is
+      genAcc ctx x
+      let fits, low = fresh ctx "LFITS", fresh ctx "LLOW"
+      emit ctx (tst a)
+      emit ctx (bcc Cond.Ec fits)
+      emit ctx (bcc Cond.Mi low)
+      emit ctx (move (immL 0x7fffff) a)
+      emit ctx (move (immL 0xffffff) a0)
+      emit ctx (bra fits)
+      emit ctx (Label low)
+      emit ctx (move (immL 0x800000) a)
+      emit ctx (Label fits)
     | Let(v, value, body) -> withLet ctx v value body (fun () -> genLong ctx body)
     | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone && isSubroutine mi -> callSub ctx mi args
     | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone -> genLong ctx (inlined mi args)
@@ -1163,6 +1229,7 @@ and genWord (ctx: Ctx) (e: Expr) : unit =
       | Some "acc.hi", [x] -> emit ctx (move (accPart ctx x 1) x0)
       | Some "acc.lo", [x] -> emit ctx (move (accPart ctx x 0) x0)
       | Some "acc.sat", [x] -> emit ctx (move (accPart ctx x 2) x0)
+      | Some "frac.ofBool", [c] -> genWord ctx (selection ctx (Expr.IfThenElse(c, <@@ Frac.ofRaw 1 @@>, <@@ Frac.zero @@>)))
       | Some "table.read", [t; i] -> tableRead ctx t i 1 0 x0
       | Some "region.read", [r; i] ->
         let region = constRegion ctx r
@@ -1438,7 +1505,7 @@ and store (ctx: Ctx) (h: Home) (e: Expr) =
     | Call(None, mi, [x]) when intrinsic (resolve mi [x]) = Some "long.ofAcc" -> genAcc ctx x
     | _ -> genLong ctx e
     emitAll ctx (storeA h)
-  | TArray _ -> fail "an array state field is written element by element, s.field[k] <- v"
+  | TArray _ | TLongArray _ -> fail "an array state field is written element by element, s.field[k] <- v"
   | TOther t -> fail $"{t.Name} values cannot be stored"
 
 /// A value into the accumulator holding a local: multiplications onto the local and words added
@@ -1682,6 +1749,10 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
     let region = constRegion ctx r
     computedStore ctx i 0 (fun () -> regionInR0 ctx region) (computedMem region.bank) value
   | StateElement ctx (m, [ value ]) -> storeWord ctx value m
+  | LongElement ctx (hi, lo, [ value ]) ->
+    genLong ctx value
+    emit ctx (move a1 hi)
+    emit ctx (move a0 lo)
   | PropertySet(Some(Var p), f, _, _) when p.Type = ctx.kernel.paramsType ->
     fail $"parameter {f.Name} is read-only"
   | ForIntegerRangeLoop(v, lo, hi, body) when ctx.unrolled.Contains v && (tryConst ctx lo).IsSome && (tryConst ctx hi).IsSome ->
@@ -1755,13 +1826,17 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
                && (loopOffset ctx (fun i -> i = v) index).IsSome ->
         let _, c = (loopOffset ctx (fun i -> i = v) index).Value
         match (field ctx p.Name).ty with
-        | TArray n ->
-          if lo + c < 0 || hi + c >= n then fail $"{p.Name}[{v.Name} + {c}] reaches outside its {n} words for {v.Name} in {lo} .. {hi}"
+        | TArray n | TLongArray n ->
+          if lo + c < 0 || hi + c >= n then fail $"{p.Name}[{v.Name} + {c}] reaches outside its {n} elements for {v.Name} in {lo} .. {hi}"
           let a, b = match arrays.TryGetValue p.Name with | true, r -> r | _ -> (c, c)
           arrays[p.Name] <- (min a c, max b c)
         | _ -> fail $"{p.Name} is not a [<Length n>] array"
         List.iter scan rest
       | Call(None, mi, [ Var i ]) when i = v && mi.Name = "ofRaw" && mi.DeclaringType = typeof<Frac> -> counted <- true
+      // a helper given the index: what its body does with it once inlined
+      | Call(None, mi, args) when intrinsic mi = None && not (isSubroutine mi) && (reflected mi).IsSome
+                                  && args |> List.exists (fun a -> a.GetFreeVars() |> Seq.contains v) ->
+        scan (inlined mi args)
       | Var i when i = v ->
         fail $"the loop index {v.Name} can index state arrays (s.field[{v.Name} + c]) or be read as Frac.ofRaw {v.Name}; not {body}"
       | ExprShape.ShapeVar _ -> ()
@@ -1774,6 +1849,8 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
       // X load and a Y load can share one instruction (an XY move takes a register of each bank)
       let mixed = arrays.Keys |> Seq.map (fun name -> (field ctx name).bank) |> Seq.distinct |> Seq.length > 1
       let owners = ResizeArray<int * Field>()    // the registers this loop steps, the array each starts on
+      let size (f: Field) = match f.ty with TLongArray _ -> 2 | _ -> 1     // words an element, a pass
+      let longRegs = ResizeArray<int>()
       let regs =
         [ for KeyValue(name, _) in arrays do
             let f = field ctx name
@@ -1788,17 +1865,19 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
             match fresh with
             | Some reg ->
               emit ctx (move r6 a)
-              emit ctx (add (immL (f.offset + lo)) a)
+              emit ctx (add (immL (f.offset + size f * lo)) a)
               emit ctx (move a1 (R reg))
               ctx.indexed <- ctx.indexed.Add((v, name), (reg, 0))
               owners.Add((reg, f))
+              if size f = 2 then longRegs.Add reg
               yield reg
-            | None when owners.Count > 0 ->
+            | None when owners |> Seq.exists (fun (_, o) -> size o = size f) ->
               // no register left: every array here steps by one word a pass, so this one rides on
               // a register the loop already steps, at its distance from that one's array
               // (`x:(r1+d)`: a word more, and no parallel move)
+              let same = owners |> Seq.filter (fun (_, o) -> size o = size f) |> List.ofSeq
               let reg, o =
-                owners |> Seq.tryFind (fun (_, o) -> o.bank = f.bank) |> Option.defaultValue owners[0]
+                same |> List.tryFind (fun (_, o) -> o.bank = f.bank) |> Option.defaultValue same.Head
               ctx.indexed <- ctx.indexed.Add((v, name), (reg, f.offset - o.offset))
             | None ->
               let held = [ for KeyValue(c, cr) in ctx.cursors do if not (ctx.released.Contains c) then $"{c.Name} (r{cr.reg})" ]
@@ -1830,7 +1909,9 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
       match last with
       | (None | Some(Label _) | Some(Comment _) | Some(Op(Branch _))) when not stepped -> emit ctx nop
       | _ -> ()
-      for reg in regs do emit ctx (update (inc (R reg)))
+      for reg in regs do
+        emit ctx (update (inc (R reg)))
+        if longRegs.Contains reg then emit ctx (update (inc (R reg)))
       match counter with
       | Some h ->
         emit ctx (move (at h 0) a)
@@ -2091,6 +2172,24 @@ and branchUnless (ctx: Ctx) (cond: Expr) (target: string) =
   // a bit of a word: `btst #n,d`, the bit in the carry
   | Intr "frac.bit" [ n; f ] -> bitTest ctx n f; emit ctx (bcc Cond.Cc target)
   | Call(None, mi, [ Intr "frac.bit" [ n; f ] ]) when mi.Name = "Not" -> bitTest ctx n f; emit ctx (bcc Cond.Cs target)
+  // known when compiling: no test (a let of a constant condition, `wide || x > y` on wide)
+  | _ when (match tryConst ctx cond with Some(:? bool) -> true | _ -> false) ->
+    if not ((tryConst ctx cond).Value :?> bool) then emit ctx (bra target)
+  // a && b: either false skips
+  | IfThenElse(l, r, Value(:? bool as f, _)) when not f -> branchUnless ctx l target; branchUnless ctx r target
+  // a || b: a true skips the test of b
+  | IfThenElse(l, Value(:? bool as t, _), r) when t ->
+    let taken, next = fresh ctx "OR", fresh ctx "ORNEXT"
+    branchUnless ctx l next
+    emit ctx (bra taken)
+    emit ctx (Label next)
+    branchUnless ctx r target
+    emit ctx (Label taken)
+  | Call(None, mi, [ c ]) when mi.Name = "Not" ->
+    let taken = fresh ctx "NOT"
+    branchUnless ctx c taken
+    emit ctx (bra target)
+    emit ctx (Label taken)
   | Call(None, mi, [l; r]) when owner mi = operators ->
     let unless name =
       match name with
@@ -2126,7 +2225,7 @@ and branchUnless (ctx: Ctx) (cond: Expr) (target: string) =
     else
       binAcc ctx l r BCmp
       emit ctx (bcc (unless mi.Name) target)
-  | _ -> fail $"conditions are comparisons of two values (no &&, || or not yet): {cond}"
+  | _ -> fail $"conditions are comparisons of two values, Frac.bit, a let of one, and &&, || and not of those: {cond}"
 
 // ---------------------------------------------------------------------------------------------
 // Entry points.

@@ -1005,6 +1005,111 @@ module FourAcc =
 
   let kernel = Kernel.define "probe-four-acc" <@ init @> <@ trig @> <@ render @>
 
+/// Long.ofAccSat (`move a,l:`): a Long state kept to 48 bits, limited, as it grows past them.
+[<ReflectedDefinition>]
+module LongSat =
+  type S = { mutable wa : Long; mutable wb : Long }
+
+  let init (_: Banks.P) (s: S) = s.wa <- Long.ofRaw 0x123456789abcL; s.wb <- Long.ofRaw -0x0fedcba98765L
+
+  let trig (_: Banks.P) (_: S) = ()
+
+  let render (p: Banks.P) (s: S) (out: Output) =
+    for _ in 0 .. 15 do
+      let a = Acc.ofLong s.wa
+      s.wa <- Long.ofAccSat (a + a + p.a * p.b)
+      let b = Acc.mac (Acc.ofLong s.wb) p.c p.d
+      s.wb <- Long.ofAccSat (b + b + Acc.ofFrac p.c)
+      out.Write(Acc.lo (Acc.ofLong s.wa))
+      out.Write(Acc.hi (Acc.ofLong s.wb))
+
+  let kernel = Kernel.define "probe-long-sat" <@ init @> <@ trig @> <@ render @>
+
+/// `let` of a condition: a word, its uses tests of it (in an if, under not, in && and ||, in a
+/// value's selection), a constant one folded.
+[<ReflectedDefinition>]
+module BoolLet =
+  type S = { mutable w : Frac }
+
+  let wide = true
+
+  let init (_: Banks.P) (s: S) = s.w <- Frac.ofRaw 0x123456
+
+  let trig (_: Banks.P) (_: S) = ()
+
+  let render (p: Banks.P) (s: S) (out: Output) =
+    let loud = p.a > p.b
+    let both = loud && p.c < Frac.zero
+    let either = wide || p.d > Frac.zero
+    for _ in 0 .. 15 do
+      let up = s.w > p.d
+      if loud then s.w <- Acc.hi (Acc.ofFrac s.w >>> 1) else s.w <- Acc.sat (Acc.ofFrac s.w + p.c)
+      if not both then out.Write s.w else out.Write p.a
+      let x = if up || both then p.b else p.c
+      if either then out.Write x
+
+  let kernel = Kernel.define "probe-bool-let" <@ init @> <@ trig @> <@ render @>
+
+/// A loop index passed to helpers that index state arrays with it.
+[<ReflectedDefinition>]
+module IndexArg =
+  type S = { [<Length 16>] h : Frac array; [<Length 16>] l : Frac array }
+
+  let init (_: Banks.P) (_: S) = ()
+
+  let trig (_: Banks.P) (_: S) = ()
+
+  let get (s: S) (k: int) = Acc.sat (Acc.ofFrac s.h[k] + Acc.ofFrac s.l[k])
+  let put (s: S) (k: int) (x: Frac) = s.h[k] <- x
+  let next (s: S) (k: int) = s.l[k + 1]
+
+  let render (p: Banks.P) (s: S) (out: Output) =
+    for i in 0 .. 14 do
+      out.Write(get s i)
+      put s i (Acc.sat (p.a * next s i))
+    out.Write(get s 15)
+    for i in 0 .. 15 do
+      s.l[i] <- Acc.sat (Acc.ofFrac s.l[i] + p.b)
+      out.Write(next s (i - 1))
+
+  let kernel = Kernel.define "probe-index-arg" <@ init @> <@ trig @> <@ render @>
+
+/// [<Length n>] Long arrays (element k hi:lo at words 2k, 2k+1), in Y and in X: constant
+/// indexes, the loop's index (its register stepping two words), two arrays in one loop, and a
+/// helper given the index.
+[<ReflectedDefinition>]
+module LongArray =
+  type S =
+    { [<Length 8>] m : Long array
+      mutable w : Long
+      [<XMemory; Length 4>] xm : Long array }
+
+  let init (_: Banks.P) (s: S) =
+    s.m[0] <- Long.ofRaw 0x7fff00ffff00L
+    s.m[5] <- Long.ofRaw -0x123456789aL
+    s.xm[3] <- Long.ofRaw 0x0000017fffffL
+    s.w <- Long.ofRaw 0x400000000001L
+
+  let trig (_: Banks.P) (_: S) = ()
+
+  let mode (s: S) (k: int) = Acc.ofLong s.m[k]
+
+  let render (p: Banks.P) (s: S) (out: Output) =
+    for i in 0 .. 7 do
+      let a = mode s i
+      s.m[i] <- Long.ofAccSat (a + a + p.a * p.b)
+      out.Write(Acc.hi a)
+      out.Write(Acc.lo a)
+    for i in 0 .. 3 do
+      s.xm[i] <- Long.ofAccSat (Acc.ofLong s.xm[i] + Acc.ofLong s.m[i + 4] + Acc.ofLong s.w)
+      out.Write(Acc.lo (Acc.ofLong s.xm[i]))
+    for i in 1 .. 6 do
+      out.Write(Acc.hi (Acc.ofLong s.m[i - 1] + Acc.ofLong s.m[i + 1]))
+      out.Write(Acc.lo (Acc.ofLong s.m[i]))
+    s.w <- Long.ofAccSat (Acc.ofLong s.m[7] + Acc.ofLong s.xm[0])
+
+  let kernel = Kernel.define "probe-long-array" <@ init @> <@ trig @> <@ render @>
+
 /// Locals in X1 and Y1 read in both branches of an if: the then branch, past its last read of
 /// them, gives their registers to its own locals; the else branch still reads them (P-I-HP:
 /// `if s.left = 0 then ... modes p4 ring; range s else force s; modes p4 ring`).
@@ -1429,6 +1534,15 @@ let tests =
         match dsp56k.kernel.Compile.compile Kernel.mds XFull.beyond with
         | Ok _ -> failtest "compiled"
         | Error e -> Expect.stringContains e "X+64" "the message names the word"
+      }
+
+      // 64 is the MDS's: it renders track t with r6 = $800 + $40 t, so X and Y words past r6+63
+      // are the next track's. Another ABI is another Target record.
+      test "the workset caps are the target's: a target with a wider X workset takes what the MDS refuses" {
+        let wide = { Kernel.mds with name = "MDS, a 128-word X workset"; xLimit = 128 }
+        match dsp56k.kernel.Compile.compile wide XFull.beyond with
+        | Error e -> failtest e
+        | Ok c -> Expect.isGreaterThan c.xWorkset 64 "X words past X+63"
       } ]
 
     testList "computed indices" [
@@ -1594,6 +1708,22 @@ let tests =
       test "frames over the caller's dead locals: compiled program equals the .NET kernel" {
         needNative ()
         conformance Frames.kernel 52
+      }
+      test "Long.ofAccSat keeps a growing Long state limited to 48 bits: compiled program equals the .NET kernel" {
+        needNative ()
+        conformance LongSat.kernel 57
+      }
+      test "let of a condition, read in ifs, not, && and ||: compiled program equals the .NET kernel" {
+        needNative ()
+        conformance BoolLet.kernel 58
+      }
+      test "a loop index passed to helpers indexing state arrays: compiled program equals the .NET kernel" {
+        needNative ()
+        conformance IndexArg.kernel 59
+      }
+      test "[<Length n>] Long arrays in Y and X, by constant and loop index: compiled program equals the .NET kernel" {
+        needNative ()
+        conformance LongArray.kernel 60
       }
       test "register locals read in both branches of an if: compiled program equals the .NET kernel" {
         needNative ()

@@ -125,6 +125,11 @@ type Frac =
   [<Intrinsic "frac.bit">]
   static member bit (n: int) (f: Frac) = (f.Word >>> n) &&& 1 = 1
 
+  /// 1 (the smallest word, $000001) when b holds, else 0. What a `let b = condition` keeps:
+  /// its uses read the word back as `w <> Frac.zero`.
+  [<Intrinsic "frac.ofBool">]
+  static member ofBool (b: bool) = if b then Frac.ofRaw 1 else Frac.zero
+
   /// Frac * Frac: `mpy`, the 48-bit fractional product in an accumulator (-1 * -1 is +1, held
   /// in the extension).
   [<Intrinsic "frac.mul">]
@@ -317,6 +322,14 @@ and [<Struct>] Long =
   /// `move a1,hi` `move a0,lo`: the extension byte is dropped.
   [<Intrinsic "long.ofAcc">]
   static member ofAcc (a: Acc) = { Long.Raw = Bits.sext48 a.Raw }
+
+  /// `move a,l:`: a1:a0, or the nearest 48-bit limit ($7fffff:ffffff, $800000:000000) when
+  /// the value needs the extension byte (`tst a` and a branch on the E bit).
+  [<Intrinsic "long.ofAccSat">]
+  static member ofAccSat (a: Acc) =
+    if a.Raw > 0x7fffffffffffL then { Long.Raw = 0x7fffffffffffL }
+    elif a.Raw < -0x800000000000L then { Long.Raw = -0x800000000000L }
+    else { Long.Raw = a.Raw }
 
 /// Where a table's words are on the DSP.
 type TableSource =

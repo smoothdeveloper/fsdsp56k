@@ -109,6 +109,7 @@ type Ty =
   | TLong
   | TAcc
   | TArray of length: int       // a state field of Frac words
+  | TLongArray of length: int   // a state field of Long values, element k hi:lo at words 2k, 2k+1
   | TOther of Type
 
 let tyOf (t: Type) =
@@ -124,6 +125,7 @@ let words ty =
   | TLong -> 2
   | TAcc -> 3
   | TArray n -> n
+  | TLongArray n -> 2 * n
   | TOther t -> fail $"{t.Name} values have no place in DSP memory"
 
 /// The record fields and their workset words.
@@ -163,10 +165,14 @@ let layout (target: Target) (k: Kernel) =
              match p.GetCustomAttributes(typeof<LengthAttribute>, true) with
              | [| :? LengthAttribute as l |] when l.Words > 0 -> TArray l.Words
              | _ -> fail $"{k.name}: state field {p.Name} is an array: give its length, [<Length n>]"
+           elif p.PropertyType = typeof<Long array> then
+             match p.GetCustomAttributes(typeof<LengthAttribute>, true) with
+             | [| :? LengthAttribute as l |] when l.Words > 0 -> TLongArray l.Words
+             | _ -> fail $"{k.name}: state field {p.Name} is an array: give its length, [<Length n>] (in Longs)"
            else tyOf p.PropertyType
          match ty with
-         | TFrac | TLong | TAcc | TArray _ -> ()
-         | _ -> fail $"{k.name}: state field {p.Name} must be a Frac, a Long, an Acc or a [<Length n>] Frac array"
+         | TFrac | TLong | TAcc | TArray _ | TLongArray _ -> ()
+         | _ -> fail $"{k.name}: state field {p.Name} must be a Frac, a Long, an Acc or a [<Length n>] Frac or Long array"
          if p.GetCustomAttributes(typeof<XMemoryAttribute>, true).Length > 0 then
            { name = p.Name; ty = ty; offset = xAt; bank = XMemory }
            xAt <- xAt + words ty
