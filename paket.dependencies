@@ -7,3 +7,7 @@ nuget Expecto
 nuget UnMango.CliWrap.FSharp
 nuget Argu
 nuget Falco.Markup
+nuget Firelight
+nuget Fable.Browser.Dom
+nuget Fable.Browser.Event
+nuget Fable.Core
