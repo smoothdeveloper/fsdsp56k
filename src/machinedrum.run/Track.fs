@@ -23,9 +23,33 @@ type Layout =
     tempX       : int        // X: the 32-word shared temporary memory (symbol 7)
     tempY       : int }      // Y: the same (symbol 8)
 
+/// The program from P:$1000: on the Machinedrum it sits in external memory, where X aliases P
+/// (packages read their tables with x: moves), apart from the track's workset and the shared
+/// areas. Here X:$1000..$7fff is free (the workset is X:$100.., the stand-ins and service words
+/// below $a00, the sine from X:$8000), so the X mirror of a package of the largest size MDS
+/// allows (14052 words, to X:$46e3) overlaps none of them; the services and the stub stay below.
 let defaultLayout =
-  { programBase = 0x100; workset = 0x100; output = 0x200; services = 0xe00; stub = 0xef0; trackMemory = 0x10000; sineTable = 0
+  { programBase = 0x1000; workset = 0x100; output = 0x200; services = 0xe00; stub = 0xef0; trackMemory = 0x10000; sineTable = 0
     inputRing = 0; inputPosition = 0; mainRing = 0; mainPosition = 0; tempX = 0; tempY = 0 }
+
+/// The program words the layout holds: from programBase up to the services or the stub,
+/// whichever comes first above it.
+let room (layout: Layout) =
+  let above = [ layout.services; layout.stub ] |> List.filter (fun a -> a > layout.programBase)
+  match above with
+  | [] -> 0x10000 - layout.programBase
+  | xs -> List.min xs - layout.programBase
+
+/// Why a program of `words` does not fit the layout, if it does not.
+let overflow (layout: Layout) (words: int) =
+  let room = room layout
+  if words <= room then None
+  else
+    let limit =
+      if layout.services > layout.programBase || layout.stub > layout.programBase then
+        $"below its services at P:${layout.services:x4} (stub P:${layout.stub:x4})"
+      else "up to the end of P memory (P:$ffff)"
+    Some $"the program is {words} words; the track harness loads it at P:${layout.programBase:x4} {limit}, room for {room} words, {words - room} over"
 
 type Bank =
   { words : int array
@@ -58,6 +82,10 @@ type Track(package: Mds.Package, machine: Mds.Machine option, layout: Layout, ba
   let services = Assembler.assembleItems (Services.program layout.services) |> Result.defaultWith (fun e -> failwith (Assembler.errorText e))
   let serviceAt name = int services.symbols[name]
   do
+    // a longer program would overwrite the services and the stub: refused, not loaded
+    match overflow layout package.programWords.Length with
+    | Some why -> failwith why
+    | None -> ()
     // the package, relocated and patched
     let words = Array.copy package.programWords
     for w in package.relocations do words[w] <- (words[w] + layout.programBase) &&& 0xffffff

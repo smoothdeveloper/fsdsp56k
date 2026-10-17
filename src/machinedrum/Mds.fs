@@ -267,6 +267,10 @@ let spriteOfPbm (text: string) =
 
 let align4 n = (n + 3) &&& ~~~3
 
+/// The most program words an MDS package holds (jmamma/MDS tools/lib/mds_format.py
+/// PROGRAM_MAX_WORDS): what the Machinedrum (MDX) loader accepts.
+let programMaxWords = 14_052
+
 /// Build a package from a definition, the assembled program (from address 0) and its symbols.
 let pack (m: Machine) (program: int array) (symbols: Map<string, int64>) (sprite: byte array option) =
   let address label delta =
@@ -283,6 +287,8 @@ let pack (m: Machine) (program: int array) (symbols: Map<string, int64>) (sprite
         address m.initSymbol 0, address m.trigSymbol 0, address m.renderSymbol 0 with
   | Some e, _, _, _ -> Error e
   | None, Error e, _, _ | None, _, Error e, _ | None, _, _, Error e -> Error e
+  | None, Ok _, Ok _, Ok _ when program.Length > programMaxWords ->
+    Error(Invalid $"the program is {program.Length} words, an MDS package holds at most {programMaxWords}")
   | None, Ok init, Ok trig, Ok render ->
     let words = program.Length
     let code = [| for w in program do yield! [| byte (w >>> 16); byte (w >>> 8); byte w |] |]

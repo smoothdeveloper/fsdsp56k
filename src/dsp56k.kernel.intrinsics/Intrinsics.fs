@@ -37,6 +37,23 @@ type LengthAttribute(words: int) =
 type XMemoryAttribute() =
   inherit Attribute()
 
+/// A helper compiled once, as a subroutine its callers reach with bsr (rts back), instead of
+/// inlined at every call: `[<Subroutine>] let refresh (p: P) (s: S) (x: Frac) = ...`. It takes
+/// the parameter and state records (and the output) as the caller has them, up to four Frac
+/// values (passed in X0, Y0, X1, Y1) and two Acc or Long values (A, B); it gives its result in
+/// X0 (Frac) or A (Acc, Long). Each call costs the argument moves, bsr and rts (and saving the
+/// caller's X1 or Y1 locals); a call takes one level of the system stack, a DO loop two.
+[<AttributeUsage(AttributeTargets.Method, AllowMultiple = false)>]
+type SubroutineAttribute() =
+  inherit Attribute()
+
+/// Loops in this function (or every function of this module) are not unswitched: a condition
+/// the loop does not change is tested on each pass rather than splitting the loop into a copy
+/// for each outcome (smaller code, a test and a branch more per pass).
+[<AttributeUsage(AttributeTargets.Method ||| AttributeTargets.Class, AllowMultiple = false)>]
+type NoUnswitchAttribute() =
+  inherit Attribute()
+
 module Bits =
   let sext24 (v: int) = (v <<< 8) >>> 8
   let sext48 (v: int64) = (v <<< 16) >>> 16
@@ -400,6 +417,13 @@ type Cursor(read: int -> int, write: int -> int -> unit, address: int, start: in
     Cursor((fun k -> a[k].Raw), (fun k w -> a[k] <- Frac.ofRaw w), 0, start.Raw, step, a.Length - 1)
 
 /// The shared temporary memory (MDS imports 7 and 8): 32 words each, not kept between calls.
+/// Loop controls.
+type Loop =
+  /// The condition itself, tested on every pass of the loop around it: not unswitched
+  /// (`if Loop.everyPass (p.mode > half) then ...`).
+  [<Intrinsic "loop.everyPass">]
+  static member everyPass (c: bool) = c
+
 module Scratch =
   let x = { name = "scratch_x"; bank = XMemory; abiSymbol = 7; address = 0x400; words = Array.zeroCreate 32 }
   let y = { name = "scratch_y"; bank = YMemory; abiSymbol = 8; address = 0x400; words = Array.zeroCreate 32 }

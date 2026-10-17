@@ -98,18 +98,18 @@ from a filter loop, for example, lets the filter read both operands in one paral
 
 ## Measured, on the public samples
 
-RENDER mean cycles, compiled, against the hand-written code each sample is graded with. The
-before column is the compiler without the prototypes; after has the `hoist` change (the other
-prototypes don't change these samples, which use none of the emulated forms):
+RENDER mean cycles, compiled, against the hand-written code each sample is graded with. Before is
+the compiler without these changes. After has all of them; only the constant hoisting and the
+immediate compares move these samples, which use none of the emulated forms:
 
 | Sample     | Before | After | Hand-written | Ratio before | Ratio after |
 |------------|-------:|------:|-------------:|-------------:|------------:|
 | TX6 BD     |   1925 |  1863 |         1202 |        1.60x |       1.55x |
 | TX6 SD     |   1580 |  1527 |          878 |        1.80x |       1.74x |
-| TX6 CP     |   1479 |  1424 |          773 |        1.91x |       1.84x |
-| TX6 CH     |   1265 |  1219 |          670 |        1.89x |       1.82x |
-| TX6 OH     |   2302 |  2243 |         1208 |        1.91x |       1.86x |
-| TX6 CY     |   2406 |  2345 |         1262 |        1.91x |       1.86x |
+| TX6 CP     |   1479 |  1366 |          773 |        1.91x |       1.77x |
+| TX6 CH     |   1265 |  1218 |          670 |        1.89x |       1.82x |
+| TX6 OH     |   2302 |  2242 |         1208 |        1.91x |       1.86x |
+| TX6 CY     |   2406 |  2344 |         1262 |        1.91x |       1.86x |
 | TX6 LT     |   1752 |  1698 |          997 |        1.76x |       1.70x |
 | TX6 HT     |   1633 |  1580 |          923 |        1.77x |       1.71x |
 | sine       |   1123 |  1123 |          625 |        1.80x |       1.80x |
@@ -130,6 +130,16 @@ kernel on random parameters and state.
   word times a 48-bit level hi:lo in two instructions.
 - `Optimize.hoist`: an immediate loaded inside a DO loop into a register nothing else in the loop
   writes is loaded once, before the loop.
+- `Acc.macSU acc s u` lowered to `macsu`.
+- A constant that is a word in a1 (a0 zero, a2 its sign) is added, subtracted or compared as an
+  immediate: `cmp #k,a`, not a load into B. Helpers the compiler inlines that only compute fold
+  on constant arguments too, so `Acc.ofFrac (at 415)` is a constant.
+
+Not done, and why:
+- `clr` fused into a parallel move, and `acc = 0; acc += x * y` to `mpy`: the graded code has no
+  `clr` and no clear-then-accumulate to fuse, so neither would move a number yet.
+- `tgt`/`tlt` for clamps: the clamped values mostly sit in X1/Y1 (Tcc only writes A or B), so this
+  waits for the register allocator.
 
 The intrinsics only pay off once kernels use them. On graded kernels that had the emulated forms,
 calling the division intrinsic instead of 24 F# steps took a RENDER from about 20x the

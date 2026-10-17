@@ -564,6 +564,255 @@ module Order =
 
   let kernel = Kernel.define "probe-order" <@ init @> <@ trig @> <@ render @>
 
+/// Quotation shapes: helpers taking
+/// unit, if/else as a value, and while loops on data.
+[<ReflectedDefinition>]
+module Shapes =
+  type S =
+    { mutable seed : Frac
+      mutable phase : Acc
+      mutable events : Frac }
+
+  let init (_: Banks.P) (s: S) =
+    s.seed <- Frac.ofRaw 0x3a5c17
+    s.phase <- Acc.zero
+    s.events <- Frac.zero
+
+  let trig (_: Banks.P) (_: S) = ()
+
+  /// A read of the scratch memory, no argument.
+  let third () = Region.read Scratch.x (Frac.ofRaw 3)
+
+  /// A statement helper, no argument.
+  let fill () =
+    let c = Cursor.linear Scratch.x Frac.zero
+    let mutable v = Frac.ofRaw 0x101010
+    for _ in 0 .. 7 do
+      c.Put v
+      v <- Frac.lfsr 0xc20001 v
+
+  let units (p: Banks.P) (s: S) (out: Output) =
+    fill ()
+    for _ in 0 .. 31 do
+      s.seed <- Frac.lfsr 0xc20001 s.seed
+      out.Write(Acc.sat (Acc.ofFrac (third ()) + s.seed * p.a))
+
+  let unitsKernel = Kernel.define "probe-shape-units" <@ init @> <@ trig @> <@ units @>
+
+  let positive (v: Frac) = if v >= Frac.zero then v else Frac.zero
+
+  /// Both branches computed values.
+  let pick (a: Frac) (b: Frac) (c: Frac) = if a > b then a * c else Acc.ofFrac b - b * c
+
+  /// Steps the seed, gives the new one.
+  let step (s: S) =
+    s.seed <- Frac.lfsr 0xc20001 s.seed
+    s.seed
+
+  let selects (p: Banks.P) (s: S) (out: Output) =
+    for _ in 0 .. 15 do
+      s.seed <- Frac.lfsr 0xc20001 s.seed
+      let x = positive s.seed
+      out.Write(Acc.sat (pick x p.a p.b + (if s.seed < p.c then Acc.ofFrac p.d else Acc.zero)))
+      // a branch with an effect, the other the state it changes
+      out.Write(if p.a > Frac.zero then step s else s.seed)
+    s.events <- (if p.b < p.c then Acc.hi (p.b * p.c) else p.c)
+
+  let selectsKernel = Kernel.define "probe-shape-selects" <@ init @> <@ trig @> <@ selects @>
+
+  /// SuperWave's event scheduler: events until the phase passes the block, then a countdown on
+  /// a local, a value held across both, and fixed loops inside and around them.
+  let events (p: Banks.P) (s: S) (out: Output) =
+    let interval = Acc.ofFrac (Acc.hi (Acc.andHi 0x0f0000 (Acc.ofFrac p.a))) + Acc.ofFrac (Frac.ofRaw 0x010000)
+    let held = s.seed * p.c
+    s.phase <- s.phase - Acc.ofFrac (Frac.ofRaw 0x080000)
+    let mutable n = Frac.zero
+    while s.phase <= Acc.zero do
+      s.phase <- s.phase + interval
+      n <- Acc.hi (Acc.ofFrac n + Frac.ofRaw 1)
+      for _ in 0 .. 1 do
+        s.seed <- Frac.lfsr 0xc20001 s.seed
+    s.events <- n
+    for _ in 0 .. 3 do
+      let mutable x = Acc.ofFrac s.seed
+      while x > Acc.ofFrac p.b do
+        x <- x - Acc.ofFrac (Frac.ofRaw 0x100000)
+      for _ in 0 .. 7 do
+        out.Write(Acc.sat (x + held))
+
+  let eventsKernel = Kernel.define "probe-shape-events" <@ init @> <@ trig @> <@ events @>
+
+/// Programs of a known size: a few words of code and a table of `n` words.
+[<ReflectedDefinition>]
+module Sizes =
+  let init (_: Banks.P) () = ()
+
+  let small = Table.program "size_small" [| for i in 0 .. 39 -> i * 0x010101 |]
+  let near = Table.program "size_near" [| for i in 0 .. 3399 -> i |]
+  let mono = Table.program "size_mono" [| for i in 0 .. 8099 -> i |]
+  let over = Table.program "size_over" [| for i in 0 .. 14099 -> i |]
+
+  let index (p: Banks.P) = Acc.hi (Acc.andHi 0x7 (Acc.ofFrac p.a))
+
+  let renderSmall (p: Banks.P) () (out: Output) =
+    for _ in 0 .. 31 do
+      out.Write(Table.read small (index p))
+  let renderNear (p: Banks.P) () (out: Output) =
+    for _ in 0 .. 31 do
+      out.Write(Table.read near (index p))
+  let renderMono (p: Banks.P) () (out: Output) =
+    for _ in 0 .. 31 do
+      out.Write(Table.read mono (index p))
+  let renderOver (p: Banks.P) () (out: Output) =
+    for _ in 0 .. 31 do
+      out.Write(Table.read over (index p))
+
+  let smallKernel = Kernel.define "probe-size-small" <@ init @> <@ init @> <@ renderSmall @>
+  let nearKernel = Kernel.define "probe-size-3400" <@ init @> <@ init @> <@ renderNear @>
+  let monoKernel = Kernel.define "probe-size-8100" <@ init @> <@ init @> <@ renderMono @>
+  let overKernel = Kernel.define "probe-size-14100" <@ init @> <@ init @> <@ renderOver @>
+
+/// [<Subroutine>] helpers: TX8-CY's coefficient refresh, called from three places; a helper with
+/// four Frac arguments, one with an Acc argument calling another subroutine, one without
+/// arguments; the caller's locals held in registers and B across the calls.
+[<ReflectedDefinition>]
+module Subs =
+  type S =
+    { mutable seed : Frac
+      mutable c0 : Frac
+      mutable c1 : Frac
+      [<Length 4>] mutable hist : Frac array }
+
+  [<Subroutine>]
+  let refresh (p: Banks.P) (s: S) (x: Frac) =
+    s.c0 <- Acc.hi (x * p.a + Acc.ofFrac p.b)
+    s.c1 <- Acc.sat (Acc.ofFrac s.c0 - x * p.c)
+    for i in 0 .. 3 do
+      s.hist[i] <- Acc.hi (s.hist[i] * p.d + Acc.ofFrac x)
+
+  [<Subroutine>]
+  let mix (x: Frac) (y: Frac) (z: Frac) (w: Frac) = Acc.sat (x * y + z * w)
+
+  [<Subroutine>]
+  let shape (a: Frac) (b: Acc) = (b >>> 1) + a * mix a a a Frac.one
+
+  [<Subroutine>]
+  let third () = Region.read Scratch.x (Frac.ofRaw 3)
+
+  let init (p: Banks.P) (s: S) =
+    s.seed <- Frac.ofRaw 0x2b5d13
+    for i in 0 .. 3 do
+      s.hist[i] <- Frac.zero
+    for _ in 0 .. 1 do
+      refresh p s Frac.zero
+
+  let trig (_: Banks.P) (_: S) = ()
+
+  let render (p: Banks.P) (s: S) (out: Output) =
+    let fill = Cursor.linear Scratch.x Frac.zero
+    for _ in 0 .. 7 do
+      s.seed <- Frac.lfsr 0xc20001 s.seed
+      fill.Put s.seed
+    let held = s.seed * p.b
+    let mutable k = s.c0
+    for _ in 0 .. 3 do
+      refresh p s k
+      for _ in 0 .. 7 do
+        s.seed <- Frac.lfsr 0xc20001 s.seed
+        k <- mix s.seed k s.c1 p.a
+        out.Write(Acc.sat (shape k held + Acc.ofFrac (third ())))
+      k <- Acc.hi (Acc.ofFrac k + held)
+    refresh p s s.hist[2]
+
+  let kernel = Kernel.define "probe-subroutines" <@ init @> <@ trig @> <@ render @>
+
+  /// Six DO loops deep, then a call: more stack than a machine may take.
+  let deep (p: Banks.P) (s: S) =
+    for _ in 0 .. 1 do
+      for _ in 0 .. 1 do
+        for _ in 0 .. 1 do
+          for _ in 0 .. 1 do
+            for _ in 0 .. 1 do
+              for _ in 0 .. 1 do
+                refresh p s s.seed
+
+  let deepKernel = Kernel.define "probe-subroutines-deep" <@ init @> <@ deep @> <@ render @>
+
+/// Loops counted when running (TX8-CY's samples to the next oscillator edge): `for _ in 1 ..
+/// Frac.index n`, zero passes for a count of zero or less, a block split at a computed edge.
+[<ReflectedDefinition>]
+module Counted =
+  type S =
+    { mutable phase : Frac
+      mutable seed : Frac }
+
+  let init (_: Banks.P) (s: S) =
+    s.phase <- Frac.zero
+    s.seed <- Frac.ofRaw 0x61a3c5
+
+  let trig (_: Banks.P) (_: S) = ()
+
+  let render (p: Banks.P) (s: S) (out: Output) =
+    let n = Acc.hi (Acc.andHi 0x0f (Acc.ofFrac p.a))          // 0 .. 15
+    for _ in 1 .. Frac.index n do
+      s.seed <- Frac.lfsr 0xc20001 s.seed
+    let m = Acc.hi (Acc.ofFrac p.b >>> 20)                     // -8 .. 7: none for 0 and less
+    for _ in 0 .. 1 do
+      for _ in 0 .. Frac.index m - 1 do
+        s.phase <- Acc.hi (Acc.ofFrac s.phase + p.c)
+    // the block in two runs, split at an edge
+    let k = Acc.hi (Acc.andHi 0x1f (Acc.ofFrac s.seed))        // 0 .. 31
+    for _ in 1 .. Frac.index k do
+      s.phase <- Acc.hi (Acc.ofFrac s.phase + p.d)
+      out.Write s.phase
+    let rest = Acc.hi (Acc.ofFrac (Frac.ofRaw 32) - k)
+    for _ in 1 .. Frac.index rest do
+      s.seed <- Frac.lfsr 0xc20001 s.seed
+      out.Write(Acc.sat (s.seed * p.a))
+
+  let kernel = Kernel.define "probe-counted-loops" <@ init @> <@ trig @> <@ render @>
+
+/// A loop whose body starts with a test of the parameters (TX8-HH's): unswitched by default;
+/// kept whole by [<NoUnswitch>], by Loop.everyPass, or by a size budget.
+[<ReflectedDefinition>]
+module Unswitching =
+  type S =
+    { mutable seed : Frac
+      mutable level : Frac }
+
+  let init (_: Banks.P) (s: S) =
+    s.seed <- Frac.ofRaw 0x3c5a97
+    s.level <- Frac.zero
+
+  let trig (_: Banks.P) (_: S) = ()
+
+  let body (p: Banks.P) (s: S) (out: Output) =
+    s.seed <- Frac.lfsr 0xc20001 s.seed
+    out.Write(Acc.sat (s.seed * p.c + s.level * p.d))
+
+  let render (p: Banks.P) (s: S) (out: Output) =
+    for _ in 0 .. 31 do
+      if p.a > p.b then s.level <- Acc.hi (Acc.ofFrac s.level + s.seed * p.a)
+      else s.level <- Acc.hi (s.level * p.b)
+      body p s out
+
+  [<NoUnswitch>]
+  let renderKept (p: Banks.P) (s: S) (out: Output) =
+    for _ in 0 .. 31 do
+      if p.a > p.b then s.level <- Acc.hi (Acc.ofFrac s.level + s.seed * p.a)
+      else s.level <- Acc.hi (s.level * p.b)
+      body p s out
+
+  let renderEach (p: Banks.P) (s: S) (out: Output) =
+    for _ in 0 .. 31 do
+      if Loop.everyPass (p.a > p.b) then s.level <- Acc.hi (Acc.ofFrac s.level + s.seed * p.a)
+      else s.level <- Acc.hi (s.level * p.b)
+      body p s out
+
+  let kernel = Kernel.define "probe-unswitch" <@ init @> <@ trig @> <@ render @>
+  let keptKernel = Kernel.define "probe-unswitch-kept" <@ init @> <@ trig @> <@ renderKept @>
+  let eachKernel = Kernel.define "probe-unswitch-each" <@ init @> <@ trig @> <@ renderEach @>
+
 [<ReflectedDefinition>]
 module Unsized =
   type S = { mutable history : Frac array }
@@ -852,6 +1101,128 @@ let tests =
         match dsp56k.kernel.Compile.compile Kernel.mds StateRing.off with
         | Ok _ -> failtest "compiled"
         | Error e -> Expect.stringContains e "ring starts on a multiple of 8" "says where it may start"
+      } ]
+
+    testList "quotation shapes" [
+      for name, k, seed in [ "helpers taking unit, as a value and as a statement", Shapes.unitsKernel, 41
+                             "if/else as a value: Frac and Acc, in arithmetic, a branch with an effect", Shapes.selectsKernel, 42
+                             "while on state and on a local: zero or more passes, fixed loops inside and around", Shapes.eventsKernel, 43 ] ->
+        test name {
+          needNative ()
+          conformance k seed
+        } ]
+
+    testList "program size" [
+      let compiled level target k =
+        match Optimize.compile level target k with
+        | Ok c -> c
+        | Error e -> failtest e
+      test "code and table words" {
+        let c = compiled Optimize.Peephole Kernel.mds Sizes.smallKernel
+        match Compile.size c with
+        | Error e -> failtest e
+        | Ok s ->
+          Expect.equal s.tables 40 "the table's words"
+          Expect.isGreaterThan s.code 0 "some code"
+          match Grade.build probeMachine c with
+          | Error e -> failtest e
+          | Ok b -> Expect.equal b.package.programWords.Length s.total "the package holds code and tables"
+      }
+      test "the MDS track harness refuses a program reaching its services" {
+        let low = { machinedrum.run.Track.defaultLayout with programBase = 0x100 }    // services at P:$0e00
+        Expect.isNone (machinedrum.run.Track.overflow low 0xd00) "3328 words fit"
+        match machinedrum.run.Track.overflow low 0xd01 with
+        | None -> failtest "3329 fit"
+        | Some why ->
+          Expect.stringContains why "room for 3328 words" "names the room"
+          Expect.stringContains why "services at P:$0e00" "and what bounds it"
+        Expect.isNone (machinedrum.run.Track.overflow machinedrum.run.Track.defaultLayout Mds.programMaxWords) "the default layout holds the largest package"
+      }
+      test "the MDS harness: the X mirror of the largest package overlaps no shared area" {
+        let l = Grade.layout
+        let mirror = l.programBase, l.programBase + Mds.programMaxWords
+        let areas =
+          [ "workset", l.workset, 64; "scratch X", l.tempX, 32; "input ring", l.inputRing, 256; "input position", l.inputPosition, 1
+            "main ring", l.mainRing, 256; "main position", l.mainPosition, 1; "service words", machinedrum.run.Services.info, 0x7ff - machinedrum.run.Services.info
+            "sine", l.sineTable, Rom.sine.words.Length ]
+        for name, at, n in areas do
+          Expect.isTrue (at + n <= fst mirror || at >= snd mirror) $"{name} X:{at:x4}..{at + n - 1:x4} is clear of X:{fst mirror:x4}..{snd mirror - 1:x4}"
+      }
+      test "a program of 3400 words on the MDS harness equals the .NET kernel, its tables read past X:$0400" {
+        needNative ()
+        conformance Sizes.nearKernel 62
+      }
+      test "a kernel past the MDS package limit does not compile" {
+        for result in [ Compile.compile Kernel.mds Sizes.overKernel; Optimize.compile Optimize.Peephole Kernel.mds Sizes.overKernel ] do
+          match result with
+          | Ok _ -> failtest "compiled"
+          | Error e ->
+            Expect.stringContains e "at most 14052 program words" "names the limit"
+            Expect.stringContains e "tables 14100" "and the sizes"
+        match Mds.pack probeMachine (Array.zeroCreate 14_053) (Map [ "INIT", 0L; "TRIG", 0L; "RENDER", 0L ]) None with
+        | Ok _ -> failtest "packed"
+        | Error e -> Expect.stringContains $"%A{e}" "at most 14052" "the package format refuses it too"
+      } ]
+
+    testList "[<Subroutine>] helpers" [
+      test "compiled program equals the .NET kernel" {
+        needNative ()
+        conformance Subs.kernel 51
+      }
+      test "one copy of each, called with bsr" {
+        for level in [ Optimize.Direct; Optimize.Peephole ] do
+          match Optimize.compile level Kernel.mds Subs.kernel with
+          | Error e -> failtest e
+          | Ok c ->
+            let text = c.items |> Array.map dsp56k.Print.item
+            let count (s: string) = text |> Array.filter (fun l -> l.Contains s) |> Array.length
+            Expect.equal (count "SUB_REFRESH_1:") 1 "refresh once"
+            Expect.equal (text |> Array.filter (fun l -> l.Contains "bsr" && l.Contains "SUB_REFRESH_") |> Array.length) 3 "called from INIT's loop, RENDER's loop and RENDER's end"
+            Expect.isGreaterThan (text |> Array.filter (fun l -> l.Contains "bsr" && l.Contains "SUB_MIX_") |> Array.length) 1 "mix from render and from shape"
+      }
+      test "the system stack: a call six DO loops deep is refused" {
+        match Optimize.compile Optimize.Peephole Kernel.mds Subs.deepKernel with
+        | Ok _ -> failtest "compiled"
+        | Error e -> Expect.stringContains e "takes 15 system stack levels" "six loops, the call, refresh's own loop"
+      } ]
+
+    test "loops counted when running: compiled program equals the .NET kernel" {
+      needNative ()
+      conformance Counted.kernel 61
+    }
+
+    testList "loop unswitching" [
+      let loops (c: Compile.Compiled) = c.items |> Array.filter (fun it -> match it with dsp56k.Item.Op(dsp56k.Loop _) -> true | _ -> false) |> Array.length
+      let compiled k =
+        match Optimize.compile Optimize.Peephole Kernel.mds k with
+        | Ok c -> c
+        | Error e -> failtest e
+      let words c = match Compile.size c with Ok s -> s.total | Error e -> failtest e
+      yield! [ for name, k, seed in [ "unswitched", Unswitching.kernel, 71; "[<NoUnswitch>]", Unswitching.keptKernel, 72
+                                      "Loop.everyPass", Unswitching.eachKernel, 73 ] ->
+                 test $"{name}: compiled program equals the .NET kernel" {
+                   needNative ()
+                   conformance k seed
+                 } ]
+      test "by default the loop is split in two; [<NoUnswitch>] and Loop.everyPass keep it whole, smaller" {
+        let split, kept, each = compiled Unswitching.kernel, compiled Unswitching.keptKernel, compiled Unswitching.eachKernel
+        Expect.equal (loops split) 2 "a copy for each outcome"
+        Expect.equal (loops kept) 1 "[<NoUnswitch>]: one loop"
+        Expect.equal (loops each) 1 "Loop.everyPass: one loop"
+        Expect.isLessThan (words kept) (words split) "smaller"
+        Expect.equal (words each) (words kept) "the same code"
+      }
+      test "a size budget keeps loops whole when the split program does not fit" {
+        let split = compiled Unswitching.kernel
+        match Optimize.compileWithin (Some(words split - 1)) Optimize.Peephole Kernel.mds Unswitching.kernel with
+        | Error e -> failtest e
+        | Ok c ->
+          Expect.equal (loops c) 1 "kept whole"
+          let code (c: Compile.Compiled) = c.items |> Array.filter (fun it -> match it with dsp56k.Item.Comment _ -> false | _ -> true)
+          Expect.equal (code c) (code (compiled Unswitching.keptKernel)) "as [<NoUnswitch>] compiles it"
+        match Optimize.compileWithin (Some(words split)) Optimize.Peephole Kernel.mds Unswitching.kernel with
+        | Error e -> failtest e
+        | Ok c -> Expect.equal c.items split.items "split when it fits"
       } ]
 
     test "pipelines (|>, <|): compiled program equals the .NET kernel" {

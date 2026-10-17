@@ -328,18 +328,23 @@ let build (machine: Mds.Machine) (compiled: Compile.Compiled) =
   | Error e -> Error(Assembler.errorText e)
   | Ok r ->
     let _, words = Assembler.image dsp56k.Space.P r
-    let m =
-      { machine with
-          patches = Abi.patches compiled.items
-          initSymbol = "INIT"; trigSymbol = "TRIG"; renderSymbol = "RENDER"
-          xWorkset = compiled.xWorkset
-          yWorkset = compiled.yWorkset }
-    match Mds.pack m words r.symbols None with
-    | Error e -> Error $"%A{e}"
-    | Ok bytes ->
-      match Mds.read bytes with
+    match Track.overflow layout words.Length with
+    | Some why ->
+      let sized = match Compile.size compiled with Ok s -> $" ({s.text})" | Error _ -> ""
+      Error $"{compiled.kernel.name}: {why}{sized}"
+    | None ->
+      let m =
+        { machine with
+            patches = Abi.patches compiled.items
+            initSymbol = "INIT"; trigSymbol = "TRIG"; renderSymbol = "RENDER"
+            xWorkset = compiled.xWorkset
+            yWorkset = compiled.yWorkset }
+      match Mds.pack m words r.symbols None with
       | Error e -> Error $"%A{e}"
-      | Ok pkg -> Ok { compiled = compiled; machine = m; bytes = bytes; package = pkg }
+      | Ok bytes ->
+        match Mds.read bytes with
+        | Error e -> Error $"%A{e}"
+        | Ok pkg -> Ok { compiled = compiled; machine = m; bytes = bytes; package = pkg }
 
 /// A package on track 0, the stand-ins loaded.
 let trackSession (package: Mds.Package) (machine: Mds.Machine) =
@@ -451,6 +456,20 @@ let firmwareSession (target: Kernel.Target) (map: FirmwareMap) (load: Emulator -
         [| for i in 0 .. target.blockWords - 1 -> emu.Read(Native.Space.Y, map.output + i) |], cycles
       member _.Dispose() = (emu :> IDisposable).Dispose() }
 
+/// The P words a map holds from `kernelBase`: up to the call stub when it lies above, else to
+/// the end of the emulator's P memory.
+let mapRoom (map: FirmwareMap) =
+  let p, _, _ = map.memory
+  (if map.stub >= map.kernelBase then map.stub else p) - map.kernelBase
+
+/// Why a program of `words` does not fit the map, if it does not.
+let mapOverflow (map: FirmwareMap) (words: int) =
+  let room = mapRoom map
+  if words <= room then None
+  else
+    let limit = if map.stub >= map.kernelBase then $"below the call stub at P:${map.stub:x4}" else "in the emulator's P memory"
+    Some $"the program is {words} words; the firmware map loads it at P:${map.kernelBase:x4}, room for {room} words {limit}, {words - room} over"
+
 /// The compiled kernel's words at `map.kernelBase`, relocated and its imports patched from
 /// `map.resources`, and its entry addresses.
 let place (map: FirmwareMap) (compiled: Compile.Compiled) =
@@ -458,20 +477,25 @@ let place (map: FirmwareMap) (compiled: Compile.Compiled) =
   | Error e -> Error(Assembler.errorText e)
   | Ok r ->
     let org, image = Assembler.image dsp56k.Space.P r
-    let words = Array.copy image
-    let at label delta = int r.symbols[label] - org + delta
-    let missing =
-      [ for patch in Abi.patches compiled.items do
-          match patch with
-          | Mds.Relocation(l, d) -> words[at l d] <- (words[at l d] + map.kernelBase) &&& 0xffffff
-          | Mds.Import(l, d, kind, symbol) ->
-            match map.resources.TryFind symbol with
-            | Some address -> words[at l d] <- (words[at l d] + address) &&& 0xffffff
-            | None -> yield $"import kind {kind} symbol {symbol}" ]
-    if not missing.IsEmpty then Error $"""{compiled.kernel.name}: the firmware map has no address for {String.concat ", " (List.distinct missing)}"""
-    else
-      let entry name = map.kernelBase + int r.symbols[name] - org
-      Ok(words, (entry "INIT", entry "TRIG", entry "RENDER"))
+    match mapOverflow map image.Length with
+    | Some why ->
+      let sized = match Compile.size compiled with Ok s -> $" ({s.text})" | Error _ -> ""
+      Error $"{compiled.kernel.name}: {why}{sized}"
+    | None ->
+      let words = Array.copy image
+      let at label delta = int r.symbols[label] - org + delta
+      let missing =
+        [ for patch in Abi.patches compiled.items do
+            match patch with
+            | Mds.Relocation(l, d) -> words[at l d] <- (words[at l d] + map.kernelBase) &&& 0xffffff
+            | Mds.Import(l, d, kind, symbol) ->
+              match map.resources.TryFind symbol with
+              | Some address -> words[at l d] <- (words[at l d] + address) &&& 0xffffff
+              | None -> yield $"import kind {kind} symbol {symbol}" ]
+      if not missing.IsEmpty then Error $"""{compiled.kernel.name}: the firmware map has no address for {String.concat ", " (List.distinct missing)}"""
+      else
+        let entry name = map.kernelBase + int r.symbols[name] - org
+        Ok(words, (entry "INIT", entry "TRIG", entry "RENDER"))
 
 /// Compiled kernels on a firmware's DSP: placed at `map.kernelBase` and called the way a host
 /// program calls a routine. Settings are refused until the caller gives `settings`.

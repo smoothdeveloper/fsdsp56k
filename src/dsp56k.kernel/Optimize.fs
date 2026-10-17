@@ -305,7 +305,7 @@ let successors (items: Item array) =
     match items[i] with
     | Op(Branch(Bra, t)) | Op(Jump(Jmp, t)) ->
       match target t with Some j -> succ[i].Add j | None -> followable <- false
-    | Op(Branch((Bcc _ | Bscc _), t)) | Op(Jump((Jcc _ | Jscc _), t)) | Op(BitBranch(_, _, _, t)) ->
+    | Op(Branch((Bcc _ | Bscc _ | Bsr), t)) | Op(Jump((Jcc _ | Jscc _ | Jsr), t)) | Op(BitBranch(_, _, _, t)) ->
       next ()
       match target t with Some j -> succ[i].Add j | None -> followable <- false
     | Op Rts | Op Rti | Op Stop | Dc _ | Ds _ -> ()
@@ -514,7 +514,8 @@ let hoist (items: (Item * int) array) =
                   | _ -> true
                 match writesOf instr with
                 | Some ws -> stores && not (overlaps dst ws) && not (Array.contains (R 6) ws)
-                | None -> control instr
+                // a subroutine may write the word
+                | None -> control instr && (match instr with Branch((Bsr | Bscc _), _) | Jump((Jsr | Jscc _), _) -> false | _ -> true)
               | _ -> true)
           before && others
       | None -> false
@@ -582,7 +583,8 @@ let deadOnExit (items: (Item * int) array) (from: int) (r: Reg) =
     else
       match fst items[k] with
       | Comment _ | Label _ -> go (k + 1)
-      | Op Rts -> true
+      // an entry's rts; a subroutine's gives its result back in registers
+      | Op Rts -> not (items[.. k] |> Array.exists (fun (it, _) -> match it with Label l -> l.StartsWith "SUB_" | _ -> false))
       | Op instr ->
         match readsOf instr, writesOf instr with
         | Some rs, Some ws -> if touches rs then false elif touches ws then true else go (k + 1)
@@ -651,7 +653,7 @@ let fixLoops (items: (Item * int) array) =
     | Label name when ends.Contains name ->
       let previous = out |> Seq.rev |> Seq.tryFind (fun (x, _) -> match x with Comment _ -> false | _ -> true)
       match previous with
-      | Some(Label _, _) | Some(Op(Loop _), _) | None -> out.Add(Op Nop, line)
+      | Some(Label _, _) | Some(Op(Loop _), _) | Some(Op(Branch _), _) | Some(Op(Jump _), _) | None -> out.Add(Op Nop, line)
       | _ -> ()
       out.Add(it, line)
     | _ -> out.Add(it, line)
@@ -679,8 +681,36 @@ let runFrom (level: Level) (first: int) (temps: int) (items: Item array) (lines:
 let run (level: Level) (temps: int) (items: Item array) (lines: int array) = runFrom level 0 temps items lines
 
 /// Compile, then run the passes of `level` over the items.
+/// Compile, run the passes of `level`, and keep the program within `limit` words: when it is
+/// larger, the loops whose unswitching added the most are kept whole (tested on each pass), the
+/// largest first, until it fits or none is unswitched. None: no limit.
+let compileWithin (limit: int option) (level: Level) (target: Kernel.Target) (k: Kernel.Kernel) =
+  let attempt (unswitchMax: int option) =
+    Compile.generateUnswitching unswitchMax target k
+    |> Result.map (fun (c, costs) ->
+      let items, lines = runFrom level c.layout.xWorkset c.xWorkset c.items c.lines
+      { c with items = items; lines = lines }, costs)
+  let fits (c: Compile.Compiled) =
+    match limit, Compile.size c with
+    | Some l, Ok s -> s.total <= l
+    | _ -> true
+  match attempt None with
+  | Ok(c, costs) when not (fits c) && not costs.IsEmpty ->
+    // each distinct cost, largest first: loops costing more than the next one down kept whole
+    let rec smaller (thresholds: int list) (best: Compile.Compiled) =
+      match thresholds with
+      | [] -> Ok best
+      | m :: rest ->
+        match attempt (Some m) with
+        | Ok(c, _) when fits c -> Ok c
+        | Ok(c, _) -> smaller rest c
+        | Error e -> Error e
+    let thresholds = (costs |> List.distinct |> List.sortDescending |> List.tail) @ [ -1 ]
+    smaller thresholds c
+  | r -> r |> Result.map fst
+
+/// Compile, then run the passes of `level` over the items; refused when the program is larger
+/// than the target's machine holds (Kernel.programLimit), after keeping loops whole if that helps.
 let compile (level: Level) (target: Kernel.Target) (k: Kernel.Kernel) =
-  Compile.compile target k
-  |> Result.map (fun c ->
-    let items, lines = runFrom level c.layout.xWorkset c.xWorkset c.items c.lines
-    { c with items = items; lines = lines })
+  compileWithin (Kernel.programLimit target |> Option.map fst) level target k
+  |> Result.bind Compile.checkSize

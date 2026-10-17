@@ -147,7 +147,34 @@ type Ctx =
     tables   : ResizeArray<Table>     // program tables, emitted after the code
     unswitched : HashSet<Var>         // loops (by index) already split on a condition
     mutable bHeld  : bool             // an Acc local lives in B: nothing else may write it
-    mutable bWrite : bool }           // ...except the local's own updates
+    mutable bWrite : bool             // ...except the local's own updates
+    subs     : Dictionary<MethodInfo, Sub>   // [<Subroutine>] helpers called, compiled after the entries
+    floors   : Map<string, int>          // the least first word of a subroutine's (Refloor)
+    kept     : HashSet<Var>                  // loops not unswitched: in [<NoUnswitch>] functions
+    unswitchMax : int option                 // unswitch a loop only when its copy takes at most these words
+    unswitchCosts : ResizeArray<int>         // the words each unswitched loop's copy took
+    mutable inSub  : Sub option       // the subroutine being compiled
+    mutable depth  : int              // system stack levels taken here: two a DO loop
+    mutable deepest : int }           // the most, in the entry or subroutine being compiled
+
+/// A [<Subroutine>] helper: where its calls are, what they leave it.
+and Sub =
+  { label    : string
+    mi       : MethodInfo
+    records  : Dictionary<Type, Var>              // the records (and output) its callers pass
+    sites    : ResizeArray<CallSite>
+    mutable compiled : bool
+    mutable start    : int            // its first word, once compiled
+    mutable deepest  : int }          // stack levels its own DO loops take
+
+/// A call: the caller's first free local word (the subroutine's words start above every call's),
+/// its free address registers (the subroutine may take those free at every call), the stack
+/// levels taken there, and the subroutine making it (None: an entry).
+and CallSite =
+  { next     : int
+    freeRegs : int list
+    depth    : int
+    caller   : Sub option }
 
 /// A cursor's address register.
 and CursorReg =
@@ -453,10 +480,36 @@ let inlined (mi: MethodInfo) (args: Expr list) =
       | Lambda(v, rest), (PropertyGet(Some(Var _), p, []) as a) :: more when not (writesField p.Name rest) ->
         (bind rest more : Expr).Substitute(fun x -> if x = v then Some a else None)
       | Lambda(v, rest), a :: more -> Expr.Let(v, a, bind rest more)
+      // `let f () = ...` is a method of no parameters called with none: its unit argument
+      // stands for nothing
+      | Lambda(v, rest), [] when v.Type = typeof<unit> && mi.GetParameters().Length = 0 -> rest
       | body, [] -> body
       | _ -> fail $"{mi.Name}: partial application is not supported"
     ordered (normalize (bind def args))
   | None -> fail $"{owner mi}.{mi.Name} is neither an intrinsic nor a [<ReflectedDefinition>] function"
+
+/// A helper marked [<Subroutine>]: called, not inlined.
+let isSubroutine (mi: MethodInfo) =
+  not (isNull (mi.GetCustomAttribute<SubroutineAttribute>())) && (reflected mi).IsSome
+
+/// A helper's parameters and body.
+let parametersOf (def: Expr) =
+  let rec go (e: Expr) acc =
+    match e with
+    | Lambda(v, body) -> go body (v :: acc)
+    | body -> List.rev acc, body
+  go def []
+
+/// The system stack levels a machine may take (the DSP56300 has 16; the Machinedrum's firmware
+/// and interrupts keep the others).
+let stackLevels = 12
+
+/// A subroutine's name across compilations.
+let subKey (mi: MethodInfo) = $"{mi.DeclaringType.FullName}.{mi.Name}:{mi.MetadataToken}"
+
+/// The registers a subroutine's arguments arrive in.
+let fracArgs = [ X0; Y0; X1; Y1 ]
+let accArgs = [ A; B ]
 
 // ---------------------------------------------------------------------------------------------
 // Operands that load with single moves.
@@ -698,7 +751,7 @@ let score (ctx: Ctx) (w: Var) = match ctx.scores.TryGetValue w with | true, n ->
 /// code does not.
 let rec acrossControl (v: Var) (e: Expr) =
   match e with
-  | ForIntegerRangeLoop _ | IfThenElse _ when e.GetFreeVars() |> Seq.contains v -> true
+  | ForIntegerRangeLoop _ | WhileLoop _ | IfThenElse _ when e.GetFreeVars() |> Seq.contains v -> true
   | ExprShape.ShapeVar _ -> false
   | ExprShape.ShapeLambda(_, b) -> acrossControl v b
   | ExprShape.ShapeCombination(_, xs) -> List.exists (acrossControl v) xs
@@ -744,7 +797,9 @@ let invariantIf (ctx: Ctx) (index: Var) (body: Expr) =
       let mi' = resolve mi args
       let ok =
         match intrinsic mi' with
-        | Some n -> not (n.StartsWith "cursor.") && n <> "out.write" && n <> "out.pair" && n <> "region.read" && n <> "region.write"
+        | Some n ->
+          not (n.StartsWith "cursor.") && n <> "out.write" && n <> "out.pair" && n <> "region.read" && n <> "region.write"
+          && n <> "loop.everyPass"
         | None -> owner mi' = operators || isConst mi' || mi'.DeclaringType = typeof<Frac> || mi'.DeclaringType = typeof<Acc>
       ok && List.forall pure' args
     | _ -> false
@@ -830,6 +885,25 @@ let yields (ctx: Ctx) (v: Var) (value: Expr) (body: Expr) =
     | ExprShape.ShapeCombination(_, xs) -> List.exists carried xs
   not v.IsMutable && accBound ctx value < 1.0 && carried body
 
+/// `if c then t else f` as a value: a mutable local, set in statement position, then read. It
+/// starts as `f` when that is a plain word or accumulator (a variable, a field, a constant) and
+/// the condition and `t` change nothing, so only `t` needs a branch; otherwise as zero.
+let selection (ctx: Ctx) (e: Expr) =
+  match e with
+  | IfThenElse(c, t, f) ->
+    let v = Var("select", e.Type, true)
+    let leaf =
+      if e.Type = typeof<Frac> then (wordLeaf ctx f).IsSome
+      elif e.Type = typeof<Long> then (longLeaf ctx f).IsSome
+      else (accLeaf ctx f).IsSome
+    let quiet = (touches false c).writes.IsEmpty && (touches false t).writes.IsEmpty
+    if leaf && quiet then
+      Expr.Let(v, f, Expr.Sequential(Expr.IfThenElse(c, Expr.VarSet(v, t), Expr.Value(())), Expr.Var v))
+    else
+      let zero = Expr.PropertyGet(nonNull (e.Type.GetProperty "zero"))
+      Expr.Let(v, zero, Expr.Sequential(Expr.IfThenElse(c, Expr.VarSet(v, t), Expr.VarSet(v, f)), Expr.Var v))
+  | _ -> e
+
 let rec genAcc (ctx: Ctx) (e: Expr) : unit =
   match accLeaf ctx e with
   | Some l -> emitAll ctx (loadAccLeaf l A)
@@ -838,6 +912,7 @@ let rec genAcc (ctx: Ctx) (e: Expr) : unit =
     | Let(v, value, body) -> withLet ctx v value body (fun () -> genAcc ctx body)
     | IfThenElse(c, t, f) when (match tryConst ctx c with Some(:? bool) -> true | _ -> false) ->
       genAcc ctx (if (tryConst ctx c).Value :?> bool then t else f)
+    | IfThenElse _ -> genAcc ctx (selection ctx e)
     | Sequential(s, rest) -> thenRun ctx rest (fun () -> genStmt ctx s); genAcc ctx rest
     | Call(None, mi, args) ->
       let mi = resolve mi args
@@ -898,6 +973,7 @@ let rec genAcc (ctx: Ctx) (e: Expr) : unit =
         genAcc ctx x
         emit ctx (and' (immL (m &&& 0xffffff)) a)
       | Some n, _ -> fail $"{n} does not give an Acc"
+      | None, _ when isSubroutine mi -> callSub ctx mi args
       | None, _ -> genAcc ctx (inlined mi args)
     | _ -> fail $"not a kernel Acc expression: {e}"
 
@@ -1006,7 +1082,11 @@ and genLong (ctx: Ctx) (e: Expr) =
       emitAll ctx (storeA t)
       emitAll ctx (loadAccLeaf (AOfLong(at t 0, at t 1)) A)
     | Let(v, value, body) -> withLet ctx v value body (fun () -> genLong ctx body)
+    | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone && isSubroutine mi -> callSub ctx mi args
     | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone -> genLong ctx (inlined mi args)
+    | IfThenElse(c, t, f) when (match tryConst ctx c with Some(:? bool) -> true | _ -> false) ->
+      genLong ctx (if (tryConst ctx c).Value :?> bool then t else f)
+    | IfThenElse _ -> genLong ctx (selection ctx e)
     | _ -> fail $"not a kernel Long expression: {e}"
 
 /// A Frac expression into X0.
@@ -1018,6 +1098,7 @@ and genWord (ctx: Ctx) (e: Expr) : unit =
     | Let(v, value, body) -> withLet ctx v value body (fun () -> genWord ctx body)
     | IfThenElse(c, t, f) when (match tryConst ctx c with Some(:? bool) -> true | _ -> false) ->
       genWord ctx (if (tryConst ctx c).Value :?> bool then t else f)
+    | IfThenElse _ -> genWord ctx (selection ctx e)
     | Sequential(s, rest) -> thenRun ctx rest (fun () -> genStmt ctx s); genWord ctx rest
     | ComputedElement ctx (f, w, c, []) ->
       indexInN0 ctx w (f.offset + c)
@@ -1055,6 +1136,7 @@ and genWord (ctx: Ctx) (e: Expr) : unit =
         emit ctx (Label skip)
         emit ctx (move a1 x0)
       | Some n, _ -> fail $"{n} does not give a Frac"
+      | None, _ when isSubroutine mi -> callSub ctx mi args
       | None, _ -> genWord ctx (inlined mi args)
     | Call(Some(Var c), mi, []) when ctx.cursors.ContainsKey c ->
       match intrinsic mi with
@@ -1513,7 +1595,7 @@ and innerLocals (e: Expr) =
 
 and genStmt (ctx: Ctx) (e: Expr) : unit =
   match e with
-  | Sequential _ | Let _ | ForIntegerRangeLoop _ | IfThenElse _ -> genStmtIn ctx e
+  | Sequential _ | Let _ | ForIntegerRangeLoop _ | WhileLoop _ | IfThenElse _ -> genStmtIn ctx e
   // a statement reads all it reads until it is done (lets inlined helpers bind inside it)
   | _ -> thenRun ctx e (fun () -> genStmtIn ctx e)
 
@@ -1539,12 +1621,56 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
   | StateElement ctx (m, [ value ]) -> storeWord ctx value m
   | PropertySet(Some(Var p), f, _, _) when p.Type = ctx.kernel.paramsType ->
     fail $"parameter {f.Name} is read-only"
-  | ForIntegerRangeLoop(v, lo, hi, body) when not (ctx.unswitched.Contains v) && (invariantIf ctx v body).IsSome ->
-    // a condition the loop does not change, tested once: a copy of the loop for each outcome
+  | ForIntegerRangeLoop(v, lo, hi, body) when not (ctx.unswitched.Contains v) && not (ctx.kept.Contains v) && (invariantIf ctx v body).IsSome ->
+    // a condition the loop does not change, tested once: a copy of the loop for each outcome,
+    // unless the copy takes more words than unswitchMax allows
+    let restore = snapshot ctx
+    let labels = ctx.labels
+    let unswitched = List.ofSeq ctx.unswitched
+    let costs = ctx.unswitchCosts.Count
     ctx.unswitched.Add v |> ignore
     let c = (invariantIf ctx v body).Value
     let loop taken = Expr.ForIntegerRangeLoop(v, lo, hi, decide ctx c taken body)
+    let first = ctx.items.Count
     genStmt ctx (Expr.IfThenElse(c, loop true, loop false))
+    let cost = (ctx.items |> Seq.skip first |> Seq.filter (fun it -> match it with Op _ -> true | _ -> false) |> Seq.length) / 2
+    match ctx.unswitchMax with
+    | Some m when cost > m ->
+      restore ()
+      ctx.labels <- labels      // the labels numbered as if the loop had not been split
+      ctx.unswitched.Clear(); ctx.unswitched.UnionWith unswitched
+      ctx.unswitchCosts.RemoveRange(costs, ctx.unswitchCosts.Count - costs)
+      ctx.kept.Add v |> ignore
+      genStmt ctx e
+    | _ -> ctx.unswitchCosts.Add cost
+  | ForIntegerRangeLoop(v, lo, hi, body) when (tryConst ctx lo).IsSome && (computedIndex ctx hi).IsSome ->
+    // `for _ in lo .. Frac.index w + c`: the count in A, none when it is 0 or less (as .NET's
+    // loop), then DO from a1
+    let lo = constInt ctx "a loop bound" lo
+    let w, c = (computedIndex ctx hi).Value
+    if body.GetFreeVars() |> Seq.contains v then
+      fail $"{v.Name}: a loop counted when running (up to Frac.index ...) cannot read its index"
+    let skip = fresh ctx "NONE"
+    thenRun ctx body (fun () -> genWord ctx w)
+    emit ctx (move x0 a)
+    let k = c - lo + 1
+    if k <> 0 then emit ctx (add (immL (k &&& 0xffffff)) a) else emit ctx (tst a)
+    emit ctx (bcc Cond.Le skip)
+    let endLabel = fresh ctx "LOOP"
+    emit ctx (Label(endLabel + "_DO"))
+    emit ctx machinedrum.Abi.relocateMarker
+    emit ctx (doTo a1 endLabel)
+    let first = ctx.items.Count
+    ctx.depth <- ctx.depth + 2
+    ctx.deepest <- max ctx.deepest ctx.depth
+    thenRun ctx body (fun () -> genStmt ctx body)     // the body runs again
+    ctx.depth <- ctx.depth - 2
+    let last = if ctx.items.Count > first then Some ctx.items[ctx.items.Count - 1] else None
+    match last with
+    | None | Some(Label _) | Some(Comment _) | Some(Op(Branch _)) -> emit ctx nop
+    | _ -> ()
+    emit ctx (Label endLabel)
+    emit ctx (Label skip)
   | ForIntegerRangeLoop(v, lo, hi, body) ->
     let lo = constInt ctx "a loop bound" lo
     let hi = constInt ctx "a loop bound" hi
@@ -1608,12 +1734,15 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
       emit ctx machinedrum.Abi.relocateMarker
       emit ctx (doTo (imm count) endLabel)
       let first = ctx.items.Count
+      ctx.depth <- ctx.depth + 2
+      ctx.deepest <- max ctx.deepest ctx.depth
       thenRun ctx body (fun () -> genStmt ctx body)     // the body runs again
+      ctx.depth <- ctx.depth - 2
       let stepped = not regs.IsEmpty || counter.IsSome
       // DO needs an instruction to end on: the body's end cannot be a branch target
       let last = if ctx.items.Count > first then Some ctx.items[ctx.items.Count - 1] else None
       match last with
-      | (None | Some(Label _) | Some(Comment _)) when not stepped -> emit ctx nop
+      | (None | Some(Label _) | Some(Comment _) | Some(Op(Branch _))) when not stepped -> emit ctx nop
       | _ -> ()
       for reg in regs do emit ctx (update (inc (R reg)))
       match counter with
@@ -1626,6 +1755,16 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
       ctx.freeRegs <- regs @ ctx.freeRegs
       ctx.indexed <- savedIndexed
       ctx.counters <- savedCounters
+  | WhileLoop(cond, body) ->
+    // the condition at the top, tested before each pass (none when it is false at once); the
+    // condition and the body are compiled knowing the whole loop runs again after them
+    let top = fresh ctx "WHILE"
+    let endLabel = fresh ctx "WEND"
+    emit ctx (Label top)
+    thenRun ctx e (fun () -> thenRun ctx body (fun () -> branchUnless ctx cond endLabel))
+    thenRun ctx e (fun () -> genStmt ctx body)
+    emit ctx (bra top)
+    emit ctx (Label endLabel)
   | IfThenElse(cond, t, f) when (match tryConst ctx cond with Some(:? bool) -> true | _ -> false) ->
     // decided when compiling: only the branch taken is generated
     if (tryConst ctx cond).Value :?> bool then genStmt ctx t else genStmt ctx f
@@ -1652,10 +1791,156 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
     storeWord ctx x (cursorMem ctx.cursors[c] true)
   | Call(Some(Var c), mi, [x]) when ctx.cursors.ContainsKey c && (intrinsic mi = Some "cursor.putUp" || intrinsic mi = Some "cursor.putDown") ->
     storeWord ctx x (cursorOne ctx.cursors[c] (intrinsic mi).Value)
+  | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone && isSubroutine mi -> callSub ctx mi args
   | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone -> genStmt ctx (inlined mi args)
   | Value(null, _) -> ()
   | _ -> fail $"not a kernel statement: {e}"
   ctx.next <- mark
+
+/// A call to a [<Subroutine>] helper: the value arguments computed (into words, none left in a
+/// register), the caller's X1 and Y1 locals saved, the arguments loaded into their registers,
+/// bsr, the locals restored. The result is in X0 or A, where the expression generators leave
+/// theirs.
+and callSub (ctx: Ctx) (mi: MethodInfo) (args: Expr list) =
+  // B holds a caller's Acc local: that local goes to memory instead (the subroutine may use B)
+  if ctx.bHeld then raise BTaken
+  let def = (reflected mi).Value
+  let ps, _ = parametersOf def
+  let sub =
+    match ctx.subs.TryGetValue mi with
+    | true, s -> s
+    | _ ->
+      let name = String(mi.Name |> Seq.map (fun c -> if Char.IsLetterOrDigit c then Char.ToUpperInvariant c else '_') |> Array.ofSeq)
+      let s = { label = $"SUB_{name}_{ctx.subs.Count + 1}"; mi = mi; records = Dictionary(); sites = ResizeArray()
+                compiled = false; start = 0; deepest = 0 }
+      ctx.subs[mi] <- s
+      s
+  let rec calling (s: Sub option) = match s with Some s when s.mi = mi -> true | Some s -> false | None -> false
+  if calling ctx.inSub then fail $"{mi.Name}: a [<Subroutine>] cannot call itself"
+  let isRecord (t: Type) = t = ctx.kernel.paramsType || t = ctx.kernel.stateType || t = typeof<Output>
+  let pairs =
+    match ps, args with
+    | [ u ], [] when u.Type = typeof<unit> -> []
+    | _ when ps.Length = args.Length -> List.zip ps args
+    | _ -> fail $"{mi.Name}: a [<Subroutine>] takes all its arguments"
+  let values =
+    [ for v, a in pairs do
+        if isRecord v.Type then
+          match a with
+          | Var w -> if not (sub.records.ContainsKey v.Type) then sub.records[v.Type] <- w
+          | _ -> fail $"{mi.Name}: pass the {v.Type.Name} record itself"
+        elif v.Type = typeof<unit> then ()
+        else
+          match tyOf v.Type with
+          | TFrac | TAcc | TLong -> yield v, a
+          | _ -> fail $"{mi.Name}: a [<Subroutine>] takes Frac, Acc and Long values and the records, not {v.Type.Name}" ]
+  let fracs = values |> List.filter (fun (v, _) -> tyOf v.Type = TFrac)
+  let accs = values |> List.filter (fun (v, _) -> tyOf v.Type <> TFrac)
+  if fracs.Length > fracArgs.Length || accs.Length > accArgs.Length then
+    fail $"{mi.Name}: a [<Subroutine>] takes up to {fracArgs.Length} Frac and {accArgs.Length} Acc or Long values"
+  // the arguments in .NET's order, each knowing the later ones still read what they read
+  let staged =
+    values |> List.mapi (fun i (v, a) ->
+      let later = values |> List.skip (i + 1) |> List.map snd
+      let run (f: unit -> unit) =
+        match later with
+        | [] -> f ()
+        | [ x ] -> thenRun ctx x f
+        | xs -> thenRun ctx (Expr.NewTuple xs) f
+      match tyOf v.Type with
+      | TFrac ->
+        let mutable w = WImm 0
+        run (fun () ->
+          w <-
+            match wordLeaf ctx a with
+            | Some(WReg r) ->
+              let t = alloc ctx TFrac
+              emit ctx (move r (at t 0))
+              WMem(at t 0)
+            | Some w -> w
+            | None ->
+              genWord ctx a
+              let t = alloc ctx TFrac
+              emit ctx (move x0 (at t 0))
+              WMem(at t 0))
+        v, Choice1Of2 w
+      | ty ->
+        let t = alloc ctx ty
+        run (fun () ->
+          if ty = TAcc then genAcc ctx a else genLong ctx a
+          emitAll ctx (storeA t))
+        v, Choice2Of2 t)
+  // the caller's register locals: the subroutine may use X1 and Y1
+  let saved =
+    [ for r in [ X1; Y1 ] do
+        if not (List.contains r ctx.freeData) then
+          let t = alloc ctx TFrac
+          emit ctx (move r (at t 0))
+          yield r, t ]
+  let mutable nf, na = 0, 0
+  for _, s in staged do
+    match s with
+    | Choice2Of2 t ->
+      let leaf = if t.ty = TLong then AOfLong(at t 0, at t 1) else AHome t
+      emitAll ctx (loadAccLeaf leaf accArgs[na])
+      na <- na + 1
+    | Choice1Of2 _ -> ()
+  for _, s in staged do
+    match s with
+    | Choice1Of2 w ->
+      emitAll ctx (loadWord w fracArgs[nf])
+      nf <- nf + 1
+    | Choice2Of2 _ -> ()
+  sub.sites.Add { next = ctx.next; freeRegs = ctx.freeRegs; depth = ctx.depth; caller = ctx.inSub }
+  emit ctx (bsr sub.label)
+  for r, t in saved do emit ctx (move (at t 0) r)
+
+/// A subroutine's code, after the entries: its words above every call's locals, its arguments
+/// stored from their registers into them, its body, rts.
+and compileSub (ctx: Ctx) (sub: Sub) =
+  sub.compiled <- true
+  let ps, body = parametersOf (reflected sub.mi).Value
+  ctx.vars <- Map.empty; ctx.consts <- Map.empty; ctx.cursors <- Map.empty
+  ctx.indexed <- Map.empty; ctx.counters <- Map.empty; ctx.conts <- []
+  ctx.released.Clear(); ctx.deadLocals.Clear()
+  ctx.freeData <- [ X1; Y1 ]; ctx.bHeld <- false; ctx.bWrite <- false; ctx.trackHome <- None
+  ctx.freeRegs <- sub.sites |> Seq.map (fun s -> Set.ofList s.freeRegs) |> Set.intersectMany |> Set.toList
+  ctx.next <- max (sub.sites |> Seq.map _.next |> Seq.max) (defaultArg (ctx.floors.TryFind (subKey sub.mi)) 0)
+  sub.start <- ctx.next
+  ctx.depth <- 0; ctx.deepest <- 0
+  ctx.inSub <- Some sub
+  ctx.line <- 0
+  emit ctx (Label sub.label)
+  let mutable nf, na = 0, 0
+  let mutable body = body
+  for v in ps do
+    if sub.records.ContainsKey v.Type then
+      let w = sub.records[v.Type]
+      body <- body.Substitute(fun x -> if x = v then Some(Expr.Var w) else None)
+    elif v.Type = typeof<unit> || v.Type = ctx.kernel.paramsType || v.Type = ctx.kernel.stateType || v.Type = typeof<Output> then ()
+    else
+      let ty = tyOf v.Type
+      let h = alloc ctx ty
+      match ty with
+      | TFrac ->
+        emit ctx (move fracArgs[nf] (at h 0))
+        nf <- nf + 1
+      | _ ->
+        let e, hi, lo = parts accArgs[na]
+        emit ctx (move hi (at h 0))
+        emit ctx (move lo (at h 1))
+        if ty = TAcc then emit ctx (move e (at h 2))
+        na <- na + 1
+      ctx.vars <- ctx.vars.Add(v, h)
+  let body = ordered (normalize body)
+  let r = sub.mi.ReturnType
+  if r = typeof<Frac> then genWord ctx body
+  elif r = typeof<Acc> then genAcc ctx body
+  elif r = typeof<Long> then genLong ctx body
+  else genStmt ctx body
+  emit ctx rts
+  sub.deepest <- ctx.deepest
+  ctx.inSub <- None
 
 /// Branch to `target` when the comparison is false.
 and branchUnless (ctx: Ctx) (cond: Expr) (target: string) =
@@ -1664,6 +1949,7 @@ and branchUnless (ctx: Ctx) (cond: Expr) (target: string) =
     elif x.Type = typeof<Acc> then x
     else fail $"comparisons are on Frac or Acc values, not {x.Type.Name}"
   match cond with
+  | Intr "loop.everyPass" [ c ] -> branchUnless ctx c target
   | Call(None, mi, [l; r]) when owner mi = operators ->
     let unless name =
       match name with
@@ -1749,6 +2035,8 @@ let entry (ctx: Ctx) (name: string) (mi: MethodInfo) =
     | ForIntegerRangeLoop(_, lo, hi, b) ->
       let n = match tryConst ctx lo, tryConst ctx hi with | Some(:? int as l), Some(:? int as h) -> max 1 (h - l + 1) | _ -> 1
       weigh (w * n) b
+    // passes not known: weighed as a short loop
+    | WhileLoop(c, b) -> weigh (w * 8) c; weigh (w * 8) b
     | Var v | VarSet(v, _) when (match e with VarSet _ -> true | _ -> true) ->
       ctx.scores[v] <- (match ctx.scores.TryGetValue v with | true, n -> n | _ -> 0) + w
       match e with VarSet(_, x) -> weigh w x | _ -> ()
@@ -1798,7 +2086,65 @@ let rec writes (e: Expr) : int option =
   | ExprShape.ShapeLambda(_, b) -> writes b
   | ExprShape.ShapeCombination(_, xs) -> sum xs
 
-let compile (target: Target) (k: Kernel) : Result<Compiled, string> =
+/// A program's P words: its code (the entry points) and its tables (emitted after the code).
+type Size =
+  { code   : int
+    tables : int }
+  member s.total = s.code + s.tables
+
+  /// "3299 words (code 3011, tables 288)", for messages.
+  member s.text = $"{s.total} words (code {s.code}, tables {s.tables})"
+
+/// The compiled program's size, as assembled.
+let size (c: Compiled) : Result<Size, string> =
+  match Assembler.assembleItems c.items with
+  | Error e -> Error(Assembler.errorText e)
+  | Ok r ->
+    let _, words = Assembler.image Space.P r
+    // the tables follow the last entry's rts
+    let last = c.items |> Array.tryFindIndexBack (fun it -> match it with Op Rts -> true | _ -> false)
+    let tables =
+      match last with
+      | Some i -> c.items[i + 1 ..] |> Array.sumBy (fun it -> match it with Dc vs -> vs.Length | _ -> 0)
+      | None -> 0
+    Ok { code = words.Length - tables; tables = tables }
+
+/// The program refused when it is larger than the target's machine can hold (Kernel.programLimit).
+let checkSize (c: Compiled) : Result<Compiled, string> =
+  match programLimit c.target, size c with
+  | Some(limit, why), Ok s when s.total > limit ->
+    Error $"{c.kernel.name}: the program is {s.text}, over the {c.target.name} limit by {s.total - limit}: {why}"
+  | _ -> Ok c
+
+/// The loops of [<NoUnswitch>] functions (or functions of [<NoUnswitch>] modules) a kernel's
+/// entries reach, themselves or through the helpers they call.
+let keptLoops (k: Kernel) =
+  let kept = HashSet<Var>()
+  let seen = HashSet<MethodInfo>()
+  let marked (mi: MethodInfo) =
+    not (isNull (mi.GetCustomAttribute<NoUnswitchAttribute>()))
+    || (not (isNull mi.DeclaringType) && not (isNull (mi.DeclaringType.GetCustomAttribute<NoUnswitchAttribute>())))
+  let rec walk (keep: bool) (e: Expr) =
+    match e with
+    | ForIntegerRangeLoop(v, lo, hi, b) ->
+      if keep then kept.Add v |> ignore
+      walk keep lo; walk keep hi; walk keep b
+    | Call(o, mi, args) ->
+      Option.iter (walk keep) o
+      List.iter (walk keep) args
+      if seen.Add mi then reflected mi |> Option.iter (walk (marked mi))
+    | ExprShape.ShapeVar _ -> ()
+    | ExprShape.ShapeLambda(_, b) -> walk keep b
+    | ExprShape.ShapeCombination(_, xs) -> List.iter (walk keep) xs
+  for mi in [ k.init; k.trig; k.render ] do
+    if seen.Add mi then reflected mi |> Option.iter (walk (marked mi))
+  kept
+
+/// A subroutine compiled below a call found later: compiled again from the start, each one's
+/// words from at least the given word.
+exception Refloor of Map<string, int>
+
+let rec generateWith (floors: Map<string, int>) (unswitchMax: int option) (target: Target) (k: Kernel) : Result<Compiled * int list, string> =
   try
     let layout = layout target k
     let ctx =
@@ -1806,10 +2152,37 @@ let compile (target: Target) (k: Kernel) : Result<Compiled, string> =
         vars = Map.empty; consts = Map.empty; next = layout.xWorkset; high = layout.xWorkset; labels = 0
         cursors = Map.empty; freeRegs = [ 1; 2; 3; 4; 5 ]; tables = ResizeArray(); conts = []; released = Collections.Generic.HashSet(); trackHome = None
         indexed = Map.empty; counters = Map.empty; freeData = [ X1; Y1 ]; scores = Dictionary(); deadLocals = HashSet()
-        unswitched = HashSet(); bHeld = false; bWrite = false }
+        unswitched = HashSet(); bHeld = false; bWrite = false
+        subs = Dictionary(); inSub = None; depth = 0; deepest = 0; floors = floors
+        kept = keptLoops k; unswitchMax = unswitchMax; unswitchCosts = ResizeArray() }
     entry ctx "INIT" k.init
     entry ctx "TRIG" k.trig
     entry ctx "RENDER" k.render
+    // the subroutines called, each once, those they call included
+    let mutable pending = ctx.subs.Values |> Seq.filter (fun s -> not s.compiled) |> Seq.tryHead
+    while pending.IsSome do
+      compileSub ctx pending.Value
+      pending <- ctx.subs.Values |> Seq.filter (fun s -> not s.compiled) |> Seq.tryHead
+    // a subroutine's words start above the locals of every call to it: a call found after it
+    // was compiled (from a subroutine compiled later) must not reach them
+    let low =
+      [ for s in ctx.subs.Values do
+          let highest = s.sites |> Seq.map _.next |> Seq.max
+          if highest > s.start then yield subKey s.mi, highest ]
+    if not low.IsEmpty then raise (Refloor(low |> List.fold (fun m (mi, n) -> Map.add mi n m) floors))
+    // system stack levels: a call one, a DO loop two, what the subroutine itself takes
+    let rec need (s: Sub) : int =
+      let inner =
+        [ for t in ctx.subs.Values do
+            for site in t.sites do
+              match site.caller with
+              | Some c when obj.ReferenceEquals(c, s) -> yield site.depth + need t
+              | _ -> () ]
+      1 + List.max (s.deepest :: inner)
+    for s in ctx.subs.Values do
+      for site in s.sites do
+        if site.caller.IsNone && site.depth + need s > stackLevels then
+          fail $"{k.name}: the call to {s.mi.Name} takes {site.depth + need s} system stack levels (a call one, a DO loop two), a machine may take {stackLevels}"
     // the block size, once the entries compile
     match reflected k.render |> Option.bind writes with
     | Some n when n <> target.blockWords ->
@@ -1821,7 +2194,20 @@ let compile (target: Target) (k: Kernel) : Result<Compiled, string> =
       for row in Array.chunkBySize 8 t.words do
         emit ctx (Dc(row |> Array.map (fun w -> Num(int64 w))))
     let source = Expr.TryGetReflectedDefinition k.render |> Option.bind debugRange |> Option.map fst
-    Ok { kernel = k; target = target; layout = ctx.layout; items = ctx.items.ToArray(); lines = ctx.lines.ToArray()
+    Ok({ kernel = k; target = target; layout = ctx.layout; items = ctx.items.ToArray(); lines = ctx.lines.ToArray()
          source = source; xWorkset = min ctx.high target.xLimit
-         yWorkset = ctx.layout.yWorkset + max 0 (ctx.high - target.xLimit) }
-  with KernelError m -> Error m
+         yWorkset = ctx.layout.yWorkset + max 0 (ctx.high - target.xLimit) }, List.ofSeq ctx.unswitchCosts)
+  with
+  | KernelError m -> Error m
+  | Refloor floors' when floors'.Count <= 64 && floors' <> floors -> generateWith floors' unswitchMax target k
+
+/// The compiled kernel, its size not checked, each loop unswitched only when its copy takes at
+/// most `unswitchMax` words (None: any); and what each unswitched loop's copy took.
+let generateUnswitching (unswitchMax: int option) (target: Target) (k: Kernel) = generateWith Map.empty unswitchMax target k
+
+/// The compiled kernel, its size not checked (Optimize.compile checks it after its passes).
+let generate (target: Target) (k: Kernel) = generateUnswitching None target k |> Result.map fst
+
+/// The compiled kernel, as the compiler generates it, refused when the target's machine
+/// cannot hold it.
+let compile (target: Target) (k: Kernel) : Result<Compiled, string> = generate target k |> Result.bind checkSize

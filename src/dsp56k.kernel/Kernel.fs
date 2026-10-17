@@ -95,6 +95,15 @@ let hostOf (t: Target) = hosts |> List.tryFind (fun h -> h.target.name = t.name)
 /// ring over state known to be aligned.
 let worksetAlignment (t: Target) = match hostOf t with Some KernelHost.Machinedrum -> 0x40 | None -> 1
 
+/// The most program words the target's machine can have, and where that limit comes from:
+/// the MDS package format on the Machinedrum (the loader places the program anywhere in its
+/// space).
+/// None under other hosts. Harnesses check their own layout when they load a program.
+let programLimit (t: Target) =
+  match hostOf t with
+  | Some KernelHost.Machinedrum -> Some(machinedrum.Mds.programMaxWords, $"an MDS package holds at most {machinedrum.Mds.programMaxWords} program words")
+  | None -> None
+
 type Ty =
   | TFrac
   | TLong
