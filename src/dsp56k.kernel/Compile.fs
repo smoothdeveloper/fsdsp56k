@@ -1043,8 +1043,8 @@ let rec genAcc (ctx: Ctx) (e: Expr) : unit =
         emit ctx (if carry = 0 then andi 0xfe ccr else ori 0x01 ccr)
         emit ctx (rep (imm 24))
         emit ctx (div x0 a)
-      | Some "acc.addFrac", [l; f] -> binAccWord ctx l f (fun r -> add r a)
-      | Some "acc.subFrac", [l; f] -> binAccWord ctx l f (fun r -> sub r a)
+      | Some "acc.addFrac", [l; f] -> binAccWord ctx l f BAdd
+      | Some "acc.subFrac", [l; f] -> binAccWord ctx l f BSub
       | Some "acc.neg", [x] -> genAcc ctx x; emit ctx (neg a)
       | Some "acc.asr", [x; n] ->
         let n = constInt ctx "a shift" n
@@ -1155,15 +1155,17 @@ and binAcc (ctx: Ctx) (l: Expr) (r: Expr) (op: BinOp) =
     emitAll ctx (loadAccLeaf (AHome t) B)
     emit ctx (item b)
 
-/// l op f with l in A and f in X0.
-and binAccWord (ctx: Ctx) (l: Expr) (f: Expr) (op: Reg -> Item) =
+/// A word operand is aligned with a1. Constants use the same immediate form as binAcc.
+and binAccWord (ctx: Ctx) (l: Expr) (f: Expr) (op: BinOp) =
   let w = (operands ctx [ f ])[0]
   genAcc ctx l
+  let register r = if op = BSub then sub r a else add r a
   match w with
-  | WReg r -> emit ctx (op r)
+  | WImm k -> emit ctx (if op = BSub then sub (imm k) a else add (imm k) a)
+  | WReg r -> emit ctx (register r)
   | _ ->
     emitAll ctx (loadWord w x0)
-    emit ctx (op x0)
+    emit ctx (register x0)
 
 /// Each Frac as something one move loads: computed and spilled first when it is not.
 and operands (ctx: Ctx) (es: Expr list) : Word array =
@@ -1520,14 +1522,23 @@ and storeHeld (ctx: Ctx) (r: Reg) (e: Expr) =
   match mulForm e with
   | Some(acc, x, y, kind) when (match acc with None -> true | Some l -> self l) -> mulInto ctx acc x y kind dst
   | _ ->
-    let word op l f =
-      match accLeaf ctx f with
-      | Some(AOfWord w) when self l ->
+    let word subtract l f =
+      let register s = if subtract then sub s r else add s r
+      let immediate k = if subtract then sub (imm k) r else add (imm k) r
+      let operand =
+        match accLeaf ctx f with
+        | Some(AOfWord w) -> Some w
+        | Some(AConst c) when c &&& 0xffffffL = 0L && c >= -0x800000000000L && c <= 0x7fffff000000L ->
+          Some(WImm(int ((c >>> 24) &&& 0xffffffL)))
+        | _ -> None
+      match operand with
+      | Some w when self l ->
         match w with
-        | WReg s -> onto (op s r)
+        | WImm k -> onto (immediate k)
+        | WReg s -> onto (register s)
         | _ ->
           emitAll ctx (loadWord w x0)
-          onto (op x0 r)
+          onto (register x0)
         true
       | _ -> false
     // an Acc added to the local: a fitting one as a pair, anything else computed in A
@@ -1545,8 +1556,16 @@ and storeHeld (ctx: Ctx) (r: Reg) (e: Expr) =
         true
     let done' =
       match e with
-      | Intr "acc.add" [l; f] -> word add l f || word add f l || acc add l f || acc add f l
-      | Intr "acc.sub" [l; f] -> word sub l f || acc sub l f
+      | Intr "acc.add" [l; f] -> word false l f || word false f l || acc add l f || acc add f l
+      | Intr "acc.sub" [l; f] -> word true l f || acc sub l f
+      | Intr "acc.addFrac" [l; f] when self l ->
+        match wordLeaf ctx f with
+        | Some(WImm k) -> onto (add (imm k) r); true
+        | _ -> false
+      | Intr "acc.subFrac" [l; f] when self l ->
+        match wordLeaf ctx f with
+        | Some(WImm k) -> onto (sub (imm k) r); true
+        | _ -> false
       | _ -> false
     if not done' then
       genAcc ctx e
@@ -1665,10 +1684,12 @@ and inMemory (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> u
     if tyOf v.Type = TFrac && score v >= 2 then
       let ahead = value :: bodyExpr :: ctx.conts
       let live (w: Var) = ahead |> List.exists (fun e -> e.GetFreeVars() |> Seq.contains w)
+      // Only data-register locals return to this pool. B has its own scoped ownership;
+      // recycling it here lets a Frac outlive that scope and be overwritten by the next helper.
       let holders =
         [ for KeyValue(w, h) in ctx.vars do
             match h.reg with
-            | Some r when not (ctx.deadLocals.Contains w) -> yield r, w
+            | Some ((X1 | Y1) as r) when not (ctx.deadLocals.Contains w) -> yield r, w
             | _ -> () ]
       for r, vars in holders |> List.groupBy fst do
         if vars |> List.forall (fun (_, w) -> not (live w)) then
