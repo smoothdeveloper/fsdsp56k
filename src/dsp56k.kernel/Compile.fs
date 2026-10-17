@@ -127,7 +127,9 @@ type Ctx =
     layout   : Layout
     items    : ResizeArray<Item>
     lines    : ResizeArray<int>     // the F# line each item came from (0: none)
-    mutable line   : int
+    mutable line   : int        // the latest debug range's line, in any file (source comments)
+    mutable sourceLine : int    // the latest line in the entry's own file: what `lines` records
+    mutable sourceFile : string option   // the entry's file (its definition's debug range)
     mutable vars   : Map<Var, Home>
     mutable consts : Map<Var, obj>
     mutable next   : int        // first free local word: X+0 .. are the [<XMemory>] state, words
@@ -215,7 +217,7 @@ let writesB (it: Item) =
 let emit (ctx: Ctx) (it: Item) =
   if ctx.bHeld && not ctx.bWrite && writesB it then raise BTaken
   ctx.items.Add it
-  ctx.lines.Add ctx.line
+  ctx.lines.Add ctx.sourceLine
 
 let emitAll (ctx: Ctx) (its: Item seq) = for it in its do emit ctx it
 
@@ -229,16 +231,27 @@ let debugRange (e: Expr) =
 
 let sourceLines = Collections.Concurrent.ConcurrentDictionary<string, string array>()
 
-/// Statements are introduced by a comment quoting their F# line, when it is known.
+/// Whether statements are introduced by a comment quoting their F# line (with debug ranges).
+/// Off, the code is the same as without debug ranges (comments can stop a peephole pattern or
+/// end a loop body), and each item still records its line in Compiled.lines.
+let mutable sourceComments = true
+
+/// Statements are introduced by a comment quoting their F# line, when it is known (and
+/// sourceComments is on). Items record the line of the entry's own file: code inlined from a
+/// helper in another file keeps the line of its call.
 let at' (ctx: Ctx) (e: Expr) =
   match debugRange e with
-  | Some(file, line) when line <> ctx.line ->
-    ctx.line <- line
-    let text =
-      let lines = sourceLines.GetOrAdd(file, fun f -> if IO.File.Exists f then IO.File.ReadAllLines f else [||])
-      if line >= 1 && line <= lines.Length then lines[line - 1].Trim() else ""
-    if text <> "" then emit ctx (Comment $"{IO.Path.GetFileName file}:{line}  {text}")
-  | _ -> ()
+  | Some(file, line) ->
+    if ctx.sourceFile |> Option.forall ((=) file) then ctx.sourceLine <- line
+    if line <> ctx.line then
+      ctx.line <- line
+      let text =
+        if not sourceComments then ""
+        else
+          let lines = sourceLines.GetOrAdd(file, fun f -> if IO.File.Exists f then IO.File.ReadAllLines f else [||])
+          if line >= 1 && line <= lines.Length then lines[line - 1].Trim() else ""
+      if text <> "" then emit ctx (Comment $"{IO.Path.GetFileName file}:{line}  {text}")
+  | None -> ()
 
 let fresh (ctx: Ctx) what =
   ctx.labels <- ctx.labels + 1
@@ -980,6 +993,7 @@ let ringTapOf (ctx: Ctx) (value: Expr) : RingTap option =
 let snapshot (ctx: Ctx) =
   let count = ctx.items.Count
   let line, vars, consts, next, high, cursors, freeRegs, conts = ctx.line, ctx.vars, ctx.consts, ctx.next, ctx.high, ctx.cursors, ctx.freeRegs, ctx.conts
+  let sourceLine = ctx.sourceLine
   let released, deadLocals = List.ofSeq ctx.released, List.ofSeq ctx.deadLocals
   let trackHome, indexed, counters, freeData, tables = ctx.trackHome, ctx.indexed, ctx.counters, ctx.freeData, ctx.tables.Count
   let inductions = ctx.inductions
@@ -989,7 +1003,7 @@ let snapshot (ctx: Ctx) =
     ctx.items.RemoveRange(count, ctx.items.Count - count)
     ctx.lines.RemoveRange(count, ctx.lines.Count - count)
     ctx.tables.RemoveRange(tables, ctx.tables.Count - tables)
-    ctx.line <- line; ctx.vars <- vars; ctx.consts <- consts; ctx.next <- next; ctx.high <- high
+    ctx.line <- line; ctx.sourceLine <- sourceLine; ctx.vars <- vars; ctx.consts <- consts; ctx.next <- next; ctx.high <- high
     ctx.cursors <- cursors; ctx.freeRegs <- freeRegs; ctx.conts <- conts
     ctx.released.Clear(); ctx.released.UnionWith released
     ctx.deadLocals.Clear(); ctx.deadLocals.UnionWith deadLocals
@@ -2559,7 +2573,7 @@ and compileSub (ctx: Ctx) (sub: Sub) =
   sub.start <- ctx.next
   ctx.depth <- 0; ctx.deepest <- 0
   ctx.inSub <- Some sub
-  ctx.line <- 0
+  ctx.line <- 0; ctx.sourceLine <- 0
   emit ctx (Label sub.label)
   let mutable nf, na = 0, 0
   let mutable body = body
@@ -2693,7 +2707,7 @@ let entry (ctx: Ctx) (name: string) (mi: MethodInfo) =
       body rest
     | e -> e
   ctx.next <- ctx.layout.xWorkset
-  ctx.line <- 0
+  ctx.line <- 0; ctx.sourceLine <- 0
   ctx.trackHome <- None
   let rec reads (e: Expr) =
     match e with
@@ -2706,7 +2720,7 @@ let entry (ctx: Ctx) (name: string) (mi: MethodInfo) =
     | ExprShape.ShapeCombination(_, xs) -> List.exists reads xs
   let savesTrack = reads def
   match debugRange def with
-  | Some(file, line) -> ctx.line <- line
+  | Some(file, line) -> ctx.line <- line; ctx.sourceLine <- line; ctx.sourceFile <- Some file
   | None -> ()
   // how much each local is used, loops weighted by their trip counts
   ctx.scores.Clear()
@@ -2734,7 +2748,7 @@ let entry (ctx: Ctx) (name: string) (mi: MethodInfo) =
     let h = alloc ctx TFrac
     ctx.trackHome <- Some h
     emit ctx (move r1 (at h 0))
-  ctx.line <- 0
+  ctx.line <- 0; ctx.sourceLine <- 0
   genStmt ctx (ordered (normalize (body def)))
   emit ctx rts
 
@@ -2834,7 +2848,7 @@ let rec generateWith (floors: Map<string, int>) (unswitchMax: int option) (targe
   try
     let layout = layout target k
     let ctx =
-      { target = target; kernel = k; layout = layout; items = ResizeArray(); lines = ResizeArray(); line = 0
+      { target = target; kernel = k; layout = layout; items = ResizeArray(); lines = ResizeArray(); line = 0; sourceLine = 0; sourceFile = None
         vars = Map.empty; consts = Map.empty; next = layout.xWorkset; high = layout.xWorkset; labels = 0
         cursors = Map.empty; freeRegs = [ 1; 2; 3; 4; 5 ]; tables = ResizeArray(); conts = []; released = Collections.Generic.HashSet(); trackHome = None
         indexed = Map.empty; counters = Map.empty; inductions = Map.empty; affineAt = Dictionary(HashIdentity.Reference); taps = Dictionary(); freeData = [ X1; Y1 ]; scores = Dictionary(); deadLocals = HashSet()
@@ -2874,7 +2888,7 @@ let rec generateWith (floors: Map<string, int>) (unswitchMax: int option) (targe
     | Some n when n <> target.blockWords ->
       fail $"{k.name}: RENDER writes {n} words, the block is {target.blockText}"
     | _ -> ()
-    ctx.line <- 0
+    ctx.line <- 0; ctx.sourceLine <- 0
     for t in ctx.tables do
       emit ctx (Label(tableLabel t))
       for row in Array.chunkBySize 8 t.words do
