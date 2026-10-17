@@ -653,6 +653,188 @@ let rotate (items: (Item * int) array) =
     | None -> go <- false
   cur
 
+/// Each item's weight: the trip counts of the DO loops around it (32 for a count known only
+/// when running), as staticCost counts them.
+let tripWeights (items: Item array) =
+  let w = Array.zeroCreate<int64> items.Length
+  let mutable around : (string * int64) list = []
+  for i in 0 .. items.Length - 1 do
+    match items[i] with
+    | Label l ->
+      while (match around with (e, _) :: _ when e = l -> true | _ -> false) do around <- List.tail around
+    | _ -> ()
+    w[i] <- around |> List.fold (fun t (_, n) -> t * n) 1L
+    match items[i] with
+    | Op(Loop(_, count, { expr = Sym e })) ->
+      let n = match count with Count { expr = Num n } when n > 0L -> n | _ -> 32L
+      around <- (e, n) :: around
+    | _ -> ()
+  w
+
+/// An accumulator temporary in a free accumulator. The compiler keeps an Acc local it cannot hold
+/// in a register as three X temporaries (a1, a0, a2 at k, k+1, k+2), stored and reloaded whole,
+/// three moves each way. Where another accumulator is neither read, written nor live anywhere
+/// the temporary is live, it holds the value instead: the store becomes `tfr a,b`, the reload
+/// `tfr b,a`, a read of the high word `move b1,x0`. Only temporaries every access of which is
+/// one of those forms; calls, returns and anything not modelled count as using every register.
+let promote (first: int) (temps: int) (items: (Item * int) array) =
+  let its = Array.map fst items
+  let n = its.Length
+  let temp (space: Space) (ea: Ea) =
+    match workset space ea with
+    | Some(SMem(Space.X, k)) when k >= first && k < temps -> Some k
+    | _ -> None
+  let single i = match its[i] with Op(Par(None, [| m |])) -> Some m | _ -> None
+  let hi acc = if acc = A then A1 else B1
+  let lo acc = if acc = A then A0 else B0
+  let ext acc = if acc = A then A2 else B2
+  // the three moves of a whole accumulator at k, from item i: (k, acc, store?)
+  let triple i =
+    if i + 2 >= n then None
+    else
+      match single i, single (i + 1), single (i + 2) with
+      | Some(Store(r1, s1, e1)), Some(Store(r0, s0, e0)), Some(Store(r2, s2, e2)) ->
+        match accOf r1, temp s1 e1, temp s0 e0, temp s2 e2 with
+        | Some acc, Some k, Some k0, Some k2 when r1 = hi acc && r0 = lo acc && r2 = ext acc && k0 = k + 1 && k2 = k + 2 ->
+          Some(k, acc, true)
+        | _ -> None
+      | Some(Load(s1, e1, r1)), Some(Load(s0, e0, r0)), Some(Load(s2, e2, r2)) when r1 = A || r1 = B ->
+        match temp s1 e1, temp s0 e0, temp s2 e2 with
+        | Some k, Some k0, Some k2 when r0 = lo r1 && r2 = ext r1 && k0 = k + 1 && k2 = k + 2 -> Some(k, r1, false)
+        | _ -> None
+      | _ -> None
+  // every access to the temporaries: whole stores and loads, high-word reads, and anything else
+  let accesses = Dictionary<int, ResizeArray<int * string>>()   // k -> (item, kind)
+  let bad = HashSet<int>()
+  let note k i kind =
+    if not (accesses.ContainsKey k) then accesses[k] <- ResizeArray()
+    accesses[k].Add(i, kind)
+  let wordOf = Dictionary<int, int>()                            // temporary word -> its slot k
+  let mutable i = 0
+  while i < n do
+    match triple i with
+    | Some(k, acc, isStore) ->
+      note k i (if isStore then "store" else "load")
+      for j in 0 .. 2 do wordOf[k + j] <- k
+      i <- i + 3
+    | None ->
+      match its[i] with
+      | Op(Par(None, [| Load(sp, ea, r) |])) when (temp sp ea).IsSome && (r = X0 || r = X1 || r = Y0 || r = Y1) ->
+        note (temp sp ea).Value i "read"
+      | Op(Par(_, moves)) ->
+        for m in moves do
+          match m with
+          | Load(sp, ea, _) | Store(_, sp, ea) -> temp sp ea |> Option.iter (fun k -> bad.Add k |> ignore)
+          | _ -> ()
+      | _ -> ()
+      i <- i + 1
+  // a slot is k with a whole store; a read of a word inside another slot, or of k+1/k+2, spoils it
+  for KeyValue(k, list) in accesses |> Seq.toArray do
+    if not (list |> Seq.exists (fun (_, kind) -> kind = "store")) then bad.Add k |> ignore
+  for KeyValue(k, list) in accesses |> Seq.toArray do
+    match wordOf.TryGetValue k with
+    | true, slot when slot <> k -> bad.Add slot |> ignore; bad.Add k |> ignore
+    | _ -> ()
+  for b in bad |> Seq.toArray do
+    match wordOf.TryGetValue b with
+    | true, slot -> bad.Add slot |> ignore
+    | _ -> ()
+  let slots = accesses.Keys |> Seq.filter (fun k -> not (bad.Contains k)) |> Seq.toArray
+  match successors its with
+  | None -> items
+  | Some succ when slots.Length > 0 ->
+    let preds = Array.create n 0
+    for i in 0 .. n - 1 do for j in succ[i] do preds[j] <- preds[j] + 1
+    // backward liveness of one fact over the items: use/def per item
+    let live (uses: int -> bool) (defs: int -> bool) =
+      let liveIn = Array.create n false
+      let liveOut = Array.create n false
+      let mutable changed = true
+      while changed do
+        changed <- false
+        for i in n - 1 .. -1 .. 0 do
+          let out = succ[i] |> Array.exists (fun j -> liveIn[j])
+          let inn = uses i || (out && not (defs i))
+          if out <> liveOut[i] || inn <> liveIn[i] then
+            liveOut[i] <- out
+            liveIn[i] <- inn
+            changed <- true
+      liveIn, liveOut
+    let control (instr: Instr) =
+      match instr with
+      | Branch((Bra | Bcc _), _) | Jump((Jmp | Jcc _), _) | Loop(_, Count _, _) | Enddo | Nop -> true
+      | _ -> false
+    // what an item does to accumulator t: (reads, writes it whole, touches it at all)
+    let effect (t: Reg) i =
+      match its[i] with
+      | Op instr when control instr -> false, false, false
+      | Op instr ->
+        match readsOf instr, writesOf instr with
+        | Some rs, Some ws ->
+          let on (r: Reg) = Array.contains t (Lower.storage r)
+          let whole =
+            match instr with
+            | Par(None, moves) -> moves |> Array.exists (function Load(_, _, r) | Copy(_, r) | Imm(_, r) -> r = t | _ -> false)
+            | _ -> false
+          Array.exists on rs, whole, Array.exists on rs || Array.exists on ws
+        | _ -> true, false, true
+      | _ -> false, false, false
+    let weights = tripWeights its
+    let accessItems k = accesses[k] |> Seq.collect (fun (i, kind) -> if kind = "read" then [ i ] else [ i; i + 1; i + 2 ]) |> Set.ofSeq
+    let chosen = ResizeArray<int * Reg>()
+    let taken = Dictionary<Reg, Set<int>>()
+    for t in [ B; A ] do
+      let tIn, tOut = live (fun i -> let r, _, _ = effect t i in r) (fun i -> let _, w, _ = effect t i in w)
+      taken[t] <- Set.empty
+      let ranked =
+        slots |> Array.sortByDescending (fun k -> accesses[k] |> Seq.sumBy (fun (i, _) -> weights[i]))
+      for k in ranked do
+        if not (chosen |> Seq.exists (fun (k', _) -> k' = k)) then
+          let own = accessItems k
+          let uses i = accesses[k] |> Seq.exists (fun (j, kind) -> kind <> "store" && j = i)
+          let defs i = accesses[k] |> Seq.exists (fun (j, kind) -> kind = "store" && j = i)
+          let sIn, sOut = live uses defs
+          let range = [ 0 .. n - 1 ] |> List.filter (fun i -> sIn[i] || sOut[i] || own.Contains i) |> Set.ofList
+          let entryLive = [ 0 .. n - 1 ] |> List.exists (fun i -> preds[i] = 0 && sIn[i])
+          let sources = accesses[k] |> Seq.forall (fun (j, kind) ->
+            match kind with
+            | "read" -> true
+            | _ -> match triple j with Some(_, acc, _) -> acc <> t | None -> false)
+          let free =
+            range |> Set.forall (fun i ->
+              not tIn[i] && not tOut[i] && (own.Contains i || (let _, _, touches = effect t i in not touches)))
+          if sources && not entryLive && free && Set.isEmpty (Set.intersect range taken[t]) then
+            chosen.Add(k, t)
+            taken[t] <- Set.union taken[t] range
+    if chosen.Count = 0 then items
+    else
+      let rewrite = Dictionary<int, Item option>()       // item -> replacement (None: dropped)
+      for k, t in chosen do
+        let tAcc = if t = A then Acc.A else Acc.B
+        for i, kind in accesses[k] do
+          match kind, triple i with
+          | "store", Some(_, src, _) ->
+            rewrite[i] <- Some(Op(Par(Some(Binary(AluOp.Tfr, src, tAcc)), [||])))
+            rewrite[i + 1] <- None
+            rewrite[i + 2] <- None
+          | "load", Some(_, dst, _) ->
+            rewrite[i] <- Some(Op(Par(Some(Binary(AluOp.Tfr, t, (if dst = A then Acc.A else Acc.B))), [||])))
+            rewrite[i + 1] <- None
+            rewrite[i + 2] <- None
+          | "read", _ ->
+            match its[i] with
+            | Op(Par(None, [| Load(_, _, r) |])) -> rewrite[i] <- Some(Op(Par(None, [| Copy(hi t, r) |])))
+            | _ -> ()
+          | _ -> ()
+      if rewrite.Values |> Seq.exists (function Some(Op instr) -> not (Lower.encodes instr) | _ -> false) then items
+      else
+        [| for i in 0 .. n - 1 do
+             match rewrite.TryGetValue i with
+             | true, Some it -> yield it, snd items[i]
+             | true, None -> ()
+             | _ -> yield items[i] |]
+  | _ -> items
+
 /// A DO loop's last instruction cannot be a branch target: a NOP where a pass left a label (or
 /// nothing) at the end of a loop.
 let fixLoops (items: (Item * int) array) =
@@ -684,15 +866,16 @@ type Passes =
     hoist       : bool   // loads a DO loop does not change done once, before the loop
     pack        : bool   // moves merged into parallel instructions
     rotate      : bool   // one-stage software pipelining of DO loops
+    promote     : bool   // accumulator temporaries kept in a free accumulator
     monotone    : bool } // each pass kept only when the static cost is no worse
 
   static member all =
     { forward = true; accCopies = true; copyForward = true; deadTemps = true; hoist = true; pack = true
-      rotate = true; monotone = true }
+      rotate = true; promote = true; monotone = true }
 
   static member none =
     { forward = false; accCopies = false; copyForward = false; deadTemps = false; hoist = false; pack = false
-      rotate = false; monotone = false }
+      rotate = false; promote = false; monotone = false }
 
 /// The switchable passes by name, with how to turn each off.
 let passes : (string * (Passes -> Passes)) list =
@@ -702,7 +885,8 @@ let passes : (string * (Passes -> Passes)) list =
     "deadTemps",   (fun p -> { p with deadTemps = false })
     "hoist",       (fun p -> { p with hoist = false })
     "pack",        (fun p -> { p with pack = false })
-    "rotate",      (fun p -> { p with rotate = false }) ]
+    "rotate",      (fun p -> { p with rotate = false })
+    "promote",     (fun p -> { p with promote = false }) ]
 
 type Level =
   | Direct            // the compiler's translation as it is
@@ -751,6 +935,10 @@ let runWith (p: Passes) (first: int) (temps: int) (items: Item array) (lines: in
     step p.accCopies (forwardWith true)
     step p.copyForward copyForward
     step p.deadTemps (deadTempsFrom first temps)
+  step p.promote (promote first temps)
+  for _ in 1 .. 2 do
+    step p.forward forward
+    step p.copyForward copyForward
   step p.hoist hoist
   step p.pack pack
   step p.rotate (rotate >> (if p.pack then pack else id))
