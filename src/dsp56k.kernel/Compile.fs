@@ -244,6 +244,27 @@ let effects =
         "cursor.position"; "track.number"; "region.read"; "region.write"; "cursor.up"; "cursor.down"
         "cursor.putUp"; "cursor.putDown"; "cursor.linearIn"; "cursor.ringIn" ]
 
+/// A helper the compiler inlines whose body only computes: no state written, no output, nothing
+/// but pure calls (it can run when the kernel is compiled, on constant arguments).
+let rec pureHelper (depth: int) (mi: MethodInfo) =
+  depth < 8
+  && (match reflected mi with
+      | Some body ->
+        let rec pureExpr (e: Expr) =
+          match e with
+          | PropertySet _ | FieldSet _ -> false
+          | Call(_, m, args) ->
+            let pureCall =
+              isConst m
+              || (match intrinsic m with Some n -> not (Set.contains n effects) | None -> owner m = operators)
+              || (not m.IsGenericMethodDefinition && pureHelper (depth + 1) m)
+            pureCall && List.forall pureExpr args
+          | ExprShape.ShapeVar _ -> true
+          | ExprShape.ShapeLambda(_, b) -> pureExpr b
+          | ExprShape.ShapeCombination(_, xs) -> List.forall pureExpr xs
+        pureExpr body
+      | None -> false)
+
 let rec tryConst (ctx: Ctx) (e: Expr) : obj option =
   match e with
   | Value(v, t) when foldable t -> someValue v
@@ -259,6 +280,8 @@ let rec tryConst (ctx: Ctx) (e: Expr) : obj option =
   | Call(None, mi, args) ->
     let mi = resolve mi args
     let pure' = isConst mi || (match intrinsic mi with Some n -> not (Set.contains n effects) | None -> owner mi = operators)
+    // an inlined helper on constants (`at 415`): folded too
+    let pure' = pure' || (not args.IsEmpty && foldable mi.ReturnType && pureHelper 0 mi)
     if pure' && foldable mi.ReturnType then
       let values = args |> List.map (tryConst ctx)
       if values |> List.forall Option.isSome then
@@ -332,6 +355,91 @@ let writesField (name: string) (e: Expr) =
     | ExprShape.ShapeCombination(_, xs) -> List.exists go xs
   go e
 
+/// What evaluating an expression reads and what it changes, as keys: "F:name" a record field or
+/// state array, "M" region memory (what cursors and Region.read/write reach), "C:v" cursor v's
+/// position ("C:*" any cursor's, in a helper), "O" the output.
+type Touches = { reads : Set<string>; writes : Set<string> }
+
+let noTouch = { reads = Set.empty; writes = Set.empty }
+let both (a: Touches) (b: Touches) = { reads = a.reads + b.reads; writes = a.writes + b.writes }
+
+/// Helpers' touches, their parameters and locals as any cursor, read once.
+let helperTouches = Collections.Concurrent.ConcurrentDictionary<MethodInfo, Touches>()
+
+let rec touches (inHelper: bool) (e: Expr) : Touches =
+  let all xs = xs |> List.map (touches inHelper) |> List.fold both noTouch
+  let cursor (c: Var) = if inHelper then "C:*" else "C:" + c.Name
+  match e with
+  | PropertySet(Some o, p, _, x) -> both (all [ o; x ]) { reads = Set.empty; writes = set [ "F:" + p.Name ] }
+  | PropertyGet(Some(Var _), p, []) when p.CanWrite -> { reads = set [ "F:" + p.Name ]; writes = Set.empty }
+  | Call(None, mi, (PropertyGet(_, p, []) :: rest)) when mi.Name = "SetArray" ->
+    both (all rest) { reads = Set.empty; writes = set [ "F:" + p.Name ] }
+  | Call(None, mi, (PropertyGet(_, p, []) :: rest)) when mi.Name = "GetArray" ->
+    both (all rest) { reads = set [ "F:" + p.Name ]; writes = Set.empty }
+  | Call(Some(Var c), mi, args) when c.Type = typeof<Cursor> ->
+    let k = cursor c
+    let own =
+      match intrinsic mi with
+      | Some "cursor.peek" -> { reads = set [ k; "M" ]; writes = Set.empty }
+      | Some "cursor.position" -> { reads = set [ k ]; writes = Set.empty }
+      | Some("cursor.put" | "cursor.putUp" | "cursor.putDown") -> { reads = set [ k ]; writes = set [ k; "M" ] }
+      | _ -> { reads = set [ k; "M" ]; writes = set [ k ] }
+    both (all args) own
+  | Call(Some o, _, args) when o.Type = typeof<Output> -> both (all args) { reads = set [ "O" ]; writes = set [ "O" ] }
+  | Call(None, mi, args) ->
+    match intrinsic (resolve mi args) with
+    | Some "region.write" -> both (all args) { reads = Set.empty; writes = set [ "M" ] }
+    | Some "region.read" -> both (all args) { reads = set [ "M" ]; writes = Set.empty }
+    | Some _ -> all args
+    | None ->
+      match reflected mi with
+      | Some def -> both (all args) (helperTouches.GetOrAdd(mi, fun _ -> touches true def))
+      | None -> all args
+  | ExprShape.ShapeVar _ -> noTouch
+  | ExprShape.ShapeLambda(_, b) -> touches inHelper b
+  | ExprShape.ShapeCombination(_, xs) -> all xs
+
+/// Whether evaluating `later` after `earlier` can give another result than the other way round.
+let conflict (earlier: Touches) (later: Touches) =
+  let meets (a: Set<string>) (b: Set<string>) =
+    not (Set.intersect a b).IsEmpty
+    || (a.Contains "C:*" && b |> Set.exists (fun k -> k.StartsWith "C:"))
+    || (b.Contains "C:*" && a |> Set.exists (fun k -> k.StartsWith "C:"))
+  meets earlier.writes (later.reads + later.writes) || meets earlier.reads later.writes
+
+/// The expression with the arguments of each call evaluated in .NET's order, left to right,
+/// where it matters: an argument whose evaluation conflicts with a later one's (one changes
+/// what the other reads or changes) is bound to a let first, in order (the code generator
+/// otherwise places operands as the instructions want them, products before what they are
+/// added to). An expression with nothing to order is returned as it is, the same object.
+let rec ordered (e: Expr) : Expr =
+  let dsp (t: Type) = t = typeof<Frac> || t = typeof<Acc> || t = typeof<Long>
+  match e with
+  | Call(o, mi, args) ->
+    let o' = o |> Option.map ordered
+    let args' = args |> List.map ordered
+    let ts = args' |> List.map (touches false) |> List.toArray
+    let first =
+      set [ for i in 0 .. ts.Length - 1 do
+              if dsp args'[i].Type && Seq.exists (fun j -> conflict ts[i] ts[j]) { i + 1 .. ts.Length - 1 } then yield i ]
+    if not first.IsEmpty then
+      let bound = args' |> List.mapi (fun i a -> if first.Contains i then Some(Var($"arg{i}", a.Type), a) else None)
+      let callArgs = List.map2 (fun b (a: Expr) -> match b with Some(v, _) -> Expr.Var v | None -> a) bound args'
+      let call = match o' with Some o' -> Expr.Call(o', mi, callArgs) | None -> Expr.Call(mi, callArgs)
+      List.foldBack (fun b body -> match b with Some(v, a) -> Expr.Let(v, a, body) | None -> body) bound call
+    else
+      let same = match o, o' with Some x, Some y -> obj.ReferenceEquals(x, y) | _ -> true
+      if same && List.forall2 (fun (x: Expr) y -> obj.ReferenceEquals(x, y)) args args' then e
+      else match o' with Some o' -> Expr.Call(o', mi, args') | None -> Expr.Call(mi, args')
+  | ExprShape.ShapeVar _ -> e
+  | ExprShape.ShapeLambda(v, b) ->
+    let b' = ordered b
+    if obj.ReferenceEquals(b, b') then e else Expr.Lambda(v, b')
+  | ExprShape.ShapeCombination(shape, xs) ->
+    let xs' = List.map ordered xs
+    if List.forall2 (fun (x: Expr) y -> obj.ReferenceEquals(x, y)) xs xs' then e
+    else ExprShape.RebuildShapeCombination(shape, xs')
+
 /// A call to a kernel helper: its parameters bound to the arguments.
 let inlined (mi: MethodInfo) (args: Expr list) =
   match reflected mi with
@@ -347,7 +455,7 @@ let inlined (mi: MethodInfo) (args: Expr list) =
       | Lambda(v, rest), a :: more -> Expr.Let(v, a, bind rest more)
       | body, [] -> body
       | _ -> fail $"{mi.Name}: partial application is not supported"
-    normalize (bind def args)
+    ordered (normalize (bind def args))
   | None -> fail $"{owner mi}.{mi.Name} is neither an intrinsic nor a [<ReflectedDefinition>] function"
 
 // ---------------------------------------------------------------------------------------------
@@ -384,6 +492,16 @@ let placeFactors (w1: Word) (w2: Word) =
     let partner = if ok (r, Y0) && other <> WReg Y0 then Y0 else X0
     loadWord other partner, ordered (r, partner)
   | _ -> loadWord w1 X0 @ loadWord w2 Y0, (X0, Y0)
+
+/// The two factors of MPYSU/DMAC: any ordered pair of X0, X1, Y0, Y1 (QQQQ), the registers
+/// already holding them kept.
+let suFactors (xs: Word array) =
+  let data r = r = X0 || r = X1 || r = Y0 || r = Y1
+  match xs[0], xs[1] with
+  | WReg r1, WReg r2 when data r1 && data r2 -> [], (r1, r2)
+  | WReg r1, w when data r1 -> (let t = (if r1 = Y0 then X0 else Y0) in loadWord w t, (r1, t))
+  | w, WReg r2 when data r2 -> (let t = (if r2 = X0 then Y0 else X0) in loadWord w t, (t, r2))
+  | w1, w2 -> loadWord w1 X0 @ loadWord w2 Y0, (X0, Y0)
 
 type AccLeaf =
   | AHome of Home              // a spilled or local Acc, hi:lo:ext
@@ -560,6 +678,12 @@ let thenRun (ctx: Ctx) (rest: Expr) (first: unit -> unit) =
   first ()
   ctx.conts <- saved
 
+/// Generate a let's value knowing the value itself and the let's body still read what they read:
+/// the lets an inlined helper binds inside the value must not take the registers of the caller's
+/// locals the rest of the value or the body use.
+let valueOf (ctx: Ctx) (value: Expr) (body: Expr) (gen: unit -> unit) =
+  thenRun ctx body (fun () -> thenRun ctx value gen)
+
 let tableLabel (t: Table) = "K_TBL_" + t.name.ToUpperInvariant().Replace("-", "_")
 
 // ---------------------------------------------------------------------------------------------
@@ -678,6 +802,8 @@ let rec accBound (ctx: Ctx) (e: Expr) : float =
     match e with
     | Var v when ctx.vars.ContainsKey v -> ctx.vars[v].bound
     | Intr "acc.ofFrac" [_] | Intr "acc.ofLong" [_] | Intr "frac.mul" [_; _] -> 1.0
+    | Intr "frac.mulsu" [_; _] -> 2.0
+    | Intr "acc.macsu" [l; _; _] -> accBound ctx l + 2.0
     | Intr "acc.add" [l; r] | Intr "acc.sub" [l; r] -> accBound ctx l + accBound ctx r
     | Intr "acc.addFrac" [l; _] | Intr "acc.subFrac" [l; _] | Intr "acc.mac" [l; _; _] -> accBound ctx l + 1.0
     | Intr "acc.neg" [x] -> accBound ctx x
@@ -731,6 +857,31 @@ let rec genAcc (ctx: Ctx) (e: Expr) : unit =
         emit ctx (asl a)
         emit ctx (rep (imm 24))
         emit ctx (div x0 a)
+      | Some "frac.mulsu", [x; y] ->
+        let loads, (s, t) = suFactors (operands ctx [ x; y ])
+        emitAll ctx loads
+        emit ctx (mpysu s t a)
+      | Some "acc.macsu", [l; x; y] ->
+        let xs = operands ctx [ x; y ]
+        genAcc ctx l
+        let loads, (s, t) = suFactors xs
+        emitAll ctx loads
+        emit ctx (macsu s t a)
+      | Some "acc.dmac", [l; x; y] ->
+        let xs = operands ctx [ x; y ]
+        genAcc ctx l
+        let loads, (s, t) = suFactors xs
+        emitAll ctx loads
+        emit ctx (Op(Dmac(false, SignedSigned, s, t, dsp56k.Acc.A)))
+      | Some "acc.divideCarry", [c; x; d] ->
+        let carry = constInt ctx "the division's carry" c
+        if carry <> 0 && carry <> 1 then fail $"the division's carry is 0 or 1, not {carry}"
+        let w = (operands ctx [ d ])[0]
+        genAcc ctx x
+        emitAll ctx (loadWord w x0)
+        emit ctx (if carry = 0 then andi 0xfe ccr else ori 0x01 ccr)
+        emit ctx (rep (imm 24))
+        emit ctx (div x0 a)
       | Some "acc.addFrac", [l; f] -> binAccWord ctx l f (fun r -> add r a)
       | Some "acc.subFrac", [l; f] -> binAccWord ctx l f (fun r -> sub r a)
       | Some "acc.neg", [x] -> genAcc ctx x; emit ctx (neg a)
@@ -775,7 +926,21 @@ and mulInto (ctx: Ctx) (acc: Expr option) (x: Expr) (y: Expr) (kind: MulKind, ne
 and binAcc (ctx: Ctx) (l: Expr) (r: Expr) (op: BinOp) =
   let item (s: Reg) = match op with BAdd -> add s a | BSub -> sub s a | BCmp -> cmp s a
   let held (x: Expr) = match accLeaf ctx x with Some(AHome { reg = Some _ }) -> true | _ -> false
+  // a constant that is a word in a1 (a0 zero, a2 its sign) rides in the instruction: `cmp #k,a`
+  let word (c: int64) =
+    let hi = (c >>> 24) &&& 0xffffffL
+    let signed = if hi &&& 0x800000L <> 0L then hi - 0x1000000L else hi
+    if c &&& 0xffffffL = 0L && (c >>> 24) = signed then Some(int hi) else None
+  let constant =
+    match accLeaf ctx r with
+    | Some(AConst c) -> word c
+    | Some(AOfWord(WImm v)) -> Some v
+    | _ -> None
   match accLeaf ctx r with
+  | _ when constant.IsSome ->
+    genAcc ctx l
+    let k = imm constant.Value
+    emit ctx (match op with BAdd -> add k a | BSub -> sub k a | BCmp -> cmp k a)
   | Some(AOfWord w) when ctx.bHeld ->
     genAcc ctx l
     match w with
@@ -1265,7 +1430,7 @@ and withLet (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> un
     let restore = snapshot ctx
     try
       let h = { space = Space.X; offset = -1; ty = TAcc; reg = Some B; bound = infinity }
-      store ctx h value
+      valueOf ctx value bodyExpr (fun () -> store ctx h value)
       ctx.bHeld <- true
       let saved = ctx.vars
       ctx.vars <- ctx.vars.Add(v, h)
@@ -1315,7 +1480,7 @@ and inMemory (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> u
       | None when tyOf v.Type = TAcc && not v.IsMutable -> { alloc ctx TAcc with bound = accBound ctx value }
       | None -> alloc ctx (tyOf v.Type)
     let afterHome = ctx.next
-    store ctx h value
+    valueOf ctx value bodyExpr (fun () -> store ctx h value)
     ctx.next <- afterHome
     let saved = ctx.vars
     ctx.vars <- ctx.vars.Add(v, h)
@@ -1347,6 +1512,12 @@ and innerLocals (e: Expr) =
 // Statements.
 
 and genStmt (ctx: Ctx) (e: Expr) : unit =
+  match e with
+  | Sequential _ | Let _ | ForIntegerRangeLoop _ | IfThenElse _ -> genStmtIn ctx e
+  // a statement reads all it reads until it is done (lets inlined helpers bind inside it)
+  | _ -> thenRun ctx e (fun () -> genStmtIn ctx e)
+
+and genStmtIn (ctx: Ctx) (e: Expr) : unit =
   let mark = ctx.next
   match e with
   | Sequential _ -> ()
@@ -1460,7 +1631,8 @@ and genStmt (ctx: Ctx) (e: Expr) : unit =
     if (tryConst ctx cond).Value :?> bool then genStmt ctx t else genStmt ctx f
   | IfThenElse(cond, t, f) ->
     let elseLabel = fresh ctx "ELSE"
-    branchUnless ctx cond elseLabel
+    // the condition is compiled knowing either branch runs after it
+    thenRun ctx f (fun () -> thenRun ctx t (fun () -> thenRun ctx cond (fun () -> branchUnless ctx cond elseLabel)))
     genStmt ctx t
     match f with
     | Value(null, _) -> emit ctx (Label elseLabel)
@@ -1595,7 +1767,7 @@ let entry (ctx: Ctx) (name: string) (mi: MethodInfo) =
     ctx.trackHome <- Some h
     emit ctx (move r1 (at h 0))
   ctx.line <- 0
-  genStmt ctx (normalize (body def))
+  genStmt ctx (ordered (normalize (body def)))
   emit ctx rts
 
 /// The words a RENDER body writes, when the count does not depend on the parameters: loops

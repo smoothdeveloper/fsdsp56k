@@ -82,7 +82,10 @@ locals worth it (uses weighted by loop trip counts) live in X1/Y1, multiplicatio
 factors around them, and constant factors ride in MPYI/MACI. State records hold `Frac`, `Long` (two words), `Acc` (three: kept exact,
 extension byte included) and fixed-length `[<Length n>] Frac array` fields read and written
 with constant indices or the loop's index (`s.h[i + 1]`, `Frac.ofRaw i`); helpers may take the
-parameter and state records. State lives in Y from the target's `stateBase`; fields marked
+parameter and state records. Helpers are inlined: their locals never take a register a caller's
+local still needs (a local stays live through the whole expression and statement reading it),
+and where one argument's effect (a state write, a cursor step, a region write) could change what
+another reads, the arguments are evaluated in .NET's order, left to right. State lives in Y from the target's `stateBase`; fields marked
 `[<XMemory>]` (`[<XMemory; Length 32>] mutable residuals : Frac array`) live in X from X:(r6+0),
 in the order declared, and the compiler's locals follow them in X (then in the Y words after the
 state, when the X state fills the workset). A loop stepping an X array and a Y array gives them

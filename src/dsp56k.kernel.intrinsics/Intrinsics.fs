@@ -88,6 +88,10 @@ type Frac =
   [<Intrinsic "frac.mul">]
   static member (*) (x: Frac, y: Frac) : Acc = { Acc.Raw = (int64 x.Raw * int64 y.Raw) <<< 1 }
 
+  /// `mpysu s,u,a`: s signed times u read unsigned (u + 2^24 when its top bit is set).
+  [<Intrinsic "frac.mulsu">]
+  static member mulSU (s: Frac) (u: Frac) : Acc = { Acc.Raw = Bits.sext56 ((int64 s.Raw * (int64 u.Raw &&& 0xffffffL)) <<< 1) }
+
 /// The 56-bit accumulator a2:a1:a0, as a signed integer of 56 bits.
 and [<Struct>] Acc =
   { Raw : int64 }    // sign-extended
@@ -156,6 +160,15 @@ and [<Struct>] Acc =
   [<Intrinsic "acc.mac">]
   static member mac (acc: Acc) (x: Frac) (y: Frac) = acc + x * y
 
+  /// `dmacss x,y,a`: the accumulator shifted right 24 bits (arithmetic), plus x * y. With
+  /// `Frac.mulSU` first, the product of a word and a 48-bit value hi:lo in two instructions.
+  /// `macsu s,u,a`: the accumulator plus s signed times u read unsigned.
+  [<Intrinsic "acc.macsu">]
+  static member macSU (acc: Acc) (s: Frac) (u: Frac) = { Acc.Raw = Bits.sext56 (acc.Raw + ((int64 s.Raw * (int64 u.Raw &&& 0xffffffL)) <<< 1)) }
+
+  [<Intrinsic "acc.dmac">]
+  static member dmac (acc: Acc) (x: Frac) (y: Frac) = { Acc.Raw = Bits.sext56 ((acc.Raw >>> 24) + ((int64 x.Raw * int64 y.Raw) <<< 1)) }
+
   /// `asl a` then `rep #24` `div s,a`: non-restoring division, the quotient building up in a0
   /// (as the DSP computes it: each step shifts the carry in, then adds or subtracts the divisor
   /// by the signs of a and s).
@@ -165,6 +178,22 @@ and [<Struct>] Acc =
     let mutable d = a.Raw &&& mask
     let mutable c = (d >>> 55) &&& 1L
     d <- (d <<< 1) &&& mask
+    let sv = int64 s.Raw <<< 24
+    let s23 = if s.Raw < 0 then 1L else 0L
+    for _ in 1 .. 24 do
+      let d55 = (d >>> 55) &&& 1L
+      let shifted = ((d <<< 1) ||| c) &&& mask
+      d <- (if d55 ^^^ s23 = 1L then shifted + sv else shifted - sv) &&& mask
+      c <- 1L - ((d >>> 55) &&& 1L)
+    { Acc.Raw = Bits.sext56 d }
+
+  /// `rep #24` `div s,a` with no `asl` first and the carry `carry` (a constant, 0 or 1) coming in:
+  /// `andi #$fe,ccr` (0) or `ori #$01,ccr` (1) before the REP. The same 24 steps as `divide`.
+  [<Intrinsic "acc.divideCarry">]
+  static member divideCarry (carry: int) (a: Acc) (s: Frac) =
+    let mask = (1L <<< 56) - 1L
+    let mutable d = a.Raw &&& mask
+    let mutable c = int64 (carry &&& 1)
     let sv = int64 s.Raw <<< 24
     let s23 = if s.Raw < 0 then 1L else 0L
     for _ in 1 .. 24 do

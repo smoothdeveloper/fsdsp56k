@@ -4,7 +4,8 @@
 ///   value is dropped (a reload just stored, an Acc local's three words reloaded into the
 ///   unchanged accumulator, a store of what the word holds, a tfr between equal accumulators),
 ///   and a load whose value a data register holds becomes a register move (which can then be
-///   packed);
+///   packed); a long immediate (or zero) a register already holds is not loaded again, and one
+///   another data register holds is copied from it;
 /// - dead stores to the compiler's temporaries: words of the X workset past the [<XMemory>]
 ///   state that no instruction reads;
 /// - loads of workset words a DO loop does not write moved before the loop;
@@ -174,7 +175,7 @@ let applyMoves (f: Facts) (alu: Alu option) (moves: Move array) =
 let aluWrites (instr: Instr) =
   match instr with
   | AluImm(_, _, d) | ShiftImm(_, _, _, d) | ShiftReg(_, _, _, d) | MulImm(_, _, _, _, d)
-  | MulSu(_, _, _, _, _, d) | MulI(_, _, _, _, d) | Div(_, d) | Inc d | Dec d -> Some [ Acc.reg d ]
+  | MulSu(_, _, _, _, _, d) | Dmac(_, _, _, _, d) | MulI(_, _, _, _, d) | Div(_, d) | Inc d | Dec d -> Some [ Acc.reg d ]
   | IfCc(alu, _, _) -> Some(List.ofArray (Lower.aluWrites alu))
   | Tcc(_, alu, agu) -> Some([ for _, d in Option.toList alu -> Acc.reg d ] @ [ for _, r in Option.toList agu -> R r ])
   | Norm(r, d) -> Some [ Acc.reg d; R r ]
@@ -254,6 +255,25 @@ let forwardWith (accCopies: bool) (items: (Item * int) array) =
             match workset space ea |> Option.bind f.Get, f.Get(SReg src) with
             | Some v, Some w when v = w -> None
             | _ -> Some it
+          // an immediate a register already holds (long immediates and zero only, as applyMoves)
+          | None, [| Imm(op, dst) |] when op.force = Long || immValue op = Some 0L ->
+            match immValue op with
+            | Some v ->
+              let c = f.Const v
+              match dst with
+              | A | B ->
+                match f.Loaded dst with
+                | Some w when w = c -> None                                         // already loaded
+                | _ -> Some it
+              | d when isWord d ->
+                match f.Get(SReg d) with
+                | Some w when w = c -> None                                         // already there
+                | _ ->
+                  match f.Holder(c, d) with
+                  | Some r when Lower.encodes (Par(None, [| Copy(r, d) |])) -> Some(Op(Par(None, [| Copy(r, d) |])))
+                  | _ -> Some it
+              | _ -> Some it
+            | None -> Some it
           | _ -> Some it
         match keep with
         | Some(Op(Par(alu, moves)) as k) ->
@@ -354,7 +374,7 @@ let readsOf (instr: Instr) =
   | Par(alu, moves) ->
     Some(Array.append (alu |> Option.map Lower.aluReads |> Option.defaultValue [||]) (Array.collect Lower.moveReads moves))
   | MulI(_, _, _, src, d) | MulImm(_, _, src, _, d) -> Some [| src; Acc.reg d |]
-  | MulSu(_, _, _, s1, s2, d) -> Some [| s1; s2; Acc.reg d |]
+  | MulSu(_, _, _, s1, s2, d) | Dmac(_, _, s1, s2, d) -> Some [| s1; s2; Acc.reg d |]
   | Div(src, d) -> Some [| src; Acc.reg d |]
   | AluImm(_, _, d) | ShiftImm(_, _, _, d) | Inc d | Dec d -> Some [| Acc.reg d |]
   | Nop -> Some [||]
@@ -432,9 +452,10 @@ let deadTempsGlobal (temps: int) (items: (Item * int) array) =
       | _ -> true
     | _ -> true)
 
-/// Loads into a data register of a workset word a DO loop does not write, where nothing else in
-/// the loop writes the register and the straight code before the load does not read it: done
-/// once, before the loop (a parameter, a state word only read there).
+/// Loads into a data register of a workset word a DO loop does not write, or of an immediate,
+/// where nothing else in the loop writes the register and the straight code before the load does
+/// not read it: done once, before the loop (a parameter, a state word only read there, a
+/// constant such as the zero a silent block writes).
 let hoist (items: (Item * int) array) =
   let control (instr: Instr) =
     match instr with
@@ -443,10 +464,18 @@ let hoist (items: (Item * int) array) =
   let overlaps (r: Reg) (ws: Reg array) = ws |> Array.exists (fun w -> Lower.storage w |> Array.exists (fun x -> Array.contains x (Lower.storage r)))
   let once (its: (Item * int) array) =
     let candidate (i: int) (e: int) (k: int) =
-      match fst its[k] with
-      | Op(Par(None, [| Load(space, ea, dst) |])) when (dst = X0 || dst = X1 || dst = Y0 || dst = Y1) ->
-        match workset space ea with
-        | Some(SMem(_, w)) ->
+      let data (r: Reg) = r = X0 || r = X1 || r = Y0 || r = Y1
+      // a workset word (its space and index), or an immediate (None): nothing in memory to watch
+      let source =
+        match fst its[k] with
+        | Op(Par(None, [| Load(space, ea, dst) |])) when data dst ->
+          match workset space ea with
+          | Some(SMem(_, w)) -> Some(dst, Some(space, w))
+          | _ -> None
+        | Op(Par(None, [| Imm(_, dst) |])) when data dst -> Some(dst, None)
+        | _ -> None
+      match source with
+      | Some(dst, word) ->
           // every pass reaches the load: what comes before it branches only forward to it or
           // short of it, and does not read the register
           let inside (t: Operand) =
@@ -471,22 +500,24 @@ let hoist (items: (Item * int) array) =
                 let stores =
                   match instr with
                   | Par(_, moves) ->
-                    moves |> Array.forall (fun m ->
-                      match m with
-                      | Store(_, sp, ea') when sp = space ->
-                        match workset sp ea', ea' with
-                        | Some(SMem(_, w')), _ -> w' <> w
-                        | None, PostInc 7 -> true
-                        | _ -> false
-                      | _ -> true)
+                    match word with
+                    | None -> true
+                    | Some(space, w) ->
+                      moves |> Array.forall (fun m ->
+                        match m with
+                        | Store(_, sp, ea') when sp = space ->
+                          match workset sp ea', ea' with
+                          | Some(SMem(_, w')), _ -> w' <> w
+                          | None, PostInc 7 -> true
+                          | _ -> false
+                        | _ -> true)
                   | _ -> true
                 match writesOf instr with
                 | Some ws -> stores && not (overlaps dst ws) && not (Array.contains (R 6) ws)
                 | None -> control instr
               | _ -> true)
           before && others
-        | _ -> false
-      | _ -> false
+      | None -> false
     its |> Array.indexed |> Array.tryPick (fun (i, (it, _)) ->
       match it with
       | Op(Loop(_, _, { expr = Sym name })) ->

@@ -103,6 +103,31 @@ module Probes =
       x <- Acc.ofFrac (Acc.lo r) >>> 5
     s.acc <- Long.ofAcc x
 
+  /// DIV with no ASL first and the carry given: both carries, dividends and divisors of either sign.
+  let divideCarry (p: P) (s: S) (out: Output) =
+    let mutable x = Acc.ofLong s.acc
+    for _ in 0 .. 7 do
+      let q = Acc.divideCarry 0 (Acc.ofFrac p.a >>> 4) p.b
+      out.Write(Acc.lo q)
+      out.Write(Acc.hi q)
+      let r = Acc.divideCarry 1 (x + p.c) p.d
+      out.Write(Acc.lo r)
+      out.Write(Acc.sat r)
+      x <- Acc.ofFrac (Acc.lo r) >>> 6
+    s.acc <- Long.ofAcc x
+
+  /// MPYSU, MACSU and DMACSS: a word times a 48-bit level hi:lo, and the level decaying by it.
+  let mulSu (p: P) (s: S) (out: Output) =
+    let mutable level = Acc.ofLong s.acc
+    for _ in 0 .. 15 do
+      let hi = Acc.hi level
+      let lo = Acc.lo level
+      let g = Acc.dmac (Frac.mulSU p.a lo) p.a hi
+      out.Write(Acc.sat g)
+      out.Write(Acc.lo (Acc.macSU (Frac.mulSU p.b p.c) p.c lo))
+      level <- Acc.dmac (Frac.mulSU p.d lo) p.d hi
+    s.acc <- Long.ofAcc level
+
   let readsIndex (_: P) (_: S) (out: Output) =
     for i in 0 .. 31 do
       out.Write(Frac.ofRaw i)
@@ -114,6 +139,8 @@ module Probes =
   let arithmeticKernel = Kernel.define "probe-arithmetic" <@ init @> <@ trig @> <@ arithmetic @>
   let controlKernel = Kernel.define "probe-control" <@ init @> <@ trig @> <@ control @>
   let divideKernel = Kernel.define "probe-divide" <@ init @> <@ trig @> <@ divide @>
+  let divideCarryKernel = Kernel.define "probe-divide-carry" <@ init @> <@ trig @> <@ divideCarry @>
+  let mulSuKernel = Kernel.define "probe-mulsu-dmac" <@ init @> <@ trig @> <@ mulSu @>
   let pipedKernel = Kernel.define "probe-piped" <@ init @> <@ trig @> <@ piped @>
   let memoryKernel = Kernel.define "probe-memory" <@ init @> <@ trig @> <@ memory @>
   let indexKernel = Kernel.define "probe-index" <@ init @> <@ trig @> <@ readsIndex @>
@@ -491,6 +518,52 @@ module StateRing =
       out.Write(c.Next())
   let off = Kernel.define "probe-state-ring-off" <@ none @> <@ none @> <@ walk @>
 
+
+/// Several reads and effects in one expression, in .NET's order (left to right, arguments before
+/// the call): two cursor reads, a helper that changes state beside a read of that state, mpysu
+/// given cursor reads.
+[<ReflectedDefinition>]
+module Order =
+  type S =
+    { mutable seed : Frac
+      mutable count : Frac }
+
+  let init (_: Banks.P) (s: S) =
+    s.seed <- Frac.ofRaw 0x5a3c21
+    s.count <- Frac.zero
+
+  let trig (_: Banks.P) (_: S) = ()
+
+  /// Steps the seed, gives the new one.
+  let step (s: S) =
+    s.seed <- Frac.lfsr 0xc20001 s.seed
+    s.seed
+
+  let mpysu (x: Frac) (u: Frac) =
+    let mutable a = x * u
+    if u < Frac.zero then a <- a + (Acc.ofFrac x <<< 1)
+    a
+
+  let render (p: Banks.P) (s: S) (out: Output) =
+    let fill = Cursor.linear Scratch.x Frac.zero
+    for _ in 0 .. 31 do
+      fill.Put(step s)
+    let r = Cursor.linear Scratch.x Frac.zero
+    for _ in 0 .. 7 do
+      // left before right, both orders of operand kinds
+      out.Write(Acc.sat (Acc.ofFrac (r.Next()) - r.Next() * p.a))
+      out.Write(Acc.sat (r.Next() * p.b - Acc.ofFrac (r.Next())))
+    for _ in 0 .. 3 do
+      // the state read beside the call that changes it: before it on the left, after on the right
+      out.Write(Acc.sat (Acc.ofFrac s.seed - Acc.ofFrac (step s)))
+      out.Write(Acc.sat (Acc.ofFrac (step s) - s.seed * p.c))
+    let q = Cursor.linear Scratch.x (Frac.ofRaw 4)
+    for _ in 0 .. 7 do
+      out.Write(Acc.sat (mpysu (q.Next()) (q.Next())))
+    s.count <- Acc.hi (Acc.ofFrac s.count + Frac.ofRaw 1)
+
+  let kernel = Kernel.define "probe-order" <@ init @> <@ trig @> <@ render @>
+
 [<ReflectedDefinition>]
 module Unsized =
   type S = { mutable history : Frac array }
@@ -789,6 +862,16 @@ let tests =
     test "DIV: compiled program equals the .NET kernel" {
       needNative ()
       conformance Probes.divideKernel 4
+    }
+
+    test "DIV with the carry given, no ASL: compiled program equals the .NET kernel" {
+      needNative ()
+      conformance Probes.divideCarryKernel 5
+    }
+
+    test "MPYSU, MACSU and DMACSS: compiled program equals the .NET kernel" {
+      needNative ()
+      conformance Probes.mulSuKernel 6
     }
 
     testList "samples reproduce the machines they were ported from, word for word" [
