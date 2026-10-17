@@ -259,6 +259,11 @@ let parameterWords (machine: Mds.Machine) (settings: float array) =
 /// on .NET one at a time.
 let sharedMemory = obj ()
 
+/// Called before each .NET RENDER of runNet with the block's index (from 0 each run): a grader
+/// that feeds a kernel's input regions block by block (a chain's sources replayed) sets their
+/// words here, as its sessions do on the emulator before their RENDER. Does nothing by default.
+let mutable beforeRender : int -> unit = ignore
+
 let runNet (h: Harness) (k: Kernel.Kernel) (scenario: Scenario) =
   let target = h.target
   lock sharedMemory (fun () ->
@@ -278,6 +283,7 @@ let runNet (h: Harness) (k: Kernel.Kernel) (scenario: Scenario) =
     | Trig -> host.Trig()
     | Render n ->
       for _ in 1 .. n do
+        beforeRender outputs.Count
         let words = host.Render()
         if words.Length <> target.blockWords then
           raise (Kernel.KernelError $"{k.name}: RENDER wrote {words.Length} words, the block is {target.blockText}")

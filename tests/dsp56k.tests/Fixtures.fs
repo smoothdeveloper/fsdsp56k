@@ -17,8 +17,23 @@ let repoRoot =
 
 let fixture name = repoRoot </> "fixtures" </> name
 
+/// What a skipped test needed, with the command that provides it: Main reports these after the
+/// run, so a missing prerequisite is not just a count of ignored tests.
+let missing = System.Collections.Concurrent.ConcurrentDictionary<string, int>()
+
+let private skipFor (what: string) =
+  missing.AddOrUpdate(what, 1, fun _ n -> n + 1) |> ignore
+  skiptest what
+
 let needFixture name =
-  if not (Directory.Exists(fixture name)) then skiptest $"fixture {name} missing: run scripts/fetch-fixtures.sh"
+  if not (Directory.Exists(fixture name)) then skipFor $"fixture {name} missing: run scripts/fetch-fixtures.sh"
 
 let needNative () =
-  if not (dsp56k.Native.load ()) then skiptest "native oracle missing: cargo build --release in native/"
+  if not (dsp56k.Native.load ()) then skipFor "native oracle missing: cargo build --release in native/ (or set FSDSP56K_NATIVE)"
+
+/// The skipped tests' prerequisites, one line each with how many tests they held back.
+let reportMissing () =
+  if not missing.IsEmpty then
+    eprintfn "\nSkipped for missing prerequisites:"
+    for KeyValue(what, n) in missing |> Seq.sortBy (fun kv -> kv.Key) do
+      eprintfn "  %3d test(s): %s" n what
