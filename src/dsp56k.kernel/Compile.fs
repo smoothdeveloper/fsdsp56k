@@ -546,7 +546,8 @@ let placeFactors (w1: Word) (w2: Word) =
   | WReg r, WReg r' when r = r' && (r = X0 || r = Y0) -> [], (r, r)
   | _ when w1 = w2 -> loadWord w1 X0, (X0, X0)
   | WReg r1, WReg r2 when r1 <> r2 && ok (r1, r2) -> [], ordered (r1, r2)
-  | WReg r, other | other, WReg r when other <> WReg r ->
+  // one factor already in a data register (one in B or A1 is loaded like a word in memory)
+  | WReg r, other | other, WReg r when other <> WReg r && (r = X0 || r = X1 || r = Y0 || r = Y1) ->
     let partner = if ok (r, Y0) && other <> WReg Y0 then Y0 else X0
     loadWord other partner, ordered (r, partner)
   | _ -> loadWord w1 X0 @ loadWord w2 Y0, (X0, Y0)
@@ -1041,7 +1042,7 @@ and mulInto (ctx: Ctx) (acc: Expr option) (x: Expr) (y: Expr) (kind: MulKind, ne
   match xs with
   | [| WImm v; w |] | [| w; WImm v |] when (match w with WImm _ -> false | _ -> true) ->
     // a constant factor rides in the instruction: mpyi/maci #c,s,a
-    let r, loads = match w with WReg r -> r, [] | _ -> X0, loadWord w X0
+    let r, loads = match w with WReg r when r = X0 || r = X1 || r = Y0 || r = Y1 -> r, [] | _ -> X0, loadWord w X0
     emitAll ctx loads
     product (Op(MulI(kind, negate, immL v, r, dst)))
   | _ ->

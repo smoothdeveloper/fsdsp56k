@@ -1636,6 +1636,15 @@ let tests =
       conformance Probes.normaliseEdgesKernel 7
     }
 
+    test "a factor in a register the multiplier cannot take (B, A1): loaded into a data register" {
+      let data r = r = dsp56k.Reg.X0 || r = dsp56k.Reg.X1 || r = dsp56k.Reg.Y0 || r = dsp56k.Reg.Y1
+      for held in [ dsp56k.Reg.B; dsp56k.Reg.A1; dsp56k.Reg.B1 ] do
+        for other in [ Compile.WImm 5; Compile.WReg dsp56k.Reg.X1; Compile.WReg dsp56k.Reg.Y0; Compile.WReg held ] do
+          for w1, w2 in [ Compile.WReg held, other; other, Compile.WReg held ] do
+            let _, (s, t) = Compile.placeFactors w1 w2
+            Expect.isTrue (data s && data t && (Compile.multiplierPairs.Contains((s, t)) || Compile.multiplierPairs.Contains((t, s)))) $"{w1} * {w2}: {s},{t}"
+    }
+
     test "LSR and shifts by a count when running: compiled program equals the .NET kernel" {
       needNative ()
       conformance Probes.shiftsKernel 8
