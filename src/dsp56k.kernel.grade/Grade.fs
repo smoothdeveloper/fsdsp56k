@@ -620,11 +620,11 @@ type Report =
     reference   : Cost option
     shapes      : Shape array }
 
-/// Compile for the harness's target, load, run and compare. `reference` is the program the
-/// kernel reproduces, when there is one.
-let gradeWith (h: Harness) (k: Kernel.Kernel) (reference: Program option) (scenario: Scenario) =
+/// Compile for the harness's target with the optimizer at `level`, load, run and compare.
+/// `reference` is the program the kernel reproduces, when there is one.
+let gradeAt (level: Optimize.Level) (h: Harness) (k: Kernel.Kernel) (reference: Program option) (scenario: Scenario) =
   let target = h.target
-  Optimize.compile Optimize.Peephole target k
+  Optimize.compile level target k
   |> Result.bind (fun compiled -> h.load compiled |> Result.map (fun p -> compiled, p))
   |> Result.bind (fun (compiled, program) ->
     try
@@ -649,13 +649,57 @@ let gradeWith (h: Harness) (k: Kernel.Kernel) (reference: Program option) (scena
            shapes = shapes }
     with Kernel.KernelError m -> Error m)
 
-/// On the MDS harness; `reference` is a shipped package, when there is one.
-let grade (k: Kernel.Kernel) (machine: Mds.Machine) (reference: byte array option) (scenario: Scenario) =
+/// The optimizer level FSDSP56K_PASSES asks for, for measuring passes through graders that call
+/// gradeWith: unset or "all" every pass; "none"; "unguarded"; or "-name,-name" those passes off.
+let environmentLevel () =
+  match Environment.GetEnvironmentVariable "FSDSP56K_PASSES" with
+  | null | "" | "all" -> Optimize.Peephole
+  | "none" -> Optimize.Chosen Optimize.Passes.none
+  | "unguarded" -> Optimize.Chosen { Optimize.Passes.all with monotone = false }
+  | spec ->
+    let off = spec.Split(',', StringSplitOptions.RemoveEmptyEntries) |> Array.map (fun n -> n.Trim().TrimStart '-')
+    let p =
+      off |> Array.fold (fun p n ->
+        match Optimize.passes |> List.tryFind (fun (name, _) -> name = n) with
+        | Some(_, turnOff) -> turnOff p
+        | None -> failwith $"FSDSP56K_PASSES: no pass {n}") Optimize.Passes.all
+    Optimize.Chosen p
+
+/// Compile with every pass (or as FSDSP56K_PASSES asks), load, run and compare.
+let gradeWith (h: Harness) (k: Kernel.Kernel) (reference: Program option) (scenario: Scenario) =
+  gradeAt (environmentLevel ()) h k reference scenario
+
+/// On the MDS harness, the optimizer at `level`; `reference` is a shipped package, when there is one.
+let gradeMdsAt (level: Optimize.Level) (k: Kernel.Kernel) (machine: Mds.Machine) (reference: byte array option) (scenario: Scenario) =
   let reference =
     match reference with
     | None -> Ok None
     | Some bytes -> mdsReference bytes |> Result.map Some
-  reference |> Result.bind (fun r -> gradeWith (mdsHarness machine) k r scenario)
+  reference |> Result.bind (fun r -> gradeAt level (mdsHarness machine) k r scenario)
+
+/// On the MDS harness; `reference` is a shipped package, when there is one.
+let grade (k: Kernel.Kernel) (machine: Mds.Machine) (reference: byte array option) (scenario: Scenario) =
+  gradeMdsAt Optimize.Peephole k machine reference scenario
+
+/// What each pass does: the kernel graded with every pass, then with each one turned off in turn,
+/// and with none. Per row: the pass turned off ("all": none off, "none": every one off), RENDER
+/// mean and worst cycles and program words. A pass that helps makes its row worse than "all".
+type PassRow =
+  { off         : string
+    renderMean  : float
+    renderWorst : int64
+    words       : int
+    correct     : bool }
+
+let passTable (gradeAtLevel: Optimize.Level -> Result<Report, string>) =
+  let row name level =
+    gradeAtLevel level |> Result.map (fun r ->
+      { off = name; renderMean = r.ours.renderMean; renderWorst = r.ours.renderWorst; words = r.ours.programWords
+        correct = List.isEmpty r.correctness })
+  [ yield row "all" Optimize.Peephole
+    for name, off in Optimize.passes -> row name (Optimize.Chosen(off Optimize.Passes.all))
+    yield row "unguarded" (Optimize.Chosen { Optimize.Passes.all with monotone = false })
+    yield row "none" (Optimize.Chosen Optimize.Passes.none) ]
 
 let text (r: Report) =
   let mismatch (m: Mismatch) =

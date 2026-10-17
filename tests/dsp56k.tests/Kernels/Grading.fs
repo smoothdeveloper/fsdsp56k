@@ -30,7 +30,8 @@ let packageBytes (path: string) =
     | Error e -> Error $"{path}: %A{e}"
   else Ok bytes
 
-let run (fixtures: string) (s: Sample) =
+/// Graded with the optimizer at `level`.
+let runAt (level: Optimize.Level) (fixtures: string) (s: Sample) =
   let package = fixtures </> s.package
   if not (File.Exists package) then Error $"{package} missing: run scripts/fetch-fixtures.sh"
   else
@@ -38,12 +39,15 @@ let run (fixtures: string) (s: Sample) =
     |> Result.bind (fun bytes ->
       match machinedrum.run.Import.package bytes with
       | Error e -> Error $"%A{e}"
-      | Ok imported -> grade s.kernel imported.machine (Some bytes) s.scenario)
+      | Ok imported -> gradeMdsAt level s.kernel imported.machine (Some bytes) s.scenario)
     |> Result.map (fun report ->
       let src = fixtures </> s.source
       { Html.title = s.title; Html.origin = s.origin; Html.license = s.license; Html.notes = s.notes
         Html.referenceSource = (if File.Exists src then Some(string (Path.GetFileName src), File.ReadAllText src) else None)
         Html.report = report })
+
+/// Graded with every pass.
+let run (fixtures: string) (s: Sample) = runAt Optimize.Peephole fixtures s
 
 // ---------------------------------------------------------------------------------------------
 // The scenarios: two bars at 120 BPM as a sequencer plays them, a few trigs, parameter locks on

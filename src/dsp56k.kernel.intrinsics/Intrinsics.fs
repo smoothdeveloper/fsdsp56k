@@ -177,12 +177,12 @@ and [<Struct>] Acc =
   [<Intrinsic "acc.mac">]
   static member mac (acc: Acc) (x: Frac) (y: Frac) = acc + x * y
 
-  /// `dmacss x,y,a`: the accumulator shifted right 24 bits (arithmetic), plus x * y. With
-  /// `Frac.mulSU` first, the product of a word and a 48-bit value hi:lo in two instructions.
   /// `macsu s,u,a`: the accumulator plus s signed times u read unsigned.
   [<Intrinsic "acc.macsu">]
   static member macSU (acc: Acc) (s: Frac) (u: Frac) = { Acc.Raw = Bits.sext56 (acc.Raw + ((int64 s.Raw * (int64 u.Raw &&& 0xffffffL)) <<< 1)) }
 
+  /// `dmacss x,y,a`: the accumulator shifted right 24 bits (arithmetic), plus x * y. With
+  /// `Frac.mulSU` first, the product of a word and a 48-bit value hi:lo in two instructions.
   [<Intrinsic "acc.dmac">]
   static member dmac (acc: Acc) (x: Frac) (y: Frac) = { Acc.Raw = Bits.sext56 ((acc.Raw >>> 24) + ((int64 x.Raw * int64 y.Raw) <<< 1)) }
 
@@ -219,6 +219,24 @@ and [<Struct>] Acc =
       d <- (if d55 ^^^ s23 = 1L then shifted + sv else shifted - sv) &&& mask
       c <- 1L - ((d >>> 55) &&& 1L)
     { Acc.Raw = Bits.sext56 d }
+
+  /// `clb a,a`: the count NORMF takes to normalise a, in a1 (a2 its sign, a0 zero): 9 less the
+  /// number of leading bits equal to the sign (bit 55 on), 0 when a is 0. `Acc.hi (Acc.clb a)`
+  /// is the count as a word: 0 for a normalised a (a1 in [0.5, 1) or [-1, -0.5)), negative by
+  /// the left shift that normalises it, positive when a uses its extension; -47 for all ones.
+  [<Intrinsic "acc.clb">]
+  static member clb (a: Acc) =
+    let v = if a.Raw < 0L then ~~~a.Raw else a.Raw     // the sign bits as leading zeros
+    let count = 56 - (64 - System.Numerics.BitOperations.LeadingZeroCount(uint64 v))
+    { Acc.Raw = (if a.Raw = 0L then 0L else int64 (9 - count)) <<< 24 }
+
+  /// `normf s,a`: a shifted right (arithmetic) by s when s is positive, left by -s when it is
+  /// negative, by the count's low 6 bits (|s| mod 64); bits shifted past bit 55 are lost.
+  /// `Acc.normf (Acc.hi (Acc.clb a)) a` normalises a (`clb a,b` `normf b1,a`).
+  [<Intrinsic "acc.normf">]
+  static member normf (s: Frac) (a: Acc) =
+    let n = abs s.Raw &&& 0x3f
+    if s.Raw < 0 then { Acc.Raw = Bits.sext56 (a.Raw <<< n) } else { Acc.Raw = a.Raw >>> n }
 
   /// `rnd a`: convergent rounding into a1 (to even on a tie), a0 cleared. `Acc.rnd (x * y)` is
   /// MPYR and `Acc.rnd (acc ± x * y)` MACR.

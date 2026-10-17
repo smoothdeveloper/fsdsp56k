@@ -128,6 +128,47 @@ module Probes =
       level <- Acc.dmac (Frac.mulSU p.d lo) p.d hi
     s.acc <- Long.ofAcc level
 
+  /// CLB then NORMF: values of either sign normalised, their counts, and shifts both ways.
+  let normalise (p: P) (s: S) (out: Output) =
+    let mutable x = Acc.ofLong s.acc
+    for _ in 0 .. 7 do
+      let c = Acc.hi (Acc.clb x)
+      out.Write(c)
+      out.Write(Acc.hi (Acc.normf c x))
+      out.Write(Acc.lo (Acc.normf p.a (Acc.ofFrac p.b)))
+      out.Write(Acc.hi (Acc.clb (Acc.ofFrac p.c >>> 7)))
+      x <- (x >>> 3) + Acc.ofFrac p.d
+    s.acc <- Long.ofAcc x
+
+  /// CLB and NORMF: leading bits counted (zero, all ones, the extension in use, products) and
+  /// accumulators shifted by them and by any signed count (|count| mod 64, either way).
+  let normaliseEdges (p: P) (s: S) (out: Output) =
+    let mutable x = Acc.ofLong s.acc + p.a
+    for _ in 0 .. 1 do
+      let e = Acc.hi (Acc.clb x)
+      out.Write e
+      let n = Acc.normf e x
+      out.Write(Acc.hi n)
+      out.Write(Acc.lo n)
+      out.Write(Acc.hi (Acc.clb n))
+      out.Write(Acc.sat (Acc.normf (Acc.hi (Acc.clb x)) x))
+      let k = Acc.hi (Acc.ofFrac p.b >>> 17)
+      let y = Acc.normf k (p.c * p.d)
+      out.Write(Acc.sat y)
+      out.Write(Acc.lo y)
+      out.Write(Acc.hi (Acc.clb y))
+      let z = Acc.normf p.a (Acc.ofFrac p.d + Acc.ofFrac p.d)
+      out.Write(Acc.sat z)
+      out.Write(Acc.hi z)
+      out.Write(Acc.lo z)
+      out.Write(Acc.hi (Acc.clb z))
+      out.Write(Acc.hi (Acc.clb (Acc.ofFrac p.d + Acc.ofFrac p.d)))
+      out.Write(Acc.hi (Acc.normf k x))
+      out.Write(Acc.hi (Acc.clb (Acc.ofFrac p.c - Acc.ofFrac p.c)))
+      out.Write(Acc.hi (Acc.clb (Acc.ofFrac p.c - Acc.ofFrac p.c - Acc.ofRaw 1L)))
+      x <- (x >>> 5) + p.b * p.c
+    s.acc <- Long.ofAcc x
+
   let readsIndex (_: P) (_: S) (out: Output) =
     for i in 0 .. 31 do
       out.Write(Frac.ofRaw i)
@@ -141,6 +182,8 @@ module Probes =
   let divideKernel = Kernel.define "probe-divide" <@ init @> <@ trig @> <@ divide @>
   let divideCarryKernel = Kernel.define "probe-divide-carry" <@ init @> <@ trig @> <@ divideCarry @>
   let mulSuKernel = Kernel.define "probe-mulsu-dmac" <@ init @> <@ trig @> <@ mulSu @>
+  let normaliseKernel = Kernel.define "probe-clb-normf" <@ init @> <@ trig @> <@ normalise @>
+  let normaliseEdgesKernel = Kernel.define "probe-clb-normf-edges" <@ init @> <@ trig @> <@ normaliseEdges @>
   let pipedKernel = Kernel.define "probe-piped" <@ init @> <@ trig @> <@ piped @>
   let memoryKernel = Kernel.define "probe-memory" <@ init @> <@ trig @> <@ memory @>
   let indexKernel = Kernel.define "probe-index" <@ init @> <@ trig @> <@ readsIndex @>
@@ -291,6 +334,81 @@ module XOnly =
     s.phase <- Long.ofAcc phase
 
   let kernel = Kernel.define "probe-x-state" <@ init @> <@ trig @> <@ render @>
+
+/// Eight state arrays (four in X, four in Y) stepped by one loop index: more than r1..r5, so
+/// the arrays past the fifth ride on a register the loop steps already, at their distance.
+[<ReflectedDefinition>]
+module ManyArrays =
+  type S =
+    { mutable seed : Frac
+      [<XMemory; Length 8>] mutable x0 : Frac array
+      [<XMemory; Length 8>] mutable x1 : Frac array
+      [<XMemory; Length 8>] mutable x2 : Frac array
+      [<XMemory; Length 8>] mutable x3 : Frac array
+      [<Length 8>] mutable y0 : Frac array
+      [<Length 8>] mutable y1 : Frac array
+      [<Length 8>] mutable y2 : Frac array
+      [<Length 8>] mutable y3 : Frac array }
+
+  let init (_: Banks.P) (s: S) =
+    s.seed <- Frac.ofRaw 0x13579b
+    for i in 0 .. 7 do
+      s.x0[i] <- Frac.zero
+      s.x1[i] <- Frac.zero
+      s.x2[i] <- Frac.zero
+      s.x3[i] <- Frac.zero
+      s.y0[i] <- Frac.zero
+      s.y1[i] <- Frac.zero
+      s.y2[i] <- Frac.zero
+      s.y3[Frac.index (Frac.ofRaw i)] <- Frac.zero
+
+  let trig (_: Banks.P) (_: S) = ()
+
+  let render (p: Banks.P) (s: S) (out: Output) =
+    for _ in 0 .. 31 do
+      for i in 0 .. 6 do
+        s.x0[i] <- s.x0[i + 1]
+        s.x1[i] <- s.x1[i + 1]
+        s.x2[i] <- s.x2[i + 1]
+        s.x3[i] <- s.x3[i + 1]
+        s.y0[i] <- s.y0[i + 1]
+        s.y1[i] <- s.y1[i + 1]
+        s.y2[i] <- s.y2[i + 1]
+        s.y3[i] <- s.y3[i + 1]
+      s.seed <- Frac.lfsr 0xc20001 s.seed
+      s.x0[7] <- s.seed
+      s.x1[7] <- Acc.hi (Acc.ofFrac s.seed >>> 1)
+      s.x2[7] <- p.a
+      s.x3[7] <- p.b
+      s.y0[7] <- p.c
+      s.y1[7] <- p.d
+      s.y2[7] <- Acc.sat (s.seed * p.a)
+      s.y3[7] <- Acc.hi (Acc.ofFrac p.b >>> 2)
+      let mutable sum = Acc.zero
+      for i in 0 .. 7 do
+        sum <- sum + s.x0[i] * s.y0[i] + s.x1[i] * s.y1[i] + s.x2[i] * s.y2[i] + s.x3[i] * s.y3[i]
+      out.Write(Acc.sat (sum >>> 3))
+
+  /// Five cursors live across a loop that indexes arrays: no register left for the loop.
+  let crowded (_: Banks.P) (s: S) (out: Output) =
+    let c1 = Cursor.linearIn s.x0 Frac.zero 1
+    let c2 = Cursor.linearIn s.x1 Frac.zero 1
+    let c3 = Cursor.linearIn s.x2 Frac.zero 1
+    let c4 = Cursor.linearIn s.x3 Frac.zero 1
+    let c5 = Cursor.linearIn s.y0 Frac.zero 1
+    for _ in 0 .. 3 do
+      for i in 0 .. 7 do
+        s.y1[i] <- s.y2[i]
+      out.Write(c1.Next())
+      out.Write(c2.Next())
+      out.Write(c3.Next())
+      out.Write(c4.Next())
+      out.Write(c5.Next())
+    for _ in 0 .. 11 do
+      out.Write(Frac.zero)
+
+  let kernel = Kernel.define "probe-many-arrays" <@ init @> <@ trig @> <@ render @>
+  let crowdedKernel = Kernel.define "probe-crowded-registers" <@ init @> <@ trig @> <@ crowded @>
 
 /// State in both memories, interleaved in the record: an X delay line against Y coefficients
 /// (an FIR whose loads can share one instruction, x:(rn)+ and y:(rm)+), Y and X words read
@@ -874,6 +992,14 @@ let keepIn (group: string list) (r: Report) = keepAt (group @ [ r.kernel ]) r
 
 let keep (r: Report) = keepIn [ "probes" ] r
 
+/// A text kept in out/kernels/tests/<path>.
+let keepText (path: string list) (text: string) =
+  try
+    let file = System.IO.Path.Combine(Array.ofList (keptRoot :: path))
+    System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName file) |> ignore
+    System.IO.File.WriteAllText(file, text + "\n")
+  with _ -> ()
+
 let conformanceWith (machine: Mds.Machine) (k: Kernel.Kernel) seed =
   let rng = Random(seed: int)
   let words () = Array.init machine.parameters.Length (fun _ -> if rng.Next 3 = 0 then [| 0; 0x7fffff; 0x800000; 0x400000 |][rng.Next 4] else rng.Next 0x1000000)
@@ -1245,6 +1371,68 @@ let tests =
       conformance Probes.mulSuKernel 6
     }
 
+    test "CLB and NORMF: compiled program equals the .NET kernel" {
+      needNative ()
+      conformance Probes.normaliseKernel 6
+    }
+
+    test "CLB and NORMF, .NET: leading bits as 9 minus their count, shifts by a signed count" {
+      let acc (v: int64) = Acc.ofRaw v
+      let clb v = (Acc.hi (Acc.clb (acc v))).Raw
+      Expect.equal (clb 0L) 0 "zero gives 0"
+      Expect.equal (clb (0x400000L <<< 24)) 0 "0.5 is normalised"
+      Expect.equal (clb (0x200000L <<< 24)) -1 "0.25: one left shift"
+      Expect.equal (clb (-0x800000L <<< 24)) 0 "-1 is normalised"
+      Expect.equal (clb (-0x400000L <<< 24)) -1 "-0.5: one left shift"
+      Expect.equal (clb (0x800000L <<< 24)) 1 "+1 in the extension: one right shift"
+      Expect.equal (clb 0x7fffffffffffffL) 8 "the largest: eight right shifts"
+      Expect.equal (clb 1L) -46 "2^-47"
+      Expect.equal (clb -1L) -47 "all ones"
+      let normf (k: int) v = (Acc.normf (Frac.ofRaw k) (acc v)).Raw
+      Expect.equal (normf -1 (0x200000L <<< 24)) (0x400000L <<< 24) "a negative count shifts left"
+      Expect.equal (normf 1 (0x400000L <<< 24)) (0x200000L <<< 24) "a positive count shifts right"
+      Expect.equal (normf 2 (-0x400000L <<< 24)) (-0x100000L <<< 24) "right shifts keep the sign"
+      Expect.equal (normf 64 12345L) 12345L "the count is taken modulo 64"
+      Expect.equal (normf -65 12345L) 24690L "on either side"
+      Expect.equal (normf 0x800000 12345L) 12345L "-2^23: no shift"
+      Expect.equal (normf -8 (0x0100000000000L)) (Bits.sext56 (0x0100000000000L <<< 8)) "bits shifted past bit 55 are lost"
+      for v in [ 1L; -1L; 3L <<< 30; -(5L <<< 40); 0x123456789abcL; 0x7fffffffffffffL; -0x80000000000000L ] do
+        let n = (Acc.normf (Acc.hi (Acc.clb (acc v))) (acc v)).Raw
+        Expect.equal (Acc.hi (Acc.clb (acc n))).Raw 0 $"normf (clb a) a is normalised for {v:x}"
+    }
+
+    test "CLB and NORMF, edges (zero, all ones, extension, counts past 23): compiled program equals the .NET kernel" {
+      needNative ()
+      conformance Probes.normaliseEdgesKernel 7
+    }
+
+    test "more arrays than address registers in one loop: compiled program equals the .NET kernel" {
+      match Optimize.compile Optimize.Peephole Kernel.mds ManyArrays.kernel with
+      | Error e -> failtest e
+      | Ok c ->
+        let lines = c.items |> Array.map dsp56k.Print.item
+        Expect.exists lines (fun l -> Text.RegularExpressions.Regex.IsMatch(l, @"[xy]:\(r[1-5]\+\$[0-9a-f]+\)")) "an array at its distance from a stepped register"
+      needNative ()
+      let rng = Random 23
+      let steps =
+        [ yield Words(randomWords rng)
+          yield Init
+          for _ in 1 .. 60 do
+            yield Words(randomWords rng)
+            yield Render 1 ]
+      match grade ManyArrays.kernel probeMachine None { name = "random words"; steps = steps } |> Result.map keep with
+      | Error e -> failtest e
+      | Ok r -> Expect.isEmpty r.correctness (text r)
+    }
+
+    test "no address register left for a loop's arrays: the message names the holders and the way out" {
+      match dsp56k.kernel.Compile.compile Kernel.mds ManyArrays.crowdedKernel with
+      | Ok _ -> failtest "compiled"
+      | Error e ->
+        Expect.stringContains e "c1 (r" "names a cursor holding a register"
+        Expect.stringContains e "Frac.index (Frac.ofRaw i)" "gives the workaround"
+    }
+
     testList "samples reproduce the machines they were ported from, word for word" [
       for sample in samples.kernels.Grading.samples ->
         test sample.title {
@@ -1260,6 +1448,38 @@ let tests =
             // the optimizer's ground so far: regressions past it fail
             Expect.isLessThan r.ours.renderMean (3.0 * r.reference.Value.renderMean) "within 3x the hand-written RENDER"
         } ]
+
+    testList "every pass pays for itself on the samples: turning one off is never faster, or as fast and smaller" [
+      for sample in samples.kernels.Grading.samples ->
+        test sample.title {
+          needNative ()
+          needFixture "MDS"
+          needFixture "kitbasher"
+          let rows =
+            Grade.passTable (fun level -> samples.kernels.Grading.runAt level (fixture "") sample |> Result.map _.report)
+            |> List.map (function Ok r -> r | Error e -> failtest e)
+          let table =
+            rows
+            |> List.map (fun r -> sprintf "  %-12s %10.1f %8d %6d %s" r.off r.renderMean r.renderWorst r.words (if r.correct then "" else "WRONG"))
+            |> String.concat "\n"
+          keepText ("samples" :: sample.group @ [ sample.folder; "passes.txt" ]) (sprintf "  %-12s %10s %8s %6s\n%s" "off" "mean" "worst" "words" table)
+          for r in rows do Expect.isTrue r.correct $"{r.off} off: the compiled program differs from the .NET kernel\n{table}"
+          let all = rows.Head
+          for r in rows.Tail do
+            let faster = r.renderMean < all.renderMean - 1e-9 || r.renderWorst < all.renderWorst
+            let smallerAsFast = r.renderMean = all.renderMean && r.renderWorst = all.renderWorst && r.words < all.words
+            Expect.isFalse (faster || smallerAsFast) $"with {r.off} off the program is better than with every pass\n{table}"
+        } ]
+
+    test "the optimizer is deterministic: compiling a sample twice gives the same listing" {
+      for sample in samples.kernels.Grading.samples do
+        let listing () =
+          match Optimize.compile Optimize.Peephole Kernel.mds sample.kernel with
+          | Ok c -> c.items |> Array.map dsp56k.Print.item |> String.concat "\n"
+          | Error e -> failtest e
+        let first = listing ()
+        Expect.equal (listing ()) first $"{sample.title}: a second compilation differs"
+    }
 
     test "a stereo RENDER is refused on a mono target" {
       match dsp56k.kernel.Compile.compile Kernel.mds Stereo.kernel with

@@ -139,7 +139,8 @@ type Ctx =
     mutable conts : Expr list         // code still to run after the current expression (loop bodies again)
     released : Collections.Generic.HashSet<Var>   // cursors whose register was freed before their scope ended
     mutable trackHome : Home option   // where the entry saved R1, the track number
-    mutable indexed : Map<Var * string, int>  // (loop index, state array) -> its address register
+    mutable indexed : Map<Var * string, int * int>  // (loop index, state array) -> its address register,
+                                                    // the array's distance from what that register steps
     mutable counters : Map<Var, Home>         // loop index -> the word counting it, when read
     mutable freeData : Reg list               // X1, Y1 when no local holds them
     scores   : Dictionary<Var, int>           // uses of each local, weighted by loop trip counts
@@ -656,8 +657,9 @@ let (|StateElement|_|) (ctx: Ctx) (e: Expr) =
     | TArray n ->
       match loopOffset ctx (fun i -> ctx.indexed.ContainsKey(i, p.Name)) index with
       | Some(i, c) ->
-        let reg = ctx.indexed[i, p.Name]
-        Some(({ space = spaceOf f; ea = (if c = 0 then Ind reg else Disp(reg, Operand.num c)) } : Mem), rest)
+        let reg, bias = ctx.indexed[i, p.Name]
+        let d = bias + c
+        Some(({ space = spaceOf f; ea = (if d = 0 then Ind reg else Disp(reg, Operand.num d)) } : Mem), rest)
       | None when (computedIndex ctx index).IsSome -> None
       | None ->
         let k = constInt ctx $"the index into {p.Name} (a constant, or the loop's index plus or minus a constant)" index
@@ -763,6 +765,7 @@ let snapshot (ctx: Ctx) =
   let released, deadLocals = List.ofSeq ctx.released, List.ofSeq ctx.deadLocals
   let trackHome, indexed, counters, freeData, tables = ctx.trackHome, ctx.indexed, ctx.counters, ctx.freeData, ctx.tables.Count
   let bHeld, bWrite = ctx.bHeld, ctx.bWrite
+  let unswitched = List.ofSeq ctx.unswitched
   fun () ->
     ctx.items.RemoveRange(count, ctx.items.Count - count)
     ctx.lines.RemoveRange(count, ctx.lines.Count - count)
@@ -773,6 +776,8 @@ let snapshot (ctx: Ctx) =
     ctx.deadLocals.Clear(); ctx.deadLocals.UnionWith deadLocals
     ctx.trackHome <- trackHome; ctx.indexed <- indexed; ctx.counters <- counters; ctx.freeData <- freeData
     ctx.bHeld <- bHeld; ctx.bWrite <- bWrite
+    // a loop split in the attempt given up is split again (it is not left as seen)
+    ctx.unswitched.Clear(); ctx.unswitched.UnionWith unswitched
 
 /// A condition in a loop's body (at its top level, not in a branch or an inner loop) that the
 /// loop does not change: it reads parameters, constants, locals bound outside the loop and not
@@ -862,6 +867,7 @@ let rec accBound (ctx: Ctx) (e: Expr) : float =
     | Intr "acc.add" [l; r] | Intr "acc.sub" [l; r] -> accBound ctx l + accBound ctx r
     | Intr "acc.addFrac" [l; _] | Intr "acc.subFrac" [l; _] | Intr "acc.mac" [l; _; _] -> accBound ctx l + 1.0
     | Intr "acc.neg" [x] -> accBound ctx x
+    | Intr "acc.clb" [_] -> 1.0
     | Intr "acc.asr" [x; n] ->
       match tryConst ctx n with
       | Some(:? int as n) -> accBound ctx x / Math.Pow(2.0, float n)
@@ -948,6 +954,20 @@ let rec genAcc (ctx: Ctx) (e: Expr) : unit =
         let loads, (s, t) = suFactors xs
         emitAll ctx loads
         emit ctx (Op(Dmac(false, SignedSigned, s, t, dsp56k.Acc.A)))
+      | Some "acc.clb", [x] ->
+        genAcc ctx x
+        emit ctx (Op(Clb(dsp56k.Acc.A, dsp56k.Acc.A)))
+      // `clb a,b` `normf b1,a`: an accumulator normalised by its own leading bits
+      | Some "acc.normf", [Intr "acc.hi" [Intr "acc.clb" [Var y]]; Var x] when x = y && not ctx.bHeld ->
+        genAcc ctx (Expr.Var x)
+        emit ctx (Op(Clb(dsp56k.Acc.A, dsp56k.Acc.B)))
+        emit ctx (Op(Normf(B1, dsp56k.Acc.A)))
+      | Some "acc.normf", [k; x] ->
+        let w = (operands ctx [ k ])[0]
+        genAcc ctx x
+        let r, loads = match w with WReg r when r = X0 || r = X1 || r = Y0 || r = Y1 -> r, [] | _ -> X0, loadWord w X0
+        emitAll ctx loads
+        emit ctx (Op(Normf(r, dsp56k.Acc.A)))
       | Some "acc.divideCarry", [c; x; d] ->
         let carry = constInt ctx "the division's carry" c
         if carry <> 0 && carry <> 1 then fail $"the division's carry is 0 or 1, not {carry}"
@@ -1327,7 +1347,12 @@ and withCursor (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit ->
   let reg =
     match ctx.freeRegs with
     | r :: rest -> ctx.freeRegs <- rest; r
-    | [] -> fail "too many live cursors at once (r1..r5)"
+    | [] ->
+      let held = [ for KeyValue(c, cr) in ctx.cursors do if not (ctx.released.Contains c) then $"{c.Name} (r{cr.reg})" ]
+      let others = [ for KeyValue((i, n), (r, _)) in ctx.indexed -> $"{n}[{i.Name}] (r{r})" ]
+      let holders = String.Join(", ", held @ others |> List.distinct)
+      fail ($"{v.Name}: too many live cursors at once (r1..r5 hold {holders}). " +
+            "A cursor gives its register back once no code still to run reads it: read the others first, or index the array with s.field[Frac.index k]")
   match over, tryConst ctx start with
   | None, Some(:? Frac as f) when f.Raw = 0 -> importHere ctx region.name region.abiSymbol (move (immL 0) (R reg))
   | None, _ ->
@@ -1704,22 +1729,39 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
       // X and Y arrays stepped together: the X ones from r1..r3, the Y ones from r4, r5, so an
       // X load and a Y load can share one instruction (an XY move takes a register of each bank)
       let mixed = arrays.Keys |> Seq.map (fun name -> (field ctx name).bank) |> Seq.distinct |> Seq.length > 1
+      let owners = ResizeArray<int * Field>()    // the registers this loop steps, the array each starts on
       let regs =
         [ for KeyValue(name, _) in arrays do
             let f = field ctx name
             let preferred =
               if not mixed then None
               else ctx.freeRegs |> List.tryFind (fun r -> (r >= 4) = (f.bank = YMemory))
-            let reg =
+            let fresh =
               match preferred, ctx.freeRegs with
-              | Some r, _ -> ctx.freeRegs <- ctx.freeRegs |> List.filter ((<>) r); r
-              | None, r :: rest -> ctx.freeRegs <- rest; r
-              | None, [] -> fail "too many live cursors and indexed arrays at once (r1..r5)"
-            emit ctx (move r6 a)
-            emit ctx (add (immL (f.offset + lo)) a)
-            emit ctx (move a1 (R reg))
-            ctx.indexed <- ctx.indexed.Add((v, name), reg)
-            reg ]
+              | Some r, _ -> ctx.freeRegs <- ctx.freeRegs |> List.filter ((<>) r); Some r
+              | None, r :: rest -> ctx.freeRegs <- rest; Some r
+              | None, [] -> None
+            match fresh with
+            | Some reg ->
+              emit ctx (move r6 a)
+              emit ctx (add (immL (f.offset + lo)) a)
+              emit ctx (move a1 (R reg))
+              ctx.indexed <- ctx.indexed.Add((v, name), (reg, 0))
+              owners.Add((reg, f))
+              yield reg
+            | None when owners.Count > 0 ->
+              // no register left: every array here steps by one word a pass, so this one rides on
+              // a register the loop already steps, at its distance from that one's array
+              // (`x:(r1+d)`: a word more, and no parallel move)
+              let reg, o =
+                owners |> Seq.tryFind (fun (_, o) -> o.bank = f.bank) |> Option.defaultValue owners[0]
+              ctx.indexed <- ctx.indexed.Add((v, name), (reg, f.offset - o.offset))
+            | None ->
+              let held = [ for KeyValue(c, cr) in ctx.cursors do if not (ctx.released.Contains c) then $"{c.Name} (r{cr.reg})" ]
+              let others = [ for KeyValue((i, n), (r, _)) in ctx.indexed do if i <> v then $"{n}[{i.Name}] (r{r})" ]
+              let holders = String.Join(", ", held @ others |> List.distinct)
+              fail ($"{name}[{v.Name}]: no address register is free for the loop over {v.Name} (r1..r5 hold {holders}). " +
+                    $"End a cursor before the loop, or index with a word counted when running: s.{name}[Frac.index (Frac.ofRaw {v.Name})] (r0 and n0, no register held)") ]
       let counter =
         if counted then
           let h = alloc ctx TFrac

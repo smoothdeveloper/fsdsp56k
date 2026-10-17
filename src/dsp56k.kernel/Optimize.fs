@@ -179,6 +179,7 @@ let aluWrites (instr: Instr) =
   | IfCc(alu, _, _) -> Some(List.ofArray (Lower.aluWrites alu))
   | Tcc(_, alu, agu) -> Some([ for _, d in Option.toList alu -> Acc.reg d ] @ [ for _, r in Option.toList agu -> R r ])
   | Norm(r, d) -> Some [ Acc.reg d; R r ]
+  | Clb(_, d) | Normf(_, d) -> Some [ Acc.reg d ]
   | Nop -> Some []
   | _ -> None
 
@@ -375,7 +376,8 @@ let readsOf (instr: Instr) =
     Some(Array.append (alu |> Option.map Lower.aluReads |> Option.defaultValue [||]) (Array.collect Lower.moveReads moves))
   | MulI(_, _, _, src, d) | MulImm(_, _, src, _, d) -> Some [| src; Acc.reg d |]
   | MulSu(_, _, _, s1, s2, d) | Dmac(_, _, s1, s2, d) -> Some [| s1; s2; Acc.reg d |]
-  | Div(src, d) -> Some [| src; Acc.reg d |]
+  | Div(src, d) | Normf(src, d) -> Some [| src; Acc.reg d |]
+  | Clb(src, _) -> Some [| Acc.reg src |]
   | AluImm(_, _, d) | ShiftImm(_, _, _, d) | Inc d | Dec d -> Some [| Acc.reg d |]
   | Nop -> Some [||]
   | _ -> None
@@ -659,23 +661,96 @@ let fixLoops (items: (Item * int) array) =
     | _ -> out.Add(it, line)
   out.ToArray()
 
+/// The passes, each one switchable (for measuring what each does), and the guard that keeps a
+/// pass's rewrite only when it is no worse (`monotone`). fixLoops always runs: it is not an
+/// optimisation, it keeps DO loop ends legal.
+type Passes =
+  { forward     : bool   // value numbering: loads a register already holds dropped, others copied
+    accCopies   : bool   // the same, with copies between accumulators
+    copyForward : bool   // a copy's source read in place of the copy
+    deadTemps   : bool   // stores to X temporaries nothing reads dropped
+    hoist       : bool   // loads a DO loop does not change done once, before the loop
+    pack        : bool   // moves merged into parallel instructions
+    rotate      : bool   // one-stage software pipelining of DO loops
+    monotone    : bool } // each pass kept only when the static cost is no worse
+
+  static member all =
+    { forward = true; accCopies = true; copyForward = true; deadTemps = true; hoist = true; pack = true
+      rotate = true; monotone = true }
+
+  static member none =
+    { forward = false; accCopies = false; copyForward = false; deadTemps = false; hoist = false; pack = false
+      rotate = false; monotone = false }
+
+/// The switchable passes by name, with how to turn each off.
+let passes : (string * (Passes -> Passes)) list =
+  [ "forward",     (fun p -> { p with forward = false })
+    "accCopies",   (fun p -> { p with accCopies = false })
+    "copyForward", (fun p -> { p with copyForward = false })
+    "deadTemps",   (fun p -> { p with deadTemps = false })
+    "hoist",       (fun p -> { p with hoist = false })
+    "pack",        (fun p -> { p with pack = false })
+    "rotate",      (fun p -> { p with rotate = false }) ]
+
 type Level =
   | Direct            // the compiler's translation as it is
-  | Peephole          // value numbering, dead temporaries, packing
+  | Peephole          // every pass, guarded
+  | Chosen of Passes  // the passes chosen
+
+/// The static cost the guard compares: instructions weighted by the trip counts of the DO loops
+/// around them (a loop with a count only known when running weighs 32, one block), then the
+/// instruction count. Branches inside a loop count as taken on every pass: an upper bound.
+let staticCost (items: (Item * int) array) =
+  let mutable weighted = 0L
+  let mutable count = 0L
+  let mutable around : (string * int64) list = []
+  let trips () = around |> List.fold (fun t (_, n) -> t * n) 1L
+  for it, _ in items do
+    match it with
+    | Label l ->
+      while (match around with (e, _) :: _ when e = l -> true | _ -> false) do around <- List.tail around
+    | Op instr ->
+      weighted <- weighted + trips ()
+      count <- count + 1L
+      match instr with
+      | Loop(_, count', { expr = Sym e }) ->
+        let n =
+          match count' with
+          | Count { expr = Num n } when n > 0L -> n
+          | _ -> 32L
+        around <- (e, n) :: around
+      | _ -> ()
+    | _ -> ()
+  weighted, count
+
+/// The passes of `p`; the compiler's temporaries are X words `first` up to `temps`.
+let runWith (p: Passes) (first: int) (temps: int) (items: Item array) (lines: int array) =
+  let mutable cur = Array.zip items lines
+  // a pass's rewrite, kept when it is no worse (when the passes are guarded)
+  let step (on: bool) (pass: (Item * int) array -> (Item * int) array) =
+    if on then
+      let next = pass cur
+      if not p.monotone || staticCost next <= staticCost cur then cur <- next
+  for _ in 1 .. 3 do
+    step p.forward forward
+    step p.copyForward copyForward
+    step p.deadTemps (deadTempsFrom first temps)
+  for _ in 1 .. 2 do
+    step p.accCopies (forwardWith true)
+    step p.copyForward copyForward
+    step p.deadTemps (deadTempsFrom first temps)
+  step p.hoist hoist
+  step p.pack pack
+  step p.rotate (rotate >> (if p.pack then pack else id))
+  cur <- fixLoops cur
+  Array.map fst cur, Array.map snd cur
 
 /// The passes of `level`; the compiler's temporaries are X words `first` up to `temps`.
 let runFrom (level: Level) (first: int) (temps: int) (items: Item array) (lines: int array) =
   match level with
   | Direct -> items, lines
-  | Peephole ->
-    let mutable cur = Array.zip items lines
-    for _ in 1 .. 3 do
-      cur <- cur |> forward |> copyForward |> deadTempsFrom first temps
-    for _ in 1 .. 2 do
-      cur <- cur |> forwardWith true |> copyForward |> deadTempsFrom first temps
-    cur <- hoist cur
-    cur <- pack cur |> rotate |> pack |> fixLoops
-    Array.map fst cur, Array.map snd cur
+  | Peephole -> runWith Passes.all first temps items lines
+  | Chosen p -> runWith p first temps items lines
 
 /// The passes of `level`, for a kernel without [<XMemory>] state: temporaries are X words below `temps`.
 let run (level: Level) (temps: int) (items: Item array) (lines: int array) = runFrom level 0 temps items lines
