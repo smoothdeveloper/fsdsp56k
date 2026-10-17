@@ -5,10 +5,25 @@
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
+    <!-- source ranges in kernel quotations: the compiled listings quote the F# lines -->
+    <OtherFlags>$(OtherFlags) --quotations-debug+</OtherFlags>
     <GenerateProgramFile>false</GenerateProgramFile>
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="Kernels/Sine.fs" />
+    <Compile Include="Kernels/InputThru.fs" />
+    <Compile Include="Kernels/MainTap.fs" />
+    <Compile Include="Kernels/Pluck.fs" />
+    <Compile Include="Kernels/Tx6BdTables.fs" />
+    <Compile Include="Kernels/Tx6Bd.fs" />
+    <Compile Include="Kernels/Tx6TomTables.fs" />
+    <Compile Include="Kernels/Tx6Tom.fs" />
+    <Compile Include="Kernels/Tx6MetalTables.fs" />
+    <Compile Include="Kernels/Tx6Metal.fs" />
+    <Compile Include="Kernels/Tx6SdTables.fs" />
+    <Compile Include="Kernels/Tx6Sd.fs" />
+    <Compile Include="Kernels/Tx6CpTables.fs" />
+    <Compile Include="Kernels/Tx6Cp.fs" />
     <Compile Include="Kernels/Grading.fs" />
     <Compile Include="Fixtures.fs" />
     <Compile Include="Catalogue.fs" />

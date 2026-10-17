@@ -8,14 +8,21 @@ open System.Reflection
 open Microsoft.FSharp.Reflection
 open dsp56k.kernel.Kernel
 
-let private call (mi: MethodInfo) (args: obj array) =
+let private call (mi: MethodInfo) (args: (obj | null) array) =
   try mi.Invoke(null, args) |> ignore
   with :? TargetInvocationException as e when not (isNull e.InnerException) -> raise (nonNull e.InnerException)
 
 type Instance(target: Target, kernel: Kernel) =
   let layout = Kernel.layout target kernel
   let zero (t: Type) = Activator.CreateInstance t
-  let state = FSharpValue.MakeRecord(kernel.stateType, FSharpType.GetRecordFields kernel.stateType |> Array.map (fun p -> zero p.PropertyType))
+  let state : obj | null =
+    if kernel.stateType = typeof<unit> then null
+    else
+      let initial (f: Field) (p: PropertyInfo) =
+        match f.ty with
+        | TArray n -> box (Array.create n Frac.zero)
+        | _ -> zero p.PropertyType
+      FSharpValue.MakeRecord(kernel.stateType, Array.map2 initial layout.state (FSharpType.GetRecordFields kernel.stateType))
   let mutable parameters = FSharpValue.MakeRecord(kernel.paramsType, FSharpType.GetRecordFields kernel.paramsType |> Array.map (fun p -> zero p.PropertyType))
   let output = Output()
 
@@ -37,10 +44,15 @@ type Instance(target: Target, kernel: Kernel) =
 
   /// The state as workset words, from Y:(r6+stateBase).
   member _.StateWords() =
-    [| for f, p in Array.zip layout.state (FSharpType.GetRecordFields kernel.stateType) do
-         match p.GetValue state with
+    [| for f, p in Array.zip layout.state (if isNull state then [||] else FSharpType.GetRecordFields kernel.stateType) do
+         match p.GetValue(nonNull state) with
          | :? Frac as v -> v.Word
          | :? Long as v ->
            int ((v.Raw >>> 24) &&& 0xffffffL)
            int (v.Raw &&& 0xffffffL)
+         | :? Acc as v ->                           // a1, a0, then a2 sign-extended
+           int ((v.Raw >>> 24) &&& 0xffffffL)
+           int (v.Raw &&& 0xffffffL)
+           int ((v.Raw >>> 48) &&& 0xffffffL)
+         | :? (Frac array) as v -> yield! v |> Array.map _.Word
          | v -> failwith $"state field {f.name}: {v}" |]

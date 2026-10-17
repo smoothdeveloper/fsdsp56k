@@ -15,10 +15,17 @@ type Layout =
     services    : int        // P: the service stand-ins
     stub        : int        // P: the jsr/stop call stub
     trackMemory : int        // X: track 0's external memory (import 6)
-    sineTable   : int }      // X: the sine resource (import symbol 1); its contents are the caller's
+    sineTable   : int        // X: the sine resource (import symbol 1); its contents are the caller's
+    inputRing   : int        // X: the 256-word input ring (symbol 2)
+    inputPosition : int      // X: the input position word (symbol 3)
+    mainRing    : int        // X: the 256-word main-output ring (symbol 4)
+    mainPosition : int       // X: the main-output position word (symbol 5)
+    tempX       : int        // X: the 32-word shared temporary memory (symbol 7)
+    tempY       : int }      // Y: the same (symbol 8)
 
 let defaultLayout =
-  { programBase = 0x100; workset = 0x100; output = 0x200; services = 0xe00; stub = 0xef0; trackMemory = 0x10000; sineTable = 0 }
+  { programBase = 0x100; workset = 0x100; output = 0x200; services = 0xe00; stub = 0xef0; trackMemory = 0x10000; sineTable = 0
+    inputRing = 0; inputPosition = 0; mainRing = 0; mainPosition = 0; tempX = 0; tempY = 0 }
 
 type Bank =
   { words : int array
@@ -60,8 +67,13 @@ type Track(package: Mds.Package, machine: Mds.Machine option, layout: Layout, ba
         | 5, 9 -> serviceAt "SAMPLE_INFO"
         | 5, 10 -> serviceAt "SAMPLE_READ"
         | 1, 1 -> layout.sineTable
+        | 1, 2 -> layout.inputRing
+        | 1, 3 -> layout.inputPosition
+        | 1, 4 -> layout.mainRing
+        | 1, 5 -> layout.mainPosition
         | 2, 6 -> layout.trackMemory
-        | (3 | 4), _ -> 0                                   // temporary areas at X/Y:$0000
+        | 3, _ -> layout.tempX                              // temporary areas, X/Y:$0000 by default
+        | 4, _ -> layout.tempY
         | _ -> 0
       words[w] <- (words[w] + resourceBase) &&& 0xffffff
     emu.Load(Space.P, layout.programBase, words)

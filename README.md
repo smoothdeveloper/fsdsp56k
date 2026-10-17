@@ -21,7 +21,7 @@ them; samples and the command-line tool sit on top.
 | **Kernel F# (spike)** | |
 | `src/dsp56k.kernel.intrinsics` | `Frac`, `Acc`, `Long`, `Table`, `Output`: DSP56300 arithmetic as .NET code, each operation tagged with the compiler's intrinsic name |
 | `src/dsp56k.kernel` | Quotation compiler from `[<ReflectedDefinition>]` kernels to DSL items (direct translation, no optimisation yet), and a .NET host running the same kernel |
-| `src/dsp56k.kernel.grade` | Runs a scenario three ways (.NET kernel, compiled package, reference package) and reports correctness, fidelity, cost and listing alignment |
+| `src/dsp56k.kernel.grade` | Runs a scenario three ways (.NET kernel, compiled program, reference) on a harness (the MDS track, or a program image of your own loaded at fixed addresses) and reports correctness, fidelity, cost and listing alignment |
 | **On top** | |
 | `src/dsp56k.tool` | The `fsdsp56k` command line |
 | `samples` | DSL programs reproducing shipped machines word for word |
@@ -75,12 +75,51 @@ let render (p: Params) (s: State) (out: Output) =
   s.ampPrev <- p.amp
 ```
 
-The compiler translates directly (values through A, B, X0, Y0, spills to the X workset), so it
-is correct but slow. The tests grade it against the shipped
-`sine.mds`: output identical, word for word, to the .NET kernel and to the shipped machine;
-RENDER at 3.6 times the hand-written cycles; and each entry point's listing aligned with the
-reference disassembly. The tests run each intrinsic's .NET meaning against the emulator on
-random and extreme words.
+The compiler translates directly (values through A, B, X0, Y0, spills to the X workset);
+`Optimize.fs` then numbers values in straight-line code (dropping reloads and redundant stores),
+removes dead spills by liveness, forwards copies and packs moves into parallel slots. `Frac`
+locals worth it (uses weighted by loop trip counts) live in X1/Y1, multiplications place their
+factors around them, and constant factors ride in MPYI/MACI. State records hold `Frac`, `Long` (two words), `Acc` (three: kept exact,
+extension byte included) and fixed-length `[<Length n>] Frac array` fields read and written
+with constant indices or the loop's index (`s.h[i + 1]`, `Frac.ofRaw i`); helpers may take the
+parameter and state records. Beyond arithmetic, kernels use cursors (an address register walking a
+region, linear or modulo, with a step), firmware resources (the sine ROM, the input and
+main-output rings and their position words, the shared temporary memory), tables placed in
+program memory, MPYR/MACR, and an LFSR step.
+
+The TX6 kit's eight drums, by Matthew Fecher (AnalogMatthew) and Fadedlimes, published under the MIT licence in
+[etcetc000/kitbasher](https://github.com/etcetc000/kitbasher), are the most comprehensive suite of real machines
+the compiler is held to: glides, layered metal, noise and tables, each reproduced word for word. They are what
+made the compiler robust; many thanks to their authors.
+
+`tests/dsp56k.tests/Kernels` ports twelve machines: jmamma/MDS's four examples and all eight drums of kitbasher's
+TX6 kit (BD, LT, HT, CH, OH, CY, SD, CP, in five kernel files). The tests grade each against the machine it
+was ported from:
+
+| Kernel | Ported from | RENDER cycles |
+|---|---|---|
+| `Sine.fs` | jmamma/MDS examples/sine | x2.78 |
+| `InputThru.fs` | jmamma/MDS examples/imports/input_thru | x1.43 |
+| `MainTap.fs` | jmamma/MDS examples/imports/main_tap | x1.77 |
+| `Pluck.fs` | jmamma/MDS examples/imports/pluck | x1.55 |
+| `Tx6Bd.fs` | kitbasher mds/tx6/bd (MIT) | x2.11 |
+| `Tx6Tom.fs` (LT, HT) | kitbasher mds/tx6/lt, ht (MIT) | x2.05, x2.07 |
+| `Tx6Metal.fs` (CH, OH, CY) | kitbasher mds/tx6/ch, oh, cy (MIT) | x2.03 each |
+| `Tx6Sd.fs` | kitbasher mds/tx6/sd (MIT) | x1.84 |
+| `Tx6Cp.fs` | kitbasher mds/tx6/cp (MIT) | x1.95 |
+
+The TX6 toms and hats are one engine each, parameterized by a `Voice` record the compiler
+reads: LT's pitch glide (`if voice.glide`) and CY's bell layer (`match voice.layer with ...`)
+are decided when compiling, so each kernel contains only its own code.
+
+Each is word for word identical to the shipped machine on the emulator, and to the same F# run
+as .NET code. The page shows per kernel the verdicts, the output over the reference (SVG), the
+cycles of every call against the track limit, the costs, and three listings side by side: the F#
+kernel, the generated assembly (hovering a line highlights the F# it came from and back; kernels
+are compiled with `--quotations-debug+` for the source ranges) and the source it was ported
+from, plus each entry point aligned with the reference's disassembly. The tests run each
+intrinsic's .NET meaning against the emulator on random and extreme words, and every sample's
+grade.
 
 ## The tool
 

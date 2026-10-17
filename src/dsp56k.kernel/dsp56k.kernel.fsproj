@@ -8,6 +8,7 @@
   <ItemGroup>
     <Compile Include="Kernel.fs" />
     <Compile Include="Compile.fs" />
+    <Compile Include="Optimize.fs" />
     <Compile Include="Host.fs" />
   </ItemGroup>
   <ItemGroup>

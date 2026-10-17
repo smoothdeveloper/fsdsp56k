@@ -1,6 +1,8 @@
 /// Grading a compiled kernel. One scenario (parameter settings, INIT, TRIG, RENDER blocks) runs
-/// three ways: the kernel as .NET code, the compiled package on the emulator and, when there is
-/// one, a reference package (a shipped machine) on the emulator. The grade reports
+/// three ways: the kernel as .NET code, the compiled program on the emulator and, when there is
+/// one, a reference on the emulator. Where programs run is a `Harness`: the Machinedrum MDS
+/// track (packages, the shipped machines as references) or a firmware's DSP (`firmware`, with
+/// routines at absolute addresses as references, `image`). The grade reports
 ///
 /// - correctness: the compiled program against the .NET kernel, output and state, word for word;
 /// - fidelity: the compiled program's output against the reference's, word for word;
@@ -60,52 +62,120 @@ let compare what (expected: int array array) (actual: int array array) =
     Some { what = what; block = b; index = i; expected = e; actual = a; differing = pairs.Length }
 
 // ---------------------------------------------------------------------------------------------
-// Executions.
+// Harnesses: where a program runs and how it is called.
 
-let layout = { Track.defaultLayout with sineTable = 0x8000 }
+/// A program loaded on an emulator, called the way its host calls a machine.
+type Session =
+  inherit IDisposable
+  abstract Emulator : Emulator
+  /// The workset's address (r6 on each call).
+  abstract Workset : int
+  /// Parameter words, parameter 0 first, where the target reads them.
+  abstract SetParameters : int array -> unit
+  /// Each call returns its cycles (0 for an entry the program does not have).
+  abstract Init : unit -> int64
+  abstract Trig : unit -> int64
+  /// One RENDER: the block's words (Target.blockWords) and the cycles.
+  abstract Render : unit -> int array * int64
+
+/// A program ready to run: the compiled kernel or a reference.
+type Program =
+  { name           : string
+    programWords   : int
+    xWorkset       : int
+    yWorkset       : int
+    declaredCycles : int            // the RENDER budget the program declares (0: none)
+    items          : Item array     // its listing, entries labelled INIT, TRIG, RENDER, for the shape ([||]: none)
+    start          : unit -> Session }
+
+/// Where kernels are graded: the target they compile for, how front-panel settings become
+/// parameter words, and how a compiled kernel becomes a Program.
+type Harness =
+  { name           : string
+    target         : Kernel.Target
+    parameterNames : string array
+    settings       : float array -> int array
+    cycleLimit     : int option     // per RENDER call, when the host has one
+    load           : Compile.Compiled -> Result<Program, string> }
+
+/// The MDS harness memory map: the firmware resources where the intrinsics' stand-ins say they are.
+let layout =
+  { Track.defaultLayout with
+      sineTable = Rom.sine.address
+      inputRing = Input.ring.address; inputPosition = Input.position.address
+      mainRing = Main.ring.address; mainPosition = Main.position.address
+      tempX = Scratch.x.address; tempY = Scratch.y.address
+      trackMemory = Track.memory.address }
+
+/// The stand-ins' contents into the emulator.
+let loadResources (emu: Emulator) =
+  emu.Load(Native.Space.X, Rom.sine.address, Rom.sine.words)
+  emu.Load(Native.Space.X, Input.ring.address, Input.ring.words)
+  emu.Load(Native.Space.X, Main.ring.address, Main.ring.words)
+  emu.Write(Native.Space.X, Input.position.address, Input.position.value)
+  emu.Write(Native.Space.X, Main.position.address, Main.position.value)
+
+/// The import symbols of the stand-ins, at their addresses: a firmware map's `resources` for
+/// kernels that read them, with `loadResources` as its setup.
+let standIns =
+  Map [ 1, Rom.sine.address; 2, Input.ring.address; 3, Input.position.address; 4, Main.ring.address
+        5, Main.position.address; 6, Track.memory.address; 7, Scratch.x.address; 8, Scratch.y.address ]
 
 let parameterWords (machine: Mds.Machine) (settings: float array) =
   settings |> Array.mapi (fun i s -> Track.convert machine.parameters[i] s)
 
-let runNet (target: Kernel.Target) (machine: Mds.Machine) (k: Kernel.Kernel) (scenario: Scenario) =
+/// The .NET side's shared temporary memory is one array per region, as on the DSP: kernels run
+/// on .NET one at a time.
+let sharedMemory = obj ()
+
+let runNet (h: Harness) (k: Kernel.Kernel) (scenario: Scenario) =
+  let target = h.target
+  lock sharedMemory (fun () ->
+  // shared temporary memory starts cleared, as the emulator's does
+  Array.fill Scratch.x.words 0 Scratch.x.words.Length 0
+  Array.fill Scratch.y.words 0 Scratch.y.words.Length 0
+  Array.fill Track.memory.words 0 Track.memory.words.Length 0
+  Track.current <- 0                    // the harness plays track 0
   let host = Host.Instance(target, k)
   let outputs, states = ResizeArray(), ResizeArray()
   for step in scenario.steps do
     match step with
-    | Settings s -> host.SetParameters(parameterWords machine s)
+    | Settings s -> host.SetParameters(h.settings s)
     | Words w -> host.SetParameters w
     | Init -> host.Init()
     | Trig -> host.Trig()
     | Render n ->
       for _ in 1 .. n do
-        outputs.Add(host.Render())
+        let words = host.Render()
+        if words.Length <> target.blockWords then
+          raise (Kernel.KernelError $"{k.name}: RENDER wrote {words.Length} words, the block is {target.blockText}")
+        outputs.Add words
         states.Add(host.StateWords())
-  { outputs = outputs.ToArray(); states = states.ToArray(); init = []; trig = []; render = [] }
+  { outputs = outputs.ToArray(); states = states.ToArray(); init = []; trig = []; render = [] })
 
-/// A package on the emulator; `stateWords` Y words from Y+stateBase are read after each block.
-let runTrack (package: Mds.Package) (machine: Mds.Machine) (stateBase: int) (stateWords: int) (scenario: Scenario) =
-  use track = new Track.Track(package, Some machine, layout, Map.empty)
-  let emu = track.Emulator
-  emu.Load(Native.Space.X, layout.sineTable, Rom.sine.words)
+/// A program on the emulator; `stateWords` Y words from Y:(r6+stateBase) are read after each block.
+let run (h: Harness) (p: Program) (stateWords: int) (scenario: Scenario) =
+  use session = p.start ()
+  let emu = session.Emulator
   let outputs, states = ResizeArray(), ResizeArray()
   let inits, trigs, renders = ResizeArray(), ResizeArray(), ResizeArray()
   for step in scenario.steps do
     match step with
-    | Settings s -> parameterWords machine s |> Array.iteri (fun i w -> track.SetParameter(i, w))
-    | Words w -> w |> Array.iteri (fun i w -> track.SetParameter(i, w))
-    | Init -> inits.Add(track.Init 0)
-    | Trig -> trigs.Add(track.Trig 0)
+    | Settings s -> session.SetParameters(h.settings s)
+    | Words w -> session.SetParameters w
+    | Init -> inits.Add(session.Init())
+    | Trig -> trigs.Add(session.Trig())
     | Render n ->
       for _ in 1 .. n do
-        let words, cycles = track.Render 0
+        let words, cycles = session.Render()
         outputs.Add words
         renders.Add cycles
-        states.Add [| for k in 0 .. stateWords - 1 -> emu.Read(Native.Space.Y, layout.workset + stateBase + k) |]
+        states.Add [| for k in 0 .. stateWords - 1 -> emu.Read(Native.Space.Y, session.Workset + h.target.stateBase + k) |]
   { outputs = outputs.ToArray(); states = states.ToArray()
     init = List.ofSeq inits; trig = List.ofSeq trigs; render = List.ofSeq renders }
 
 // ---------------------------------------------------------------------------------------------
-// Packaging.
+// The MDS harness: packages loaded the way the Machinedrum loader does it.
 
 type Built =
   { compiled : Compile.Compiled
@@ -132,6 +202,162 @@ let build (machine: Mds.Machine) (compiled: Compile.Compiled) =
       | Error e -> Error $"%A{e}"
       | Ok pkg -> Ok { compiled = compiled; machine = m; bytes = bytes; package = pkg }
 
+/// A package on track 0, the stand-ins loaded.
+let trackSession (package: Mds.Package) (machine: Mds.Machine) =
+  let track = new Track.Track(package, Some machine, layout, Map.empty)
+  loadResources track.Emulator
+  { new Session with
+      member _.Emulator = track.Emulator
+      member _.Workset = layout.workset
+      member _.SetParameters words = words |> Array.iteri (fun i w -> track.SetParameter(i, w))
+      member _.Init() = track.Init 0
+      member _.Trig() = track.Trig 0
+      member _.Render() = track.Render 0
+      member _.Dispose() = (track :> IDisposable).Dispose() }
+
+let mdsProgram name (package: Mds.Package) (machine: Mds.Machine) (items: Item array) =
+  { name = name; programWords = package.programWords.Length; xWorkset = machine.xWorkset; yWorkset = machine.yWorkset
+    declaredCycles = machine.maxTrackCycles; items = items; start = fun () -> trackSession package machine }
+
+/// MDS packages with `machine`'s identity and controls, on the Machinedrum track harness.
+let mdsHarness (machine: Mds.Machine) =
+  { name = "Machinedrum MDS"; target = Kernel.mds
+    parameterNames = machine.parameters |> Array.map _.name
+    settings = parameterWords machine
+    cycleLimit = Some Abi.trackCycleLimit
+    load = fun compiled -> build machine compiled |> Result.map (fun b -> mdsProgram compiled.kernel.name b.package b.machine compiled.items) }
+
+/// A shipped package (.mds bytes, or one machine of a .syx) as a reference, disassembled.
+let mdsReference (bytes: byte array) =
+  match Mds.read bytes, Import.package bytes with
+  | Ok pkg, Ok imported -> Ok(mdsProgram "reference" pkg imported.machine imported.items)
+  | Error e, _ -> Error $"reference: %A{e}"
+  | _, Error e -> Error $"reference: %A{e}"
+
+// ---------------------------------------------------------------------------------------------
+// Firmware harnesses: programs at absolute addresses, called the way a host program
+// calls a routine. The firmware's words and tables come from the caller.
+
+/// Where things are on the firmware's DSP.
+type FirmwareMap =
+  { memory     : int * int * int        // P, X, Y words of the emulator
+    workset    : int                    // r6 on each call
+    output     : int                    // r7 on each call: the RENDER block, in Y
+    stub       : int                    // P: three free words for the jsr/stop call stub
+    kernelBase : int                    // P: where a compiled kernel is loaded
+    registers  : (int * int) list       // further registers on each call (emulator codes), after r6, r7, m0..m7 linear
+    resources  : Map<int, int>          // MDS import symbol to address, for kernels reading firmware memory
+    setup      : Emulator -> unit       // what both programs find in memory (ROM tables, ...), once per session
+    maxCycles  : int }                  // per call
+
+let firmwareMap =
+  { memory = 0x10000, 0x10000, 0x10000; workset = 0x100; output = 0x200; stub = 0xff00; kernelBase = 0x1000
+    registers = []; resources = Map.empty; setup = ignore; maxCycles = 2_000_000 }
+
+/// A reference made of firmware routines: program words at absolute P addresses and the entry
+/// points a host program calls.
+type FirmwareImage =
+  { name         : string
+    program      : (int * int array) list                  // P words at absolute addresses
+    data         : (Native.Space * int * int array) list   // words loaded after the program: tables, patches
+    init         : int option                              // entry addresses (None: not called)
+    trig         : int option
+    render       : int
+    programWords : int                                     // the routines' size, for the cost
+    xWorkset     : int
+    yWorkset     : int
+    items        : Item array }                            // the routines, labelled INIT, TRIG, RENDER, for the shape
+
+/// A listing of firmware routines for the shape: `words` (loaded at `origin`) disassembled from
+/// the entry points, labelled with their names (INIT, TRIG, RENDER). Pass the routines' own span:
+/// every word becomes an instruction or `dc`, and jumps out of the span stay addresses.
+let disassemble (origin: int) (words: int array) (entries: (string * int) list) =
+  let relative = entries |> List.map (fun (name, address) -> address - origin, name)
+  let names = relative |> List.groupBy fst |> List.map (fun (pc, ns) -> pc, List.map snd ns) |> Map.ofList
+  Disassembler.items words (relative |> List.map fst |> Array.ofList) (names |> Map.map (fun _ ns -> List.head ns)) Set.empty
+  |> Array.collect (fun it ->
+    match it with
+    | Label n ->
+      // the other names of the same address, as labels beside it
+      match names |> Map.tryFindKey (fun _ ns -> List.head ns = n) with
+      | Some pc -> names[pc] |> List.map Label |> Array.ofList
+      | None -> [| it |]
+    | _ -> [| it |])
+
+/// An emulator with the map's memory, `load` run after the map's setup.
+let firmwareSession (target: Kernel.Target) (map: FirmwareMap) (load: Emulator -> unit) (init: int option, trig: int option, render: int) =
+  let p, x, y = map.memory
+  let emu = new Emulator(p, x, y)
+  map.setup emu
+  load emu
+  let call (entry: int option) =
+    match entry with
+    | None -> 0L
+    | Some address ->
+      emu.SetReg(22, map.workset)
+      emu.SetReg(23, map.output)
+      for m in 32 .. 39 do emu.SetReg(m, 0xffffff)
+      for r, v in map.registers do emu.SetReg(r, v)
+      match emu.Call(address, map.stub, map.maxCycles) with
+      | Some c -> c
+      | None -> failwith $"P:{address:x6} did not return within {map.maxCycles} cycles"
+  { new Session with
+      member _.Emulator = emu
+      member _.Workset = map.workset
+      member _.SetParameters words = words |> Array.iteri (fun i w -> emu.Write(Native.Space.Y, map.workset + target.paramBase + i, w))
+      member _.Init() = call init
+      member _.Trig() = call trig
+      member _.Render() =
+        let cycles = call (Some render)
+        [| for i in 0 .. target.blockWords - 1 -> emu.Read(Native.Space.Y, map.output + i) |], cycles
+      member _.Dispose() = (emu :> IDisposable).Dispose() }
+
+/// The compiled kernel's words at `map.kernelBase`, relocated and its imports patched from
+/// `map.resources`, and its entry addresses.
+let place (map: FirmwareMap) (compiled: Compile.Compiled) =
+  match Assembler.assembleItems compiled.items with
+  | Error e -> Error(Assembler.errorText e)
+  | Ok r ->
+    let org, image = Assembler.image dsp56k.Space.P r
+    let words = Array.copy image
+    let at label delta = int r.symbols[label] - org + delta
+    let missing =
+      [ for patch in Abi.patches compiled.items do
+          match patch with
+          | Mds.Relocation(l, d) -> words[at l d] <- (words[at l d] + map.kernelBase) &&& 0xffffff
+          | Mds.Import(l, d, kind, symbol) ->
+            match map.resources.TryFind symbol with
+            | Some address -> words[at l d] <- (words[at l d] + address) &&& 0xffffff
+            | None -> yield $"import kind {kind} symbol {symbol}" ]
+    if not missing.IsEmpty then Error $"""{compiled.kernel.name}: the firmware map has no address for {String.concat ", " (List.distinct missing)}"""
+    else
+      let entry name = map.kernelBase + int r.symbols[name] - org
+      Ok(words, (entry "INIT", entry "TRIG", entry "RENDER"))
+
+/// Compiled kernels on a firmware's DSP: placed at `map.kernelBase` and called the way a host
+/// program calls a routine. Settings are refused until the caller gives `settings`.
+let firmware (target: Kernel.Target) (map: FirmwareMap) =
+  { name = target.name; target = target
+    parameterNames = [||]
+    settings = fun _ -> raise (Kernel.KernelError $"{target.name}: this harness has no settings conversion; give parameter words (Words), or the harness's settings")
+    cycleLimit = None
+    load = fun compiled ->
+      place map compiled
+      |> Result.map (fun (words, (init, trig, render)) ->
+        { name = compiled.kernel.name; programWords = words.Length; xWorkset = compiled.xWorkset; yWorkset = compiled.layout.yWorkset
+          declaredCycles = 0; items = compiled.items
+          start = fun () -> firmwareSession target map (fun emu -> emu.Load(Native.Space.P, map.kernelBase, words)) (Some init, Some trig, render) }) }
+
+/// A firmware image as a reference on the same map.
+let image (target: Kernel.Target) (map: FirmwareMap) (img: FirmwareImage) =
+  { name = img.name; programWords = img.programWords; xWorkset = img.xWorkset; yWorkset = img.yWorkset
+    declaredCycles = 0; items = img.items
+    start = fun () ->
+      let load (emu: Emulator) =
+        for address, words in img.program do emu.Load(Native.Space.P, address, words)
+        for space, address, words in img.data do emu.Load(space, address, words)
+      firmwareSession target map load (img.init, img.trig, img.render) }
+
 // ---------------------------------------------------------------------------------------------
 // Shape: listings side by side.
 
@@ -142,16 +368,21 @@ let canonical (it: Item) =
 
 let mnemonic (text: string) = (text.Split([| ' '; '\t' |], StringSplitOptions.RemoveEmptyEntries)).[0]
 
-/// The instructions under each entry label, in listing order.
+/// The instructions under each entry label, in listing order. Entry labels with nothing between
+/// them (INIT and TRIG at one address) share what follows.
 let sections (items: Item array) =
-  let mutable current = ""
+  let mutable current = []
+  let mutable adjacent = false
   let found = Collections.Generic.Dictionary<string, ResizeArray<string>>()
   for it in items do
     match it with
     | Label name when Array.contains name entries ->
-      current <- name
+      current <- if adjacent then name :: current else [ name ]
+      adjacent <- true
       found[name] <- ResizeArray()
-    | Op _ when current <> "" -> found[current].Add(canonical it)
+    | Op _ when not current.IsEmpty ->
+      adjacent <- false
+      for c in current do found[c].Add(canonical it)
     | _ -> ()
   entries |> Array.map (fun e -> e, (match found.TryGetValue e with | true, l -> l.ToArray() | _ -> [||]))
 
@@ -202,52 +433,66 @@ type Cost =
     renderMean   : float
     renderWorst  : int64 }
 
-let cost (pkg: Mds.Package) (m: Mds.Machine) (r: Run) =
+let cost (p: Program) (r: Run) =
   let worst xs = if List.isEmpty xs then 0L else List.max xs
-  { programWords = pkg.programWords.Length; xWorkset = m.xWorkset; yWorkset = m.yWorkset
+  { programWords = p.programWords; xWorkset = p.xWorkset; yWorkset = p.yWorkset
     init = worst r.init; trig = worst r.trig
     renderMean = (if r.render.IsEmpty then 0.0 else List.averageBy float r.render); renderWorst = worst r.render }
 
 type Report =
   { kernel      : string
     scenario    : string
+    steps       : Step list
     blocks      : int
+    harness     : Harness
+    compiled    : Compile.Compiled
+    program     : Program                 // the compiled kernel, as the harness loads it
+    net         : Run                     // the .NET kernel
+    dsp         : Run                     // the compiled program on the emulator
+    refRun      : Run option              // the reference on the emulator
+    refItems    : Item array              // the reference's listing
     correctness : Mismatch list           // compiled vs .NET kernel
     fidelity    : Mismatch option option  // compiled vs reference (None: no reference)
     ours        : Cost
     reference   : Cost option
     shapes      : Shape array }
 
-/// Compile, build, run and compare. `reference` is a shipped package, when there is one.
+/// Compile for the harness's target, load, run and compare. `reference` is the program the
+/// kernel reproduces, when there is one.
+let gradeWith (h: Harness) (k: Kernel.Kernel) (reference: Program option) (scenario: Scenario) =
+  let target = h.target
+  Optimize.compile Optimize.Peephole target k
+  |> Result.bind (fun compiled -> h.load compiled |> Result.map (fun p -> compiled, p))
+  |> Result.bind (fun (compiled, program) ->
+    try
+      let stateWords = compiled.layout.yWorkset - target.stateBase
+      let net = runNet h k scenario
+      let dsp = run h program stateWords scenario
+      let correctness = [ compare "output" net.outputs dsp.outputs; compare "state" net.states dsp.states ] |> List.choose id
+      let refRun = reference |> Option.map (fun r -> run h r 0 scenario)
+      let shapes =
+        match reference with
+        | Some r when r.items.Length > 0 ->
+          let theirs = sections r.items |> Map.ofArray
+          sections compiled.items |> Array.map (fun (e, o) -> align e o (theirs.TryFind e |> Option.defaultValue [||]))
+        | _ -> [||]
+      Ok { kernel = k.name; scenario = scenario.name; steps = scenario.steps; blocks = dsp.outputs.Length
+           harness = h; compiled = compiled; program = program
+           net = net; dsp = dsp; refRun = refRun; refItems = (reference |> Option.map _.items |> Option.defaultValue [||])
+           correctness = correctness
+           fidelity = refRun |> Option.map (fun r -> compare "output" r.outputs dsp.outputs)
+           ours = cost program dsp
+           reference = Option.map2 cost reference refRun
+           shapes = shapes }
+    with Kernel.KernelError m -> Error m)
+
+/// On the MDS harness; `reference` is a shipped package, when there is one.
 let grade (k: Kernel.Kernel) (machine: Mds.Machine) (reference: byte array option) (scenario: Scenario) =
-  let target = Kernel.mds
-  Compile.compile target k
-  |> Result.bind (build machine)
-  |> Result.bind (fun built ->
-    let layout = built.compiled.layout
-    let stateWords = layout.yWorkset - target.stateBase
-    let net = runNet target machine k scenario
-    let dsp = runTrack built.package built.machine target.stateBase stateWords scenario
-    let correctness = [ compare "output" net.outputs dsp.outputs; compare "state" net.states dsp.states ] |> List.choose id
-    let refRun, refCost, shapes =
-      match reference with
-      | None -> None, None, [||]
-      | Some bytes ->
-        match Mds.read bytes, Import.package bytes with
-        | Ok pkg, Ok imported ->
-          let refMachine = imported.machine
-          let r = runTrack pkg refMachine target.stateBase 0 scenario
-          let ours = sections built.compiled.items
-          let theirs = sections imported.items |> Map.ofArray
-          Some r, Some(cost pkg refMachine r), ours |> Array.map (fun (e, o) -> align e o theirs[e])
-        | Error e, _ -> failwithf "reference: %A" e
-        | _, Error e -> failwithf "reference: %A" e
-    Ok { kernel = k.name; scenario = scenario.name; blocks = dsp.outputs.Length
-         correctness = correctness
-         fidelity = refRun |> Option.map (fun r -> compare "output" r.outputs dsp.outputs)
-         ours = cost built.package built.machine dsp
-         reference = refCost
-         shapes = shapes })
+  let reference =
+    match reference with
+    | None -> Ok None
+    | Some bytes -> mdsReference bytes |> Result.map Some
+  reference |> Result.bind (fun r -> gradeWith (mdsHarness machine) k r scenario)
 
 let text (r: Report) =
   let mismatch (m: Mismatch) =

@@ -21,6 +21,13 @@ type IntrinsicAttribute(name: string) =
 type ConstAttribute() =
   inherit Attribute()
 
+/// The number of words of a `Frac array` state field: `[<Length 4>] mutable history : Frac array`.
+/// Elements are read and written with constant indices.
+[<AttributeUsage(AttributeTargets.Property ||| AttributeTargets.Field, AllowMultiple = false)>]
+type LengthAttribute(words: int) =
+  inherit Attribute()
+  member _.Words = words
+
 module Bits =
   let sext24 (v: int) = (v <<< 8) >>> 8
   let sext48 (v: int64) = (v <<< 16) >>> 16
@@ -50,6 +57,14 @@ type Frac =
   /// $7fffff, the largest fraction.
   [<Const>]
   static member one = { Frac.Raw = 0x7fffff }
+
+  /// One step of a 24-bit shift register: shifted left, the taps XORed in when the bit shifted
+  /// out was set (`lsl a` `bcc` `eor #taps,a`).
+  [<Intrinsic "frac.lfsr">]
+  static member lfsr (taps: int) (state: Frac) =
+    let w = state.Word
+    let shifted = (w <<< 1) &&& 0xffffff
+    Frac.ofRaw (if w &&& 0x800000 <> 0 then shifted ^^^ Bits.word taps else shifted)
 
   /// Frac * Frac: `mpy`, the 48-bit fractional product in an accumulator (-1 * -1 is +1, held
   /// in the extension).
@@ -120,9 +135,41 @@ and [<Struct>] Acc =
     let a1 = (u >>> 24) &&& (int64 (Bits.word mask))
     { Acc.Raw = Bits.sext56 ((u &&& ~~~(0xffffffL <<< 24)) ||| (a1 <<< 24)) }
 
-  /// acc + x * y: `mac`.
+  /// acc + x * y: `mac`. (`acc + x * y` and `acc - x * y` compile to MAC too.)
   [<Intrinsic "acc.mac">]
   static member mac (acc: Acc) (x: Frac) (y: Frac) = acc + x * y
+
+  /// `asl a` then `rep #24` `div s,a`: non-restoring division, the quotient building up in a0
+  /// (as the DSP computes it: each step shifts the carry in, then adds or subtracts the divisor
+  /// by the signs of a and s).
+  [<Intrinsic "acc.divide">]
+  static member divide (a: Acc) (s: Frac) =
+    let mask = (1L <<< 56) - 1L
+    let mutable d = a.Raw &&& mask
+    let mutable c = (d >>> 55) &&& 1L
+    d <- (d <<< 1) &&& mask
+    let sv = int64 s.Raw <<< 24
+    let s23 = if s.Raw < 0 then 1L else 0L
+    for _ in 1 .. 24 do
+      let d55 = (d >>> 55) &&& 1L
+      let shifted = ((d <<< 1) ||| c) &&& mask
+      d <- (if d55 ^^^ s23 = 1L then shifted + sv else shifted - sv) &&& mask
+      c <- 1L - ((d >>> 55) &&& 1L)
+    { Acc.Raw = Bits.sext56 d }
+
+  /// `rnd a`: convergent rounding into a1 (to even on a tie), a0 cleared. `Acc.rnd (x * y)` is
+  /// MPYR and `Acc.rnd (acc ± x * y)` MACR.
+  [<Intrinsic "acc.rnd">]
+  static member rnd (a: Acc) =
+    let low = a.Raw &&& 0xffffffL
+    let down = a.Raw - low
+    let up = down + 0x1000000L
+    let r =
+      if low > 0x800000L then up
+      elif low < 0x800000L then down
+      elif (down >>> 24) &&& 1L = 1L then up
+      else down
+    { Acc.Raw = Bits.sext56 r }
 
 /// Two words a1:a0 (48 bits): what a workset field holds of an accumulator.
 and [<Struct>] Long =
@@ -140,19 +187,29 @@ and [<Struct>] Long =
 
 /// Where a table's words are on the DSP.
 type TableSource =
-  /// A firmware resource, read through a loader-patched address (MDS import kind 1).
+  /// A firmware resource in X memory, read through a loader-patched address (MDS import kind 1).
   | Resource of abiSymbol: int
+  /// Words emitted after the machine's code, read from P memory.
+  | Program
 
-/// A read-only table in X memory. The words are what the .NET side reads; for a resource they
-/// are a stand-in that the harness loads in the firmware's place.
+/// A read-only table. The words are what the .NET side reads; for a resource they are a stand-in
+/// the harness loads at `address` in the firmware's place.
 type Table =
-  { name   : string
-    source : TableSource
-    words  : int array }
+  { name    : string
+    source  : TableSource
+    address : int
+    words   : int array }
 
-  /// `move x:(rn+table),d` with the index in rn.
+  /// `move x:(rn+table),d` (a resource) or `move p:(rn),d` (program words), the index in rn.
   [<Intrinsic "table.read">]
   static member read (t: Table) (index: Frac) = Frac.ofRaw t.words[index.Raw]
+
+  /// Word `col` of row `row` in a table of rows `width` words wide.
+  [<Intrinsic "table.row">]
+  static member row (t: Table) (width: int) (row: Frac) (col: int) = Frac.ofRaw t.words[row.Raw * width + col]
+
+  /// A table placed in the program.
+  static member program name (words: int array) = { name = name; source = Program; address = 0; words = Array.map Bits.word words }
 
 module Rom =
   /// The 32,768-word sine resource (MDS symbol 1). The firmware's contents are not published;
@@ -160,9 +217,127 @@ module Rom =
   let sine =
     { name = "sine"
       source = Resource 1
+      address = 0x8000
       words = Array.init 32768 (fun i -> (Frac.q23 (Math.Sin(2.0 * Math.PI * float i / 32768.0))).Word) }
 
-/// The block being rendered: one word per frame.
+type Bank =
+  | XMemory
+  | YMemory
+
+/// Memory a cursor walks through: firmware memory whose address the loader patches in (MDS
+/// import `abiSymbol`). `address` is where the harness places it; `words` its contents for the
+/// .NET side (the harness loads the same).
+type Region =
+  { name      : string
+    bank      : Bank
+    abiSymbol : int
+    address   : int
+    words     : int array }
+
+  /// The region's first address (`move #>region,d`).
+  [<Intrinsic "region.address">]
+  static member addressOf (r: Region) = Frac.ofRaw r.address
+
+/// A firmware word at a loader-patched address (`move x:>cell,d`); `value` is what the harness
+/// puts there.
+type Cell =
+  { name      : string
+    abiSymbol : int
+    address   : int
+    mutable value : int }
+
+  [<Intrinsic "cell.read">]
+  static member read (c: Cell) = Frac.ofRaw c.value
+
+/// An address register walking a region: `(rn)+`, `(rn)+nn`, with modulo addressing over the
+/// region for a ring. Bind it with `let` (one register for the binding's scope).
+[<AllowNullLiteral>]
+type Cursor(region: Region, start: int, step: int, modulo: int) =
+  let mutable i = start
+  // modulo addressing with M = modulo (0: linear): the ring is the M + 1 words from the multiple
+  // of the next power of two at or below the address
+  let advance () =
+    let next = i + step
+    if modulo = 0 then i <- next
+    else
+      let mutable size = 1
+      while size <= modulo do size <- size * 2
+      let lower = (region.address + i) / size * size - region.address
+      i <- if next > lower + modulo then next - (modulo + 1) elif next < lower then next + (modulo + 1) else next
+
+  /// Read and move on: `move x:(rn)+,d`.
+  [<Intrinsic "cursor.next">]
+  member _.Next() =
+    let v = region.words[i]
+    advance ()
+    Frac.ofRaw v
+
+  /// Read in place: `move x:(rn),d`.
+  [<Intrinsic "cursor.peek">]
+  member _.Peek() = Frac.ofRaw region.words[i]
+
+  /// Write and move on: `move s,x:(rn)+`.
+  [<Intrinsic "cursor.put">]
+  member _.Put(f: Frac) =
+    region.words[i] <- f.Word
+    advance ()
+
+  /// Where the cursor is, as an offset in the region.
+  [<Intrinsic "cursor.position">]
+  member _.Position() = Frac.ofRaw i
+
+  /// Linear addressing from word `start` of the region, one word a step.
+  [<Intrinsic "cursor.linear">]
+  static member linear (r: Region) (start: Frac) = Cursor(r, start.Raw, 1, 0)
+
+  /// Modulo addressing over the region (its size a power of two) from `start`, `step` words a step.
+  [<Intrinsic "cursor.ring">]
+  static member ring (r: Region) (start: Frac) (step: int) = Cursor(r, start.Raw, step, r.words.Length - 1)
+
+  /// Modulo addressing with a modulus known when running: the ring is `last + 1` words (`last`
+  /// is what goes in the M register), one word a step.
+  [<Intrinsic "cursor.modulo">]
+  static member modulo (r: Region) (start: Frac) (last: Frac) = Cursor(r, start.Raw, 1, last.Raw)
+
+/// The shared temporary memory (MDS imports 7 and 8): 32 words each, not kept between calls.
+module Scratch =
+  let x = { name = "scratch_x"; bank = XMemory; abiSymbol = 7; address = 0x400; words = Array.zeroCreate 32 }
+  let y = { name = "scratch_y"; bank = YMemory; abiSymbol = 8; address = 0x400; words = Array.zeroCreate 32 }
+
+/// The audio inputs: a 256-word ring of pairs (input A, input B), and the word holding where the
+/// input is now (MDS imports 2 and 3). The harness fills the ring with a test signal.
+module Input =
+  let ring =
+    { name = "input"; bank = XMemory; abiSymbol = 2; address = 0x500
+      words = Array.init 256 (fun i ->
+        let frame = float (i / 2)
+        let v = if i % 2 = 0 then 0.6 * Math.Sin(2.0 * Math.PI * frame / 37.0) else 0.4 * Math.Sin(2.0 * Math.PI * frame / 11.0) + 0.2
+        (Frac.q23 v).Word) }
+  let position = { name = "input_position"; abiSymbol = 3; address = 0x600; value = 0x500 + 0x80 }
+
+/// The main output: the last four 64-word blocks, pairs (MDS imports 4 and 5), and the word
+/// holding the address of the block to read now.
+module Main =
+  let ring =
+    { name = "main"; bank = XMemory; abiSymbol = 4; address = 0x900
+      words = Array.init 256 (fun i ->
+        let frame = float (i / 2)
+        let v = if i % 2 = 0 then 0.7 * Math.Sin(2.0 * Math.PI * frame / 29.0) else -0.5 * Math.Sin(2.0 * Math.PI * frame / 13.0)
+        (Frac.q23 v).Word) }
+  let position = { name = "main_position"; abiSymbol = 5; address = 0x601; value = 0x900 + 0xc0 }
+
+/// The track the machine plays on, and the tracks' external memory (MDS import 6: 1,536 words a
+/// track, X and Y the same storage; the harness gives it Y memory).
+type Track =
+  /// The track number the firmware passes in R1, 0..15 (`current` on the .NET side).
+  [<Intrinsic "track.number">]
+  static member number () = Frac.ofRaw Track.current
+  static member val current = 0 with get, set
+  static member val memory =
+    { name = "track_memory"; bank = YMemory; abiSymbol = 6; address = 0x1000; words = Array.zeroCreate (1536 * 16) }
+
+/// The block being rendered: one word per frame, or a left, right pair per frame on a stereo
+/// target (Kernel.Target.channels).
 [<AllowNullLiteral>]
 type Output() =
   let words = ResizeArray<int>()
@@ -170,6 +345,12 @@ type Output() =
   /// `move d,y:(r7)+`.
   [<Intrinsic "out.write">]
   member _.Write(f: Frac) = words.Add f.Word
+
+  /// One stereo frame: `move l,y:(r7)+` `move r,y:(r7)+`.
+  [<Intrinsic "out.pair">]
+  member _.WritePair(left: Frac, right: Frac) =
+    words.Add left.Word
+    words.Add right.Word
 
   member _.Words = words.ToArray()
   member _.Clear() = words.Clear()
