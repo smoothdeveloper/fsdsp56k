@@ -152,6 +152,9 @@ type Ctx =
     subs     : Dictionary<MethodInfo, Sub>   // [<Subroutine>] helpers called, compiled after the entries
     floors   : Map<string, int>          // the least first word of a subroutine's (Refloor)
     kept     : HashSet<Var>                  // loops not unswitched: in [<NoUnswitch>] functions
+    mutable pending : Expr list              // code being generated that conts may not hold (a
+                                             // subroutine's body, a loop count, a cursor's start):
+                                             // what a call's frame must not overwrite either
     unswitchMax : int option                 // unswitch a loop only when its copy takes at most these words
     unswitchCosts : ResizeArray<int>         // the words each unswitched loop's copy took
     mutable inSub  : Sub option       // the subroutine being compiled
@@ -732,6 +735,14 @@ let thenRun (ctx: Ctx) (rest: Expr) (first: unit -> unit) =
   ctx.conts <- rest :: saved
   first ()
   ctx.conts <- saved
+
+/// Generate `first` with `es` read until it is done, for the frames of the subroutines it calls
+/// only (register choices do not see them).
+let pend (ctx: Ctx) (es: Expr list) (first: unit -> unit) =
+  let saved = ctx.pending
+  ctx.pending <- es @ saved
+  first ()
+  ctx.pending <- saved
 
 /// Generate a let's value knowing the value itself and the let's body still read what they read:
 /// the lets an inlined helper binds inside the value must not take the registers of the caller's
@@ -1356,7 +1367,7 @@ and withCursor (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit ->
   match over, tryConst ctx start with
   | None, Some(:? Frac as f) when f.Raw = 0 -> importHere ctx region.name region.abiSymbol (move (immL 0) (R reg))
   | None, _ ->
-    genWord ctx start
+    pend ctx [ value; bodyExpr ] (fun () -> genWord ctx start)
     importHere ctx region.name region.abiSymbol (move (immL 0) a)
     emit ctx (add x0 a)
     emit ctx (move a1 (R reg))
@@ -1369,14 +1380,14 @@ and withCursor (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit ->
       emit ctx (add (immL d) a)
       emit ctx (move a1 (R reg))
   | Some(f, _), _ ->
-    genWord ctx start
+    pend ctx [ value; bodyExpr ] (fun () -> genWord ctx start)
     emit ctx (move r6 a)
     emit ctx (add x0 a)
     if f.offset <> 0 then emit ctx (add (immL f.offset) a)
     emit ctx (move a1 (R reg))
   match modulus with
   | Some last ->
-    genWord ctx last
+    pend ctx [ value; bodyExpr ] (fun () -> genWord ctx last)
     emit ctx (movec x0 (M reg))
   | None -> if ring then emit ctx (movec (immL (region.words.Length - 1)) (M reg))
   if step <> 1 then emit ctx (move (immL (step &&& 0xffffff)) (N reg))
@@ -1676,7 +1687,7 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
     if body.GetFreeVars() |> Seq.contains v then
       fail $"{v.Name}: a loop counted when running (up to Frac.index ...) cannot read its index"
     let skip = fresh ctx "NONE"
-    thenRun ctx body (fun () -> genWord ctx w)
+    thenRun ctx body (fun () -> pend ctx [ hi ] (fun () -> genWord ctx w))
     emit ctx (move x0 a)
     let k = c - lo + 1
     if k <> 0 then emit ctx (add (immL (k &&& 0xffffff)) a) else emit ctx (tst a)
@@ -1843,6 +1854,35 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
 /// register), the caller's X1 and Y1 locals saved, the arguments loaded into their registers,
 /// bsr, the locals restored. The result is in X0 or A, where the expression generators leave
 /// theirs.
+/// The local word `i` (X words up to xLimit, then the Y words after the Y state).
+and homeAt (ctx: Ctx) (i: int) : Home =
+  let x = ctx.target.xLimit
+  if i < x then { space = Space.X; offset = i; ty = TFrac; reg = None; bound = infinity }
+  else { space = Space.Y; offset = ctx.layout.yWorkset + i - x; ty = TFrac; reg = None; bound = infinity }
+
+/// One past the last local word in use that code still to run may read: words of locals no
+/// code ahead reads are free, any other word in use (a spill, a counter, a word not known) is
+/// not. Below the entry's or the subroutine's first word, everything is the callers'.
+and liveTop (ctx: Ctx) =
+  let x = ctx.target.xLimit
+  let ahead = HashSet<Var>()
+  for e in ctx.pending @ ctx.conts do ahead.UnionWith(e.GetFreeVars())
+  let owners = Dictionary<int, bool>()        // a local's word -> one of the locals there is live
+  for KeyValue(v, h) in ctx.vars do
+    let local = h.reg.IsNone && ((h.space = Space.X && h.offset >= ctx.layout.xWorkset && h.offset < x)
+                                 || (h.space = Space.Y && h.offset >= ctx.layout.yWorkset))
+    if local then
+      let i = if h.space = Space.X then h.offset else h.offset - ctx.layout.yWorkset + x
+      for k in i .. i + words h.ty - 1 do
+        owners[k] <- (match owners.TryGetValue k with | true, l -> l | _ -> false) || ahead.Contains v
+  let first = match ctx.inSub with Some s -> s.start | None -> ctx.layout.xWorkset
+  let mutable top = first
+  for i in first .. ctx.next - 1 do
+    match owners.TryGetValue i with
+    | true, false -> ()
+    | _ -> top <- i + 1
+  top
+
 and callSub (ctx: Ctx) (mi: MethodInfo) (args: Expr list) =
   // B holds a caller's Acc local: that local goes to memory instead (the subroutine may use B)
   if ctx.bHeld then raise BTaken
@@ -1878,6 +1918,16 @@ and callSub (ctx: Ctx) (mi: MethodInfo) (args: Expr list) =
           | _ -> fail $"{mi.Name}: a [<Subroutine>] takes Frac, Acc and Long values and the records, not {v.Type.Name}" ]
   let fracs = values |> List.filter (fun (v, _) -> tyOf v.Type = TFrac)
   let accs = values |> List.filter (fun (v, _) -> tyOf v.Type <> TFrac)
+  // the caller's words the code after the call still reads: the subroutine's frame starts right
+  // above them, over the locals nothing reads again and the argument words (in registers by the
+  // bsr). The caller's X1 and Y1 locals are saved in the first words above, when they fit below
+  // the words in use (the arguments are computed above those)
+  let top = liveTop ctx
+  let kept = [ X1; Y1 ] |> List.filter (fun r -> not (List.contains r ctx.freeData))
+  let savedHomes =
+    if top + kept.Length <= ctx.next then [ for i in 0 .. kept.Length - 1 -> homeAt ctx (top + i) ]
+    else [ for _ in kept -> alloc ctx TFrac ]
+  let frame = if top + kept.Length <= ctx.next then top + kept.Length else ctx.next
   if fracs.Length > fracArgs.Length || accs.Length > accArgs.Length then
     fail $"{mi.Name}: a [<Subroutine>] takes up to {fracArgs.Length} Frac and {accArgs.Length} Acc or Long values"
   // the arguments in .NET's order, each knowing the later ones still read what they read
@@ -1913,12 +1963,8 @@ and callSub (ctx: Ctx) (mi: MethodInfo) (args: Expr list) =
           emitAll ctx (storeA t))
         v, Choice2Of2 t)
   // the caller's register locals: the subroutine may use X1 and Y1
-  let saved =
-    [ for r in [ X1; Y1 ] do
-        if not (List.contains r ctx.freeData) then
-          let t = alloc ctx TFrac
-          emit ctx (move r (at t 0))
-          yield r, t ]
+  let saved = List.zip kept savedHomes
+  for r, t in saved do emit ctx (move r (at t 0))
   let mutable nf, na = 0, 0
   for _, s in staged do
     match s with
@@ -1933,7 +1979,7 @@ and callSub (ctx: Ctx) (mi: MethodInfo) (args: Expr list) =
       emitAll ctx (loadWord w fracArgs[nf])
       nf <- nf + 1
     | Choice2Of2 _ -> ()
-  sub.sites.Add { next = ctx.next; freeRegs = ctx.freeRegs; depth = ctx.depth; caller = ctx.inSub }
+  sub.sites.Add { next = frame; freeRegs = ctx.freeRegs; depth = ctx.depth; caller = ctx.inSub }
   emit ctx (bsr sub.label)
   for r, t in saved do emit ctx (move (at t 0) r)
 
@@ -1943,7 +1989,7 @@ and compileSub (ctx: Ctx) (sub: Sub) =
   sub.compiled <- true
   let ps, body = parametersOf (reflected sub.mi).Value
   ctx.vars <- Map.empty; ctx.consts <- Map.empty; ctx.cursors <- Map.empty
-  ctx.indexed <- Map.empty; ctx.counters <- Map.empty; ctx.conts <- []
+  ctx.indexed <- Map.empty; ctx.counters <- Map.empty; ctx.conts <- []; ctx.pending <- []
   ctx.released.Clear(); ctx.deadLocals.Clear()
   ctx.freeData <- [ X1; Y1 ]; ctx.bHeld <- false; ctx.bWrite <- false; ctx.trackHome <- None
   ctx.freeRegs <- sub.sites |> Seq.map (fun s -> Set.ofList s.freeRegs) |> Set.intersectMany |> Set.toList
@@ -1976,10 +2022,11 @@ and compileSub (ctx: Ctx) (sub: Sub) =
       ctx.vars <- ctx.vars.Add(v, h)
   let body = ordered (normalize body)
   let r = sub.mi.ReturnType
-  if r = typeof<Frac> then genWord ctx body
-  elif r = typeof<Acc> then genAcc ctx body
-  elif r = typeof<Long> then genLong ctx body
-  else genStmt ctx body
+  pend ctx [ body ] (fun () ->
+    if r = typeof<Frac> then genWord ctx body
+    elif r = typeof<Acc> then genAcc ctx body
+    elif r = typeof<Long> then genLong ctx body
+    else genStmt ctx body)
   emit ctx rts
   sub.deepest <- ctx.deepest
   ctx.inSub <- None
@@ -2158,14 +2205,14 @@ let checkSize (c: Compiled) : Result<Compiled, string> =
     Error $"{c.kernel.name}: the program is {s.text}, over the {c.target.name} limit by {s.total - limit}: {why}"
   | _ -> Ok c
 
-/// The loops of [<NoUnswitch>] functions (or functions of [<NoUnswitch>] modules) a kernel's
+/// The loops of functions marked with `attr` (or functions of modules marked with it) a kernel's
 /// entries reach, themselves or through the helpers they call.
-let keptLoops (k: Kernel) =
+let markedLoops (attr: Type) (k: Kernel) =
   let kept = HashSet<Var>()
   let seen = HashSet<MethodInfo>()
   let marked (mi: MethodInfo) =
-    not (isNull (mi.GetCustomAttribute<NoUnswitchAttribute>()))
-    || (not (isNull mi.DeclaringType) && not (isNull (mi.DeclaringType.GetCustomAttribute<NoUnswitchAttribute>())))
+    not (isNull (mi.GetCustomAttribute attr))
+    || (match mi.DeclaringType with null -> false | t -> not (isNull (t.GetCustomAttribute attr)))
   let rec walk (keep: bool) (e: Expr) =
     match e with
     | ForIntegerRangeLoop(v, lo, hi, b) ->
@@ -2182,6 +2229,9 @@ let keptLoops (k: Kernel) =
     if seen.Add mi then reflected mi |> Option.iter (walk (marked mi))
   kept
 
+/// The loops of [<NoUnswitch>] functions (or functions of [<NoUnswitch>] modules).
+let keptLoops (k: Kernel) = markedLoops typeof<NoUnswitchAttribute> k
+
 /// A subroutine compiled below a call found later: compiled again from the start, each one's
 /// words from at least the given word.
 exception Refloor of Map<string, int>
@@ -2196,7 +2246,7 @@ let rec generateWith (floors: Map<string, int>) (unswitchMax: int option) (targe
         indexed = Map.empty; counters = Map.empty; freeData = [ X1; Y1 ]; scores = Dictionary(); deadLocals = HashSet()
         unswitched = HashSet(); bHeld = false; bWrite = false
         subs = Dictionary(); inSub = None; depth = 0; deepest = 0; floors = floors
-        kept = keptLoops k; unswitchMax = unswitchMax; unswitchCosts = ResizeArray() }
+        kept = keptLoops k; pending = []; unswitchMax = unswitchMax; unswitchCosts = ResizeArray() }
     entry ctx "INIT" k.init
     entry ctx "TRIG" k.trig
     entry ctx "RENDER" k.render

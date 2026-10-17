@@ -856,6 +856,50 @@ module Subs =
 
   let deepKernel = Kernel.define "probe-subroutines-deep" <@ init @> <@ deep @> <@ render @>
 
+/// Subroutine frames over the caller's dead locals: RENDER's Acc locals t1..t4 are read only
+/// before the call, so middle's frame (and leaf's above it) start below them; middle's own
+/// locals u, v, m are dead by its last call to leaf.
+[<ReflectedDefinition>]
+module Frames =
+  type S =
+    { mutable w : Frac
+      mutable z : Frac }
+
+  [<Subroutine>]
+  let leaf (s: S) (x: Frac) (y: Frac) =
+    let a = x * y
+    let b = Acc.sat (a + s.w * x)
+    let c = Acc.ofFrac b - y * b
+    let d = Acc.hi (c >>> 1)
+    Acc.sat (Acc.ofFrac d + Acc.sat c * x)
+
+  [<Subroutine>]
+  let middle (s: S) (x: Frac) =
+    let u = leaf s x s.w
+    let v = leaf s u x
+    let m = Acc.ofFrac v + u * x
+    let w = leaf s v (Acc.sat m)
+    Acc.sat (Acc.ofFrac w + v * x)
+
+  let init (_: Banks.P) (s: S) =
+    s.w <- Frac.ofRaw 0x123456
+    s.z <- Frac.zero
+
+  let trig (_: Banks.P) (_: S) = ()
+
+  let render (p: Banks.P) (s: S) (out: Output) =
+    for _ in 0 .. 31 do
+      let t1 = p.a * p.b
+      let t2 = p.c * p.d + t1
+      let t3 = t2 - p.a * p.c
+      let t4 = t3 + p.b * p.d - t1
+      let early = Acc.sat (t4 + (t2 >>> 1))
+      let r = middle s early
+      out.Write(Acc.sat (Acc.ofFrac r + p.d * early))
+      s.w <- Acc.hi (Acc.ofFrac r >>> 1)
+
+  let kernel = Kernel.define "probe-subroutine-frames" <@ init @> <@ trig @> <@ render @>
+
 /// Loops counted when running (TX8-CY's samples to the next oscillator edge): `for _ in 1 ..
 /// Frac.index n`, zero passes for a count of zero or less, a block split at a computed edge.
 [<ReflectedDefinition>]
@@ -1310,6 +1354,17 @@ let tests =
         match Optimize.compile Optimize.Peephole Kernel.mds Subs.deepKernel with
         | Ok _ -> failtest "compiled"
         | Error e -> Expect.stringContains e "takes 15 system stack levels" "six loops, the call, refresh's own loop"
+      }
+      test "frames over the caller's dead locals: compiled program equals the .NET kernel" {
+        needNative ()
+        conformance Frames.kernel 52
+      }
+      test "frames over the caller's dead locals: a chain of calls takes the words its live locals need" {
+        match Optimize.compile Optimize.Peephole Kernel.mds Frames.kernel with
+        | Error e -> failtest e
+        | Ok c ->
+          // stacked on the caller's every local (as before), the chain took 32 X words
+          Expect.isLessThanOrEqual c.xWorkset 17 "t1..t4 and middle's dead locals given to the frames"
       } ]
 
     test "loops counted when running: compiled program equals the .NET kernel" {
