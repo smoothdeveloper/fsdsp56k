@@ -1074,6 +1074,52 @@ module IndexArg =
 
   let kernel = Kernel.define "probe-index-arg" <@ init @> <@ trig @> <@ render @>
 
+/// Ring taps: reads of `base + ((p - k) & mask)` in a row, k a run-time word plus 0, 1, 2 (P-I-ST's
+/// ladder), and `((p - c) & mask) + base` (NFX-EN's cubic). The base is aligned to the ring for
+/// some parameter words and not for others: the modulo path and the fallback both run.
+[<ReflectedDefinition>]
+module RingTaps =
+  type S =
+    { mutable origin : Frac
+      mutable pos : Frac }
+
+  let tap (s: S) (k: Frac) =
+    Region.read Scratch.x (Acc.hi (Acc.ofFrac s.origin + Acc.hi (Acc.andHi 7 (Acc.ofFrac s.pos - k))))
+
+  let word (s: S) (from: Frac) (back: int) =
+    Region.read Scratch.y (Acc.hi (Acc.andHi 15 (Acc.ofFrac from - Frac.ofRaw back) + s.origin))
+
+  let init (_: Banks.P) (s: S) =
+    s.origin <- Frac.zero
+    s.pos <- Frac.zero
+
+  let trig (_: Banks.P) (_: S) = ()
+
+  let render (p: Banks.P) (s: S) (out: Output) =
+    s.origin <- Acc.hi (Acc.andHi 0xc (Acc.ofFrac p.a))
+    let mutable fill = p.c
+    for i in 0 .. 31 do
+      Region.write Scratch.x (Frac.ofRaw i) fill
+      Region.write Scratch.y (Frac.ofRaw i) (Acc.hi (Acc.ofFrac p.d - fill))
+      fill <- Acc.hi (Acc.ofFrac fill + Frac.ofRaw 0x10101)
+    let w = Acc.hi (Acc.andHi 3 (Acc.ofFrac p.b))
+    for _ in 0 .. 7 do
+      let d0 = tap s w
+      let d1 = tap s (Acc.hi (Acc.ofFrac w + Frac.ofRaw 1))
+      let d2 = tap s (Acc.hi (Acc.ofFrac w + Frac.ofRaw 2))
+      out.Write d0
+      out.Write(Acc.sat (Acc.ofFrac d1 + d2))
+      let from = Acc.hi (Acc.ofFrac s.pos - w)
+      let p0 = word s from 0
+      let p1 = word s from 1
+      let p2 = word s from 2
+      let p3 = word s from 3
+      out.Write(Acc.sat (Acc.ofFrac p0 - p3))
+      out.Write(Acc.sat (Acc.ofFrac p1 + p2))
+      s.pos <- Acc.hi (Acc.andHi 15 (Acc.ofFrac s.pos + Frac.ofRaw 3))
+
+  let kernel = Kernel.define "probe-ring-taps" <@ init @> <@ trig @> <@ render @>
+
 /// Region indexes a DO loop steps: a local stepped by a constant (`w <- w + 2`, read as w and
 /// w + 1, its value used after the loop) and indexes affine in the loop index through lets and a
 /// helper (`n = h + 2k`, `n + 1`): address registers stepped instead of r0/n0 rebuilt each access.
@@ -1797,6 +1843,17 @@ let tests =
       test "a region's address taken twice, then zeros: the patched immediate is not a known 0" {
         needNative ()
         conformance AddressTwice.kernel 61
+      }
+      test "ring taps in a row, aligned base (modulo) and not (fallback): compiled program equals the .NET kernel" {
+        needNative ()
+        conformance RingTaps.kernel 63
+      }
+      test "ring taps in a row: grouped under one modulo register" {
+        match Optimize.compile Optimize.Direct Kernel.mds RingTaps.kernel with
+        | Error e -> failtest e
+        | Ok c ->
+          let text = c.items |> Array.map dsp56k.dsl.Transcribe.item
+          Expect.equal (text |> Array.filter (fun l -> l.Contains "RING_FALLBACK") |> Array.length) 4 "two groups: a branch and a label each"
       }
       test "region indexes a loop steps (a stepped local, affine in the index): compiled program equals the .NET kernel" {
         needNative ()

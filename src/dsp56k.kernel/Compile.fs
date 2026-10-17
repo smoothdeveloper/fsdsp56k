@@ -146,6 +146,7 @@ type Ctx =
                                               // address register at region + local, in a DO loop
     affineAt : Dictionary<Expr, Mem>          // region index expressions (by reference) affine in a
                                               // DO loop's index -> the word through its register
+    taps : Dictionary<Var, Home>              // lets of a ring tap group, read already into their homes
     mutable freeData : Reg list               // X1, Y1 when no local holds them
     scores   : Dictionary<Var, int>           // uses of each local, weighted by loop trip counts
     deadLocals : HashSet<Var>                 // register locals given back before their scope ended
@@ -902,6 +903,79 @@ let inductionsOf (ctx: Ctx) (body: Expr) =
       if c <> System.Int32.MinValue && not (bad.Contains w) && regions.ContainsKey w
          && assigned.TryGetValue w = (true, 1) && ctx.vars[w].ty = TFrac then
         yield w, c, List.ofSeq regions[w] ]
+
+/// A read of a ring: `Region.read r (base + ((p + c) & mask))` (or `((p + c) & mask) + base`),
+/// seen through inlined helpers and their arguments' lets. p is kept symbolic (a sum of words:
+/// locals, state and parameter fields, state array elements, with their signs), c a constant.
+type RingTap =
+  { region   : Region
+    mask     : int
+    baseKey  : string           // base, symbolically
+    posKey   : string           // p without its constant
+    offset   : int              // c
+    baseExpr : Expr             // base, a Frac (the inlined lets around it)
+    wrapped  : Expr }           // (p + c) & mask's operand, an Acc (the inlined lets around it)
+
+let ringTapOf (ctx: Ctx) (value: Expr) : RingTap option =
+  let sext (w: int) = (w <<< 8) >>> 8
+  // a Frac expression as a sum of signed words and a constant
+  let rec lin (env: Map<Var, Expr>) (e: Expr) : (Map<string, int> * int) option =
+    match tryConst ctx e with
+    | Some(:? Frac as f) -> Some(Map.empty, sext f.Word)
+    | _ ->
+      match e with
+      | Var x when env.ContainsKey x -> lin env env[x]
+      | Var x when ctx.vars.ContainsKey x -> Some(Map [ $"v:{x.Name}:{x.GetHashCode()}", 1 ], 0)
+      | PropertyGet(Some(Var o), p, []) when o.Type = ctx.kernel.stateType || o.Type = ctx.kernel.paramsType ->
+        Some(Map [ $"f:{p.Name}", 1 ], 0)
+      | Call(None, mi, [ PropertyGet(Some(Var o), p, []); ix ]) when mi.Name = "GetArray" && o.Type = ctx.kernel.stateType ->
+        let ixKey = match tryConst ctx ix with Some c -> $"{c}" | None -> (match ix with Var i -> $"{i.Name}:{i.GetHashCode()}" | _ -> "?")
+        if ixKey = "?" then None else Some(Map [ $"a:{p.Name}:{ixKey}", 1 ], 0)
+      | Intr "acc.hi" [ x ] -> linAcc env x
+      | _ -> None
+  and linAcc (env: Map<Var, Expr>) (e: Expr) =
+    let add (a: Map<string, int>, k) (b: Map<string, int>, l) sign =
+      let m = b |> Map.fold (fun (m: Map<string, int>) key c -> m.Add(key, (defaultArg (m.TryFind key) 0) + sign * c)) a
+      Some(m |> Map.filter (fun _ c -> c <> 0), k + sign * l)
+    match e with
+    | Intr "acc.ofFrac" [ x ] -> lin env x
+    | Intr "acc.addFrac" [ a; b ] -> (match linAcc env a, lin env b with Some x, Some y -> add x y 1 | _ -> None)
+    | Intr "acc.subFrac" [ a; b ] -> (match linAcc env a, lin env b with Some x, Some y -> add x y -1 | _ -> None)
+    | Intr "acc.add" [ a; b ] -> (match linAcc env a, linAcc env b with Some x, Some y -> add x y 1 | _ -> None)
+    | Intr "acc.sub" [ a; b ] -> (match linAcc env a, linAcc env b with Some x, Some y -> add x y -1 | _ -> None)
+    | Let(v, x, b) when not v.IsMutable -> linAcc (env.Add(v, x)) b
+    | _ -> None
+  let key (m: Map<string, int>) = m |> Map.toList |> List.map (fun (k, c) -> $"{c}*{k}") |> String.concat "+"
+  // the lets an expression is read under, around it
+  let under (env: (Var * Expr) list) (e: Expr) = List.foldBack (fun (v, x) b -> Expr.Let(v, x, b)) env e
+  let rec find (env: (Var * Expr) list) (e: Expr) =
+    match e with
+    | Let(v, x, b) when not v.IsMutable && not (v.Type = typeof<Cursor>) -> find (env @ [ v, x ]) b
+    | Call(None, mi, args) when intrinsic (resolve mi args) = None && not (isSubroutine mi) && (reflected mi).IsSome ->
+      find env (inlined mi args)
+    | Intr "region.read" [ r; i ] ->
+      // an index computed by a helper: inlined, its arguments' lets kept with the others
+      let rec open' (env: (Var * Expr) list) (i: Expr) =
+        match i with
+        | Let(v, x, b) when not v.IsMutable -> open' (env @ [ v, x ]) b
+        | Call(None, mi, args) when intrinsic (resolve mi args) = None && not (isSubroutine mi) && (reflected mi).IsSome ->
+          open' env (inlined mi args)
+        | _ -> env, i
+      let env, i = open' env i
+      let map = Map.ofList env
+      let ring (m: Expr) (x: Expr) (b: Expr) =
+        match constObject ctx r, tryConst ctx m, linAcc map x, lin map b with
+        | Some(:? Region as region), Some(:? int as mask), Some(pm, c), Some(bm, bk)
+            when mask > 1 && mask < 0x8000 && (mask &&& (mask + 1)) = 0 && not pm.IsEmpty ->
+          Some { region = region; mask = mask; baseKey = $"{key bm}+{bk}"; posKey = key pm; offset = c
+                 baseExpr = under env b; wrapped = under env x }
+        | _ -> None
+      match i with
+      | Intr "acc.hi" [ Intr "acc.addFrac" [ Intr "acc.ofFrac" [ b ]; Intr "acc.hi" [ Intr "acc.andHi" [ m; x ] ] ] ] -> ring m x b
+      | Intr "acc.hi" [ Intr "acc.addFrac" [ Intr "acc.andHi" [ m; x ]; b ] ] -> ring m x b
+      | _ -> None
+    | _ -> None
+  if value.Type <> typeof<Frac> then None else find [] value
 
 let snapshot (ctx: Ctx) =
   let count = ctx.items.Count
@@ -1723,7 +1797,14 @@ and storeWordReg (ctx: Ctx) (e: Expr) (dst: Reg) =
       emit ctx (move x0 dst)
 
 and withLet (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> unit) =
-  if v.Type = typeof<Cursor> then withCursor ctx v value bodyExpr body
+  if ctx.taps.ContainsKey v then
+    // read with its tap group: bound to its home
+    let saved = ctx.vars
+    ctx.vars <- ctx.vars.Add(v, ctx.taps[v])
+    body ()
+    ctx.vars <- saved
+  elif not v.IsMutable && ringGroup ctx v value bodyExpr body then ()
+  elif v.Type = typeof<Cursor> then withCursor ctx v value bodyExpr body
   elif (match tyOf v.Type with TOther _ -> true | _ -> false) then
     // not a DSP value: a table, a region, a configuration record... known at compile time
     match constObject ctx value with
@@ -1769,6 +1850,70 @@ and withLet (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> un
       restore ()
       inMemory ctx v value bodyExpr body
   | _ -> inMemory ctx v value bodyExpr body
+
+/// Lets in a row reading one ring (ringTapOf: same region, base, mask and position, constant
+/// offsets apart): when the ring's block is aligned (region + base a multiple of mask + 1, tested
+/// when running), one address register at region + base + ((p + c0) & mask) with modulo
+/// mask + 1, each read at (rk+nk), nk the tap's offset from the first; otherwise each read as
+/// written. Both paths leave the values in the same homes; the code after them is generated once.
+and ringGroup (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> unit) =
+  match ringTapOf ctx value with
+  | None -> false
+  | Some first ->
+    let same (t: RingTap) =
+      t.region.name = first.region.name && t.mask = first.mask && t.baseKey = first.baseKey && t.posKey = first.posKey
+    let rec more (e: Expr) acc =
+      match e with
+      | Let(w, x, b) when not w.IsMutable && w.Type = typeof<Frac> ->
+        match ringTapOf ctx x with
+        | Some t when same t -> more b ((w, x, t) :: acc)
+        | _ -> List.rev acc
+      | _ -> List.rev acc
+    let group = (v, value, first) :: more bodyExpr []
+    if group.Length < 2 || ctx.freeRegs.IsEmpty then false
+    else
+      let reg = ctx.freeRegs |> List.tryFind (fun r -> (r >= 4) = (first.region.bank = YMemory)) |> Option.defaultValue ctx.freeRegs.Head
+      ctx.freeRegs <- ctx.freeRegs |> List.filter ((<>) reg)
+      let mark = ctx.next
+      let homes = [ for _ in group -> alloc ctx TFrac ]
+      let fallback = fresh ctx "RING_FALLBACK"
+      let finish = fresh ctx "RING_DONE"
+      let space = match first.region.bank with XMemory -> Space.X | YMemory -> Space.Y
+      // n = (p + c0) & mask; r = region + base; the block aligned?
+      genAcc ctx first.wrapped
+      emit ctx (and' (immL first.mask) a)
+      emit ctx (move a1 (N reg))
+      genAcc ctx (Expr.Call(nonNull (typeof<Acc>.GetMethod "ofFrac"), [ first.baseExpr ]))
+      importHere ctx first.region.name first.region.abiSymbol (move (immL 0) x0)
+      emit ctx (add x0 a)
+      emit ctx (move a1 (R reg))
+      emit ctx (and' (immL first.mask) a)
+      emit ctx (bne fallback)
+      emit ctx (movec (immL first.mask) (M reg))
+      emit ctx (update (incN (R reg)))
+      for (_, _, t), h in List.zip group homes do
+        let d = t.offset - first.offset
+        if d = 0 then emit ctx (move { space = space; ea = Ind reg } x0)
+        else
+          emit ctx (move (immL (d &&& 0xffffff)) (N reg))
+          emit ctx (move { space = space; ea = IndexN reg } x0)
+        emit ctx (move x0 (at h 0))
+      emit ctx (movec (immL 0xffffff) (M reg))
+      emit ctx (bra finish)
+      emit ctx (Label fallback)
+      for (_, x, _), h in List.zip group homes do store ctx h x
+      emit ctx (Label finish)
+      ctx.freeRegs <- reg :: ctx.freeRegs
+      for (w, _, _), h in List.tail (List.zip group homes) do ctx.taps[w] <- h
+      let saved = ctx.vars
+      ctx.vars <- ctx.vars.Add(v, homes.Head)
+      try body ()
+      finally
+        // also when the code is given up and generated again (BTaken)
+        ctx.vars <- saved
+        for (w, _, _) in List.tail group do ctx.taps.Remove w |> ignore
+      ctx.next <- mark
+      true
 
 /// A local in a register (X1 or Y1 for a Frac used enough) or in X words.
 and inMemory (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> unit) =
@@ -2692,7 +2837,7 @@ let rec generateWith (floors: Map<string, int>) (unswitchMax: int option) (targe
       { target = target; kernel = k; layout = layout; items = ResizeArray(); lines = ResizeArray(); line = 0
         vars = Map.empty; consts = Map.empty; next = layout.xWorkset; high = layout.xWorkset; labels = 0
         cursors = Map.empty; freeRegs = [ 1; 2; 3; 4; 5 ]; tables = ResizeArray(); conts = []; released = Collections.Generic.HashSet(); trackHome = None
-        indexed = Map.empty; counters = Map.empty; inductions = Map.empty; affineAt = Dictionary(HashIdentity.Reference); freeData = [ X1; Y1 ]; scores = Dictionary(); deadLocals = HashSet()
+        indexed = Map.empty; counters = Map.empty; inductions = Map.empty; affineAt = Dictionary(HashIdentity.Reference); taps = Dictionary(); freeData = [ X1; Y1 ]; scores = Dictionary(); deadLocals = HashSet()
         unswitched = HashSet(); bHeld = false; bWrite = false
         subs = Dictionary(); inSub = None; depth = 0; deepest = 0; floors = floors
         kept = keptLoops k; unrolled = unrolledLoops k; pending = []; unswitchMax = unswitchMax; unswitchCosts = ResizeArray() }
