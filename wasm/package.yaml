@@ -1,0 +1,10 @@
+name: dsp56k-wasm
+private: true
+type: module
+packageManager: pnpm@10.6.4
+scripts:
+  build: vite build
+  check: node ../out/wasm/check.mjs
+devDependencies:
+  vite: ^8.0.0
+  vite-plugin-fable: ^0.5.2

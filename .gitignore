@@ -10,6 +10,9 @@ out/
 *.lst
 native/target/
 
+# scratch the build scripts write (Fable tools, wasm builds)
+.bench/
+
 # web tooling
 node_modules/
 fable_modules/

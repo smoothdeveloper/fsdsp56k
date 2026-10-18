@@ -242,6 +242,17 @@ let at' (ctx: Ctx) (e: Expr) =
       if text <> "" then emit ctx (Comment $"{IO.Path.GetFileName file}:{line}  {text}")
   | None -> ()
 
+/// Code generated for `e` is attributed to e's own line (an item records the line of the entry's own file) and to the
+/// enclosing line again afterwards: an inlined helper's body takes its own lines in Compiled.lines, not those of its call.
+/// No comment is emitted, so the code is the same as without it.
+let lined (ctx: Ctx) (e: Expr) (gen: unit -> unit) =
+  match debugRange e with
+  | Some(file, line) when ctx.sourceFile |> Option.forall ((=) file) ->
+    let saved = ctx.sourceLine
+    ctx.sourceLine <- line
+    try gen () finally ctx.sourceLine <- saved
+  | _ -> gen ()
+
 let fresh (ctx: Ctx) what =
   ctx.labels <- ctx.labels + 1
   $"K_{what}_{ctx.labels}"
@@ -1235,7 +1246,9 @@ let rec genAcc (ctx: Ctx) (e: Expr) : unit =
         emit ctx (and' (immL (m &&& 0xffffff)) a)
       | Some n, _ -> fail $"{n} does not give an Acc"
       | None, _ when isSubroutine mi -> callSub ctx mi args
-      | None, _ -> genAcc ctx (inlined mi args)
+      | None, _ ->
+        let body = inlined mi args
+        lined ctx body (fun () -> genAcc ctx body)
     | _ -> fail $"not a kernel Acc expression: {e}"
 
 /// A multiplication: the factors in X0 and Y0, the accumulated value (if any) in A. Into B only
@@ -1359,7 +1372,9 @@ and genLong (ctx: Ctx) (e: Expr) =
       emit ctx (Label fits)
     | Let(v, value, body) -> withLet ctx v value body (fun () -> genLong ctx body)
     | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone && isSubroutine mi -> callSub ctx mi args
-    | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone -> genLong ctx (inlined mi args)
+    | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone ->
+      let body = inlined mi args
+      lined ctx body (fun () -> genLong ctx body)
     | IfThenElse(c, t, f) when (match tryConst ctx c with Some(:? bool) -> true | _ -> false) ->
       genLong ctx (if (tryConst ctx c).Value :?> bool then t else f)
     | IfThenElse _ -> genLong ctx (selection ctx e)
@@ -1423,7 +1438,9 @@ and genWord (ctx: Ctx) (e: Expr) : unit =
         emit ctx (move a1 x0)
       | Some n, _ -> fail $"{n} does not give a Frac"
       | None, _ when isSubroutine mi -> callSub ctx mi args
-      | None, _ -> genWord ctx (inlined mi args)
+      | None, _ ->
+        let body = inlined mi args
+        lined ctx body (fun () -> genWord ctx body)
     | Call(Some(Var c), mi, []) when ctx.cursors.ContainsKey c ->
       match intrinsic mi with
       | Some "cursor.next" -> emit ctx (move (cursorMem ctx.cursors[c] true) x0)
@@ -1797,7 +1814,11 @@ and storeWordReg (ctx: Ctx) (e: Expr) (dst: Reg) =
       genWord ctx e
       emit ctx (move x0 dst)
 
+/// The value's code takes the value's line, and the body's the body's own (see `lined`).
 and withLet (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> unit) =
+  lined ctx value (fun () -> withLetAt ctx v value bodyExpr (fun () -> lined ctx bodyExpr body))
+
+and withLetAt (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> unit) =
   if ctx.taps.ContainsKey v then
     // read with its tap group: bound to its home
     let saved = ctx.vars

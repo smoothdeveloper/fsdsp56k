@@ -12,7 +12,9 @@ let private flags = BindingFlags.Static ||| BindingFlags.Instance ||| BindingFla
 
 /// The .NET type of a full name from the loaded assemblies (a module's nested types are `Outer+Inner`).
 let private clrType (full: string) : Type option =
+  // the newest assembly first: a source compiled again (the explorer's) shadows its earlier version
   AppDomain.CurrentDomain.GetAssemblies()
+  |> Array.rev
   |> Array.tryPick (fun a ->
     match a.GetType full with
     | null ->

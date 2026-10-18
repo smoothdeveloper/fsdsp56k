@@ -30,8 +30,10 @@ let private runtimeReferences () =
       if isManaged then yield f ]
 
 /// Checks source files (paths, in compilation order) against the kernel libraries and any further assemblies.
+let private sharedChecker = lazy (FSharpChecker.Create(keepAssemblyContents = true))
+
 let check (files: string list) (extraReferences: string list) : Result<Checked, string> =
-  let checker = FSharpChecker.Create(keepAssemblyContents = true)
+  let checker = sharedChecker.Value
   let references =
     [ yield! runtimeReferences ()
       typeof<unit>.Assembly.Location
@@ -57,6 +59,32 @@ let check (files: string list) (extraReferences: string list) : Result<Checked, 
     Error(errors |> Array.truncate 5 |> Array.map (fun d -> $"{d.FileName}({d.StartLine}): {d.Message}") |> String.concat "\n")
   else
     Ok { contents = results.AssemblyContents.ImplementationFiles; messages = [] }
+
+/// The compiled library of source files, loaded into this process, so that what the kernel asks of the running program (a module
+/// value such as a table, a call on constants) can be answered by reflection as for any kernel built with the project. The
+/// source's own code runs when its values are read: for a trusted source (the user's own, on loopback) only.
+let compileAndLoad (files: string list) (extraReferences: string list) (outPath: string) : Result<unit, string> =
+  let checker = sharedChecker.Value
+  let references =
+    [ yield! runtimeReferences ()
+      typeof<unit>.Assembly.Location
+      typeof<Frac>.Assembly.Location
+      typeof<Kernel.Kernel>.Assembly.Location
+      yield! extraReferences ]
+    |> List.distinct
+  let argv =
+    [| yield "fsc.exe"; yield "--noframework"; yield "--targetprofile:netcore"; yield "--target:library"; yield "--nologo"
+       yield "--out:" + outPath
+       for r in references -> "-r:" + r
+       yield! files |]
+  let diagnostics, exn = checker.Compile argv |> Async.RunSynchronously
+  let errors = diagnostics |> Array.filter (fun d -> d.Severity = FSharp.Compiler.Diagnostics.FSharpDiagnosticSeverity.Error)
+  match exn with
+  | Some e -> Error e.Message
+  | None when errors.Length > 0 -> Error(errors |> Array.truncate 5 |> Array.map (fun d -> $"{d.FileName}({d.StartLine}): {d.Message}") |> String.concat "\n")
+  | None ->
+    Reflection.Assembly.LoadFrom outPath |> ignore
+    Ok()
 
 // ---------------------------------------------------------------------------------------------
 // Types and members.
@@ -103,7 +131,9 @@ let private clrType (e: FSharpEntity) : Type option =
     match e.TryFullName with
     | Some n -> n
     | None -> e.DisplayName
+  // the newest assembly first: a source compiled again (the explorer's) shadows its earlier version
   AppDomain.CurrentDomain.GetAssemblies()
+  |> Array.rev
   |> Array.tryPick (fun a ->
     match a.GetType(named.Replace(".", ".")) with
     | null ->
@@ -378,3 +408,25 @@ let kernelIn (checked': Checked) (moduleName: string) (name: string) (init: stri
 
 /// The kernel `name` made of three functions of the checked source (the first of each name).
 let kernel (checked': Checked) (name: string) (names: string * string * string) = kernelIn checked' "" name names
+
+/// A function (or value) of a module of the source, and the lines it covers.
+type FunctionSpan = { name: string; startLine: int; endLine: int }
+
+/// The last line any part of an expression is on: the range of a `let` or a sequence covers its first part only.
+let rec private lastLine (e: FSharpExpr) : int =
+  e.ImmediateSubExpressions |> List.fold (fun last sub -> max last (lastLine sub)) e.Range.EndLine
+
+/// The module-level functions and values the file `file` declares, with their line extents: from the line of the name to the
+/// last line of the body. The members the compiler writes are left out.
+let functionsOf (checked': Checked) (file: string) : FunctionSpan array =
+  [| for f in checked'.contents do
+       if f.FileName = file then
+         let rec walk (d: FSharpImplementationFileDeclaration) =
+           seq {
+             match d with
+             | FSharpImplementationFileDeclaration.Entity(e, subs) when e.IsFSharpModule || e.IsNamespace -> for s in subs do yield! walk s
+             | FSharpImplementationFileDeclaration.MemberOrFunctionOrValue(m, _, body) when m.IsModuleValueOrMember && not m.IsCompilerGenerated ->
+               let start = m.DeclarationLocation.StartLine
+               yield { name = m.DisplayName; startLine = start; endLine = max start (lastLine body) }
+             | _ -> () }
+         for d in f.Declarations do yield! walk d |]

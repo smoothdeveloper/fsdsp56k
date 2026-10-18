@@ -1,3 +1,5 @@
+<img src="docs/fsdsp56k-logo.svg" alt="fsdsp56k" width="96" align="right">
+
 # fsdsp56k
 
 F# tooling for the Motorola DSP56300 family, and on top of it, support for writing Elektron
