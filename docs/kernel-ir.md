@@ -9,7 +9,7 @@ tests pass as before.
 ```
 F# kernel ──quotations──► FromQuotation ─┐
 by hand / Ir.Build ──────────────────────┼─► Ir.IrKernel ─► Compile.fs ─► items ─► Optimize.fs ─► words
-(typed tree from Fable, JSON: not built) ┘      (this tree)    (unchanged logic)
+(JSON: not built; typed tree: below)     ┘      (this tree)    (unchanged logic)
 ```
 
 ## Why
@@ -62,6 +62,28 @@ end gets them. A front end that already produces normal forms simply never meets
   printer). `UPDATE_GOLDEN=1` rewrites it; `DUMP_LISTINGS=dir` writes every listing, to diff a change.
 - `IrFrontEndTests.fs`: the by-hand Sine against Sine.fs.
 
+## A second real front end: the F# compiler's typed tree (spike, `src/dsp56k.kernel.typedtree`)
+
+`FromTypedTree.check files` runs the F# compiler (FSharp.Compiler.Service, `keepAssemblyContents`) over kernel
+*source text*; `FromTypedTree.kernel checked "name" ("init", "trig", "render")` reads the three functions as an
+`IrKernel`, with no quotation and no `[<ReflectedDefinition>]`. `tests/dsp56k.tests/TypedTreeFrontEndTests.fs` compiles
+every kernel of `tests/dsp56k.tests/Kernels` (Sine, InputThru, MainTap, Pluck, the Tx6 family with their tables files) through it, on every
+host, and requires the same program as the quotation front end. What the typed tree does differently, and the converter
+absorbs: F#'s generic operators instead of the kernel types' own (`acc >>> 6`: looked up in `Ir.typeOperators` by operand
+types); a unit argument on a property or a method with none; generic functions instantiated per call site (their return type is
+the instantiated one); `match` as decision trees with targets; union case field reads.
+
+Still on .NET reflection: `Member.Get` and `Member.Invoke` (module values: tables, voice records; pure helpers `tryConst` runs).
+A browser build needs an evaluator for those (or a front end that folds them). FCS itself does not run in a browser; Fable.Standalone's
+compiler (FCS compiled by Fable) does, and it holds the same typed tree. Its stock API only prints it (`FSharpAstToString`), so
+`TypedTreeJson.fs` writes it as JSON and `tools/typed-tree-standalone` carries a 30-line Fable 5.18.0 patch that adds a worker
+message for it (`GetTypedTree`): pasted source in, JSON out. Measured: 80 kernel files type-check in
+13 s in node and give the same tree as .NET's compiler (63 differences in 9.9 MB, all in FSharp.Core/System member metadata).
+The reader (`FromJson.fs`: JSON in, `IrKernel` out) is done: Sine, InputThru, MainTap, Pluck and the seven Tx6 kernels, read from
+the JSON of the browser's compiler (in node), compile to the same program as the quotations on every host; and it compiles under
+Fable (`Ir.fs`, `Json.fs`, `FromJson.fs`) and gives, in node, the same text as compiled by .NET. Still missing: the constants evaluator
+(the reader asks a `Host` for module values and calls on constants; .NET reflection answers today) and `Compile.fs` under Fable.
+
 ## Not done
 
 - The tree is in the Kernel project (it needs only `System`); to be built by Fable it moves to a project of
@@ -70,6 +92,7 @@ end gets them. A front end that already produces normal forms simply never meets
 - A serialised form (JSON) of the tree: constants (module values, a voice's configuration record) must be
   folded or encoded, and `tryConst` evaluates pure helpers by calling them (`Member.Invoke`): a loaded tree
   has no .NET to call, so it needs the tree's own evaluator (or inlining and folding) first.
-- A front end for pasted F# (Fable.Standalone's typed tree), and the browser-side registries.
+- The constants evaluator and the generator (`Compile.fs`, `Optimize.fs`) under Fable, with the kernel types' values ported (the
+  generator matches `:? Frac`).
 - `Host.fs` (a kernel run as .NET code) still reads the quotation `Kernel` by reflection; an interpreter
   of the tree would replace it where there is no .NET.

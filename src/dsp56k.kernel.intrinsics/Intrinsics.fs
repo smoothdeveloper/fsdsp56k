@@ -111,7 +111,7 @@ type Frac =
   /// The word shifted right, zeros in from the top (logical): `lsr #n,a` on the word in a1. n is
   /// a constant, 0 to 31 (24 on gives 0).
   [<Intrinsic "frac.lsr">]
-  static member lsr (n: int) (f: Frac) = Frac.ofRaw (f.Word >>> n)
+  static member ``lsr`` (n: int) (f: Frac) = Frac.ofRaw (f.Word >>> n)
 
   /// The word shifted right (logical) by a count computed when running: `lsr s,a`, the count the
   /// low six bits of s (0 to 63; 24 on gives 0).
@@ -199,7 +199,7 @@ and [<Struct>] Acc =
   /// `lsr #n,a`: a1 shifted right, zeros in from bit 47 (logical); a2 and a0 as they were. n is
   /// a constant, 0 to 31 (24 on clears a1).
   [<Intrinsic "acc.lsr">]
-  static member lsr (n: int) (a: Acc) = Acc.withHi a (((a.Raw >>> 24) &&& 0xffffffL) >>> n)
+  static member ``lsr`` (n: int) (a: Acc) = Acc.withHi a (((a.Raw >>> 24) &&& 0xffffffL) >>> n)
 
   /// `lsr s,a`: as `Acc.lsr`, by a count computed when running, the low six bits of s (0 to
   /// 63; 24 on clears a1).

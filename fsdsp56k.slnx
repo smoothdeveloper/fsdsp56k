@@ -9,4 +9,5 @@
   <Project Path="src/dsp56k.kernel.intrinsics/dsp56k.kernel.intrinsics.fsproj" />
   <Project Path="src/dsp56k.kernel/dsp56k.kernel.fsproj" />
   <Project Path="src/dsp56k.kernel.grade/dsp56k.kernel.grade.fsproj" />
+  <Project Path="src/dsp56k.kernel.typedtree/dsp56k.kernel.typedtree.fsproj" />
 </Solution>

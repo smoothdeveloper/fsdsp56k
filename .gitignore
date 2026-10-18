@@ -10,6 +10,12 @@ out/
 *.lst
 native/target/
 
+# web tooling
+node_modules/
+fable_modules/
+dist/
+vite.log
+
 # local notes: kept next to the checkout, never committed
 *.local.md
 .local/

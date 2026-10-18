@@ -11,3 +11,4 @@ nuget Firelight
 nuget Fable.Browser.Dom
 nuget Fable.Browser.Event
 nuget Fable.Core
+nuget FSharp.Compiler.Service

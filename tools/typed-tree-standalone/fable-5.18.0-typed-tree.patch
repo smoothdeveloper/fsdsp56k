@@ -1,0 +1,88 @@
+diff --git a/src/fable-standalone/src/Fable.Standalone.fsproj b/src/fable-standalone/src/Fable.Standalone.fsproj
+index ec13e56..07e3b38 100644
+--- a/src/fable-standalone/src/Fable.Standalone.fsproj
++++ b/src/fable-standalone/src/Fable.Standalone.fsproj
+@@ -85,6 +85,9 @@
+     <!-- Fable.Standalone -->
+     <Compile Include="Interfaces.fs"/>
+     <Compile Include="Lexer.fs"/>
++    <!-- the typed tree as JSON: one source file, kept in fsdsp56k (src/Dsp56k.Kernel.TypedTree), that also compiles on .NET; the build gets their folder in TYPED_TREE_JSON_DIR -->
++    <Compile Include="$(TYPED_TREE_JSON_DIR)/Json.fs" Link="Json.fs" />
++    <Compile Include="$(TYPED_TREE_JSON_DIR)/TypedTreeJson.fs" Link="TypedTreeJson.fs" />
+     <Compile Include="Main.fs"/>
+   </ItemGroup>
+ 
+diff --git a/src/fable-standalone/src/Interfaces.fs b/src/fable-standalone/src/Interfaces.fs
+index 311e9ac..81f9f03 100644
+--- a/src/fable-standalone/src/Interfaces.fs
++++ b/src/fable-standalone/src/Interfaces.fs
+@@ -122,3 +122,6 @@ type IFableManager =
+     abstract PrintTargetAst: fableResult: IFableResult * IWriter -> Async<unit>
+ 
+     abstract FSharpAstToString: parseResults: IParseAndCheckResults * fileName: string -> string
++
++    /// The F# compiler's typed tree of every file of the checked project, as JSON text (dsp56k.kernel.TypedTreeJson).
++    abstract FSharpAstToJson: parseResults: IParseAndCheckResults -> string
+diff --git a/src/fable-standalone/src/Main.fs b/src/fable-standalone/src/Main.fs
+index b020d37..e6b567a 100644
+--- a/src/fable-standalone/src/Main.fs
++++ b/src/fable-standalone/src/Main.fs
+@@ -565,4 +565,8 @@ let init () =
+             let implFile = project.ImplementationFiles.Item(fileName)
+ 
+             AstPrint.printFSharpDecls "" implFile.Declarations |> String.concat "\n"
++
++        member _.FSharpAstToJson(results: IParseAndCheckResults) =
++            let res = results :?> ParseAndCheckResults
++            dsp56k.kernel.TypedTreeJson.ofFiles res.CheckProjectResults.AssemblyContents.ImplementationFiles
+     }
+diff --git a/src/fable-standalone/src/Worker/Shared.fs b/src/fable-standalone/src/Worker/Shared.fs
+index c4c3ebd..907266e 100644
+--- a/src/fable-standalone/src/Worker/Shared.fs
++++ b/src/fable-standalone/src/Worker/Shared.fs
+@@ -49,6 +49,8 @@ type WorkerRequest =
+         filesToEmit: string[] *
+         language: string *
+         otherFSharpOptions: string[]
++    /// The typed tree of the checked files as JSON text (answered with TypedTree)
++    | GetTypedTree of fsharpCode: FSharpCodeFile[] * otherFSharpOptions: string[]
+     | GetTooltip of id: Guid * line: int * column: int * lineText: string
+     | GetCompletions of id: Guid * line: int * column: int * lineText: string
+     | GetDeclarationLocation of id: Guid * line: int * column: int * lineText: string
+@@ -71,6 +73,7 @@ type WorkerAnswer =
+     | ParsedCode of errors: Fable.Standalone.Error[]
+     | CompilationFinished of code: string * language: string * errors: Fable.Standalone.Error[] * stats: CompileStats
+     | CompilationsFinished of code: string[] * language: string * errors: Fable.Standalone.Error[] * stats: CompileStats
++    | TypedTree of json: string * errors: Fable.Standalone.Error[]
+     | CompilerCrashed of message: string
+     | FoundTooltip of id: Guid * lines: string[]
+     | FoundCompletions of id: Guid * Fable.Standalone.Completion[]
+diff --git a/src/fable-standalone/src/Worker/Worker.fs b/src/fable-standalone/src/Worker/Worker.fs
+index ec5c7dc..8778d2d 100644
+--- a/src/fable-standalone/src/Worker/Worker.fs
++++ b/src/fable-standalone/src/Worker/Worker.fs
+@@ -430,6 +430,24 @@ let rec loop (box: MailboxProcessor<WorkerRequest>) (state: State) =
+ 
+             return! loop box state
+ 
++        | Some fable, GetTypedTree(fsharpCode, otherFSharpOptions) ->
++            try
++                let! fable = makeFableState (Initialized fable) otherFSharpOptions
++                let names = fsharpCode |> Array.map (fun x -> x.Name)
++                let contents = fsharpCode |> Array.map (fun x -> x.Content)
++
++                let res =
++                    fable.Manager.ParseAndCheckProject(fable.Checker, PROJECT_NAME, names, contents, otherFSharpOptions)
++
++                let hardErrors = res.Errors |> Array.filter (fun e -> not e.IsWarning)
++                let json = if hardErrors.Length > 0 then "" else fable.Manager.FSharpAstToJson res
++                TypedTree(json, res.Errors) |> state.Worker.Post
++            with er ->
++                JS.console.error er
++                CompilerCrashed(describeError er) |> state.Worker.Post
++
++            return! loop box state
++
+         | Some fable, GetTooltip(id, line, col, lineText) ->
+             let tooltipLines =
+                 match FILE_NAME |> state.CurrentResults.TryFind with

@@ -15,6 +15,7 @@ let all =
     KernelTests.tests
     KernelIrTests.tests
     IrFrontEndTests.tests
+    TypedTreeFrontEndTests.tests
   ]
 
 [<EntryPoint>]

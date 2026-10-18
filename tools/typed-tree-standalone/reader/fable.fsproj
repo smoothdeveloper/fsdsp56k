@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <NoWarn>3370;25;49;64;3391</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../../src/dsp56k.kernel/Ir.fs" />
+    <Compile Include="../../../src/dsp56k.kernel.typedtree/Json.fs" />
+    <Compile Include="../../../src/dsp56k.kernel.typedtree/FromJson.fs" />
+    <Compile Include="ReaderShow.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Fable.Core" Version="5.3.0" />
+  </ItemGroup>
+</Project>

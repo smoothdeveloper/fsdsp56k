@@ -53,7 +53,7 @@ module IrTy =
     | TyInt -> "Int32"
     | TyInt64 -> "Int64"
     | TyFloat -> "Double"
-    | TyPrim n | TyRecord n | TyUnion n | TyOther n -> n.Substring(n.LastIndexOfAny [| '.'; '+' |] + 1)
+    | TyPrim n | TyRecord n | TyUnion n | TyOther n -> n.Substring((max (n.LastIndexOf '.') (n.LastIndexOf '+')) + 1)
     | TyFrac -> "Frac"
     | TyAcc -> "Acc"
     | TyLong -> "Long"
@@ -67,6 +67,15 @@ module IrTy =
 
 let counter = ref 0
 
+/// The next variable number: atomic on .NET, where kernels compile on several threads; Fable's JavaScript has one.
+let private nextId () =
+#if FABLE_COMPILER
+  counter.Value <- counter.Value + 1
+  counter.Value
+#else
+  System.Threading.Interlocked.Increment counter
+#endif
+
 /// What orders variables of the same name: the .NET type's metadata token, as F# orders quotation variables (a front end
 /// that has no such thing leaves it 0). Set by the front end before kernels are compiled.
 let mutable typeKeyOf: IrTy -> int = fun _ -> 0
@@ -76,7 +85,7 @@ let mutable typeKeyOf: IrTy -> int = fun _ -> 0
 /// those decides which local gets a register.
 [<Sealed; AllowNullLiteral>]
 type Var(name: string, ty: IrTy, isMutable: bool, typeKey: int) =
-  let id = System.Threading.Interlocked.Increment counter
+  let id = nextId ()
   new(name: string, ty: IrTy, isMutable: bool) = Var(name, ty, isMutable, typeKeyOf ty)
   new(name: string, ty: IrTy) = Var(name, ty, false, typeKeyOf ty)
   member _.Name = name

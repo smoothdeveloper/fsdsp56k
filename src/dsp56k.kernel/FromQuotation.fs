@@ -175,6 +175,9 @@ let private registered =
          | Ir.TyLong -> Ir.Expr.Value(box Long.zero, Ir.TyLong)
          | other -> fail $"no zero of {other}")
 
+/// Fills the registries the generator reads (intrinsics, operators, zeros): any front end that builds trees needs them.
+let ensureRegistered () = registered.Force()
+
 /// The kernel as the generator reads it.
 let kernel (k: Kernel) : Ir.IrKernel =
   registered.Force()
