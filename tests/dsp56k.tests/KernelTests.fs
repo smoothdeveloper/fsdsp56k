@@ -1526,8 +1526,68 @@ let conformance (k: Kernel.Kernel) seed =
   | Ok r -> Expect.isEmpty r.correctness (text r)
 
 
+module JoinCases =
+  open dsp56k.dsl
+  open dsp56k.dsl.Asm
+
+  let tests = testList "accumulator join equality" [
+    let openCode body =
+      body |> Array.mapi (fun i item -> item, i)
+      |> Optimize.joinAccumulators 20 23
+      |> Array.map fst
+    let spill =
+      [| move a1 (xm (disp r6 20))
+         move a0 (xm (disp r6 21))
+         move a2 (xm (disp r6 22)) |]
+    let reload =
+      [| move (xm (disp r6 20)) a
+         move (xm (disp r6 21)) a0
+         move (xm (disp r6 22)) a2 |]
+    let diamond change =
+      Array.concat
+        [ [| label "ENTRY" |]
+          spill
+          [| tst a; bge "JOIN" |]
+          change
+          [| label "JOIN" |]
+          reload
+          [| rts |] ]
+    test "different values on both paths still equal their shared home" {
+      let body = diamond (Array.append [| clr a |] spill)
+      Expect.equal (openCode body).Length (body.Length - 3) "the whole reload is redundant"
+    }
+    test "a changed low part without a matching store retains the reload" {
+      let body = diamond [| move (imm 1) a0 |]
+      Expect.equal (openCode body) body "one unequal raw part prevents forwarding"
+    }
+    test "an extension write without a matching store retains the reload" {
+      let body = diamond [| move (imm 1) a2 |]
+      Expect.equal (openCode body) body "extension equality is required too"
+    }
+    test "an X-memory state home is outside the temporary range" {
+      let body = diamond (Array.append [| clr a |] spill)
+      let actual =
+        body |> Array.map (fun item -> item, 0)
+        |> Optimize.joinAccumulators 23 26
+        |> Array.map fst
+      Expect.equal actual body "state must not be treated as disposable spill storage"
+    }
+    test "an indirect X store may alias the home" {
+      let body = diamond [| move x0 (xm (ind r0)) |]
+      Expect.equal (openCode body) body "unknown X alias invalidates equality"
+    }
+    test "moving the workset base invalidates the home" {
+      let body = diamond [| move r0 r6 |]
+      Expect.equal (openCode body) body "R6 must keep its meaning"
+    }
+    test "a call is a barrier even when its local target is known" {
+      let body = Array.append (diamond [| bsr "CALLEE" |]) [| label "CALLEE"; rts |]
+      Expect.equal (openCode body) body "callee effects cannot be assumed"
+    } ]
+
 let tests =
   testList "kernels" [
+    JoinCases.tests
 
     test "arithmetic intrinsics: compiled program equals the .NET kernel" {
       needNative ()

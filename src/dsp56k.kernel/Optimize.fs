@@ -333,6 +333,110 @@ let successors (items: Item array) =
     | _ -> next ()
   if followable then Some(succ |> Array.map (fun l -> l.ToArray())) else None
 
+/// Whole-accumulator reloads whose three raw parts equal their temporary on every incoming
+/// path. Value IDs need not agree between paths: a clamp can select a different value while
+/// keeping A equal to its home on both. Unknown effects and entry paths contribute no facts.
+let joinAccumulators (first: int) (temps: int) (items: (Item * int) array) =
+  let its = Array.map fst items
+  let n = its.Length
+  let single i = match its[i] with Op(Par(None, [| m |])) -> Some m | _ -> None
+  let reload i =
+    if i + 2 >= n then None
+    else
+      match single i, single (i + 1), single (i + 2) with
+      | Some(Load(Space.X, e1, ((A | B) as acc))), Some(Load(Space.X, e0, lo)), Some(Load(Space.X, e2, ext))
+          when lo = (if acc = A then A0 else B0) && ext = (if acc = A then A2 else B2) ->
+        match workset Space.X e1, workset Space.X e0, workset Space.X e2 with
+        | Some(SMem(_, k)), Some(SMem(_, k0)), Some(SMem(_, k2))
+            when k >= first && k + 2 < temps && k0 = k + 1 && k2 = k + 2 -> Some(k, acc)
+        | _ -> None
+      | _ -> None
+  match successors its with
+  | None -> items
+  | Some succ ->
+    let preds = Array.init n (fun _ -> ResizeArray<int>())
+    for i in 0 .. n - 1 do for j in succ[i] do preds[j].Add i
+    let candidates = [| for i in 0 .. n - 1 do match reload i with Some pair -> yield pair | _ -> () |] |> Array.distinct
+    let dropped = HashSet<int>()
+    for k, acc in candidates do
+      let registers = if acc = A then [| A1; A0; A2 |] else [| B1; B0; B2 |]
+      let regMask r =
+        let touched = parts r
+        registers |> Array.mapi (fun bit r -> if List.contains r touched then 1 <<< bit else 0) |> Array.fold (|||) 0
+      let memoryMask space ea =
+        match workset space ea with
+        | Some(SMem(Space.X, word)) when word >= k && word < k + 3 -> 1 <<< (word - k)
+        | Some _ -> 0
+        | None when space = Space.X -> 7     // an indirect store can alias the temporary
+        | _ -> 0
+      let transfer state item =
+        match item with
+        | Label _ -> state
+        | Comment text when not (text.StartsWith machinedrum.Abi.markerPrefix) -> state
+        | Op(Branch((Bra | Bcc _), _)) | Op(Jump((Jmp | Jcc _), _))
+        | Op(Loop _) | Op Enddo | Op Nop -> state
+        | Op(Par(alu, moves)) ->
+          let mutable changed = 0
+          let mutable stored = 0
+          let mutable baseChanged = false
+          let write r =
+            changed <- changed ||| regMask r
+            if r = R 6 then baseChanged <- true
+          alu |> Option.iter (fun a -> Lower.aluWrites a |> Array.iter write)
+          for move in moves do
+            // Lower.storage deliberately merges A0/A1/A2 for interference; equality needs
+            // their precise writes so the three-part reload does not erase its earlier parts.
+            match move with
+            | Load(_, ea, r) -> write r; Lower.eaWrites ea |> Array.iter write
+            | Store(_, _, ea) | Update ea -> Lower.eaWrites ea |> Array.iter write
+            | Copy(_, r) | Imm(_, r) -> write r
+            match move with Store(_, sp, ea) -> stored <- stored ||| memoryMask sp ea | _ -> ()
+          if baseChanged then 0
+          else
+            let mutable result = state &&& (7 ^^^ (changed ||| stored))
+            // Generate equality only for a single move without an ALU: a parallel move's
+            // sources precede all writes, and overlapping destinations need more modelling.
+            for move in (if alu.IsNone && moves.Length = 1 then moves else [||]) do
+              match move with
+              | Store(src, Space.X, ea) ->
+                match workset Space.X ea with
+                | Some(SMem(_, word)) when word >= k && word < k + 3 ->
+                  let bit = 1 <<< (word - k)
+                  // Parallel stores read the old register, before any ALU/register writes.
+                  if src = registers[word - k] && changed &&& bit = 0 then result <- result ||| bit
+                | _ -> ()
+              | Load(Space.X, ea, dst) ->
+                match workset Space.X ea with
+                | Some(SMem(_, word)) when word >= k && word < k + 3 ->
+                  let bit = 1 <<< (word - k)
+                  if (dst = registers[word - k] || (word = k && dst = acc)) && stored &&& bit = 0 then
+                    result <- result ||| bit
+                | _ -> ()
+              | _ -> ()
+            result
+        | Op instr ->
+          match aluWrites instr with
+          | Some writes when not (List.contains (R 6) writes) ->
+            state &&& (7 ^^^ (writes |> List.map regMask |> List.fold (|||) 0))
+          | _ -> 0
+        | _ -> 0
+      let incoming = Array.zeroCreate<int> n
+      let outgoing = Array.zeroCreate<int> n
+      let mutable changed = true
+      while changed do
+        changed <- false
+        for i in 0 .. n - 1 do
+          let before = if preds[i].Count = 0 then 0 else preds[i] |> Seq.map (fun p -> outgoing[p]) |> Seq.reduce (&&&)
+          let after = transfer before its[i]
+          if before <> incoming[i] || after <> outgoing[i] then
+            incoming[i] <- before
+            outgoing[i] <- after
+            changed <- true
+      for i in 0 .. n - 1 do
+        if incoming[i] = 7 && reload i = Some(k, acc) then
+          for j in i .. i + 2 do dropped.Add j |> ignore
+    items |> Array.mapi (fun i item -> i, item) |> Array.choose (fun (i, item) -> if dropped.Contains i then None else Some item)
+
 /// Stores to the compiler's temporaries (X workset words from `first` up to `temps`; the words
 /// below `first` are [<XMemory>] state) that no path reads before the word is written again.
 let deadTempsFrom (first: int) (temps: int) (items: (Item * int) array) =
@@ -1081,15 +1185,16 @@ type Passes =
     rotate      : bool   // one-stage software pipelining of DO loops
     promote     : bool   // accumulator temporaries kept in a free accumulator
     assign      : bool   // temporaries' webs in free registers
+    joins       : bool   // raw accumulator equality retained through CFG joins
     monotone    : bool } // each pass kept only when the static cost is no worse
 
   static member all =
     { forward = true; accCopies = true; copyForward = true; deadTemps = true; hoist = true; pack = true
-      rotate = true; promote = true; assign = true; monotone = true }
+      rotate = true; promote = true; assign = true; joins = true; monotone = true }
 
   static member none =
     { forward = false; accCopies = false; copyForward = false; deadTemps = false; hoist = false; pack = false
-      rotate = false; promote = false; assign = false; monotone = false }
+      rotate = false; promote = false; assign = false; joins = false; monotone = false }
 
 /// The switchable passes by name, with how to turn each off.
 let passes : (string * (Passes -> Passes)) list =
@@ -1101,7 +1206,8 @@ let passes : (string * (Passes -> Passes)) list =
     "pack",        (fun p -> { p with pack = false })
     "rotate",      (fun p -> { p with rotate = false })
     "promote",     (fun p -> { p with promote = false })
-    "assign",      (fun p -> { p with assign = false }) ]
+    "assign",      (fun p -> { p with assign = false })
+    "joins",       (fun p -> { p with joins = false }) ]
 
 type Level =
   | Direct            // the compiler's translation as it is
@@ -1150,6 +1256,8 @@ let runWith (p: Passes) (first: int) (temps: int) (items: Item array) (lines: in
     step p.accCopies (forwardWith true)
     step p.copyForward copyForward
     step p.deadTemps (deadTempsFrom first temps)
+  step p.joins (joinAccumulators first temps)
+  if p.joins then step p.deadTemps (deadTempsFrom first temps)
   step p.promote (promote first temps)
   step p.assign (assign first temps)
   for _ in 1 .. 2 do
