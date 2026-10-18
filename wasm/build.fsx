@@ -5,6 +5,10 @@ open System.Diagnostics
 let root = Path.GetFullPath(Path.Combine(__SOURCE_DIRECTORY__, ".."))
 let scratch = Path.Combine(root, ".bench/wasm")
 let upstream = Path.Combine(scratch, "upstream")
+if String.IsNullOrEmpty(Environment.GetEnvironmentVariable "EM_CACHE") then
+  let cache = Path.Combine(scratch, "emscripten-cache")
+  Directory.CreateDirectory cache |> ignore
+  Environment.SetEnvironmentVariable("EM_CACHE", cache)
 let arguments = fsi.CommandLineArgs |> Array.skip 1
 let checkout =
   match arguments with
@@ -78,6 +82,15 @@ File.WriteAllText(helpers,
   (File.ReadAllText helpers).Replace(
     "static_assert(sizeof(m_block.dsp().m_interruptFunc) == 8);",
     "static_assert(sizeof(m_block.dsp().m_interruptFunc) == sizeof(void*));"))
+// Pipeline lookahead can read unmapped memory. Preserve upstream's zero return, but bound
+// diagnostics so repeated speculative reads cannot flood an AudioWorklet's console.
+let memoryFile = Path.Combine(upstream, "source/dsp56kEmu/memory.cpp")
+let memorySource = File.ReadAllText memoryFile
+if not (memorySource.Contains "LOG_ERR_MEM_READ( _offset );") then
+  failwith "Upstream unmapped-read diagnostics changed"
+File.WriteAllText(memoryFile,
+  memorySource.Replace("LOG_ERR_MEM_READ( _offset );",
+    "static unsigned diagnostics = 0; if (diagnostics++ < 4) { LOG_ERR_MEM_READ( _offset ); }"))
 printfn "[2/3] Configure WebAssembly interpreter"
 let build = Path.Combine(scratch, "build")
 run root "emcmake"

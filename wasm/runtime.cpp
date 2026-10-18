@@ -10,6 +10,7 @@ PeripheralsNop peripheralX, peripheralY;
 std::unique_ptr<Memory> memory;
 std::unique_ptr<DSP> dsp;
 uint32_t size = 0;
+uint32_t bridge = 0;
 constexpr EReg registers[] = {
   Reg_R0, Reg_R1, Reg_R2, Reg_R3, Reg_R4, Reg_R5, Reg_R6, Reg_R7,
   Reg_N0, Reg_N1, Reg_N2, Reg_N3, Reg_N4, Reg_N5, Reg_N6, Reg_N7,
@@ -23,9 +24,11 @@ bool valid(uint32_t bank, uint32_t address) {
 }
 
 extern "C" {
-void dsp_destroy() { dsp.reset(); memory.reset(); size = 0; }
+double dsp_cycles() { return dsp ? static_cast<double>(dsp->getCycles()) : 0; }
+double dsp_operations() { return dsp ? static_cast<double>(dsp->getInstructionCounter()) : 0; }
+void dsp_destroy() { dsp.reset(); memory.reset(); size = 0; bridge = 0; }
 int dsp_create(uint32_t words) {
-  if (words < 256 || words > 0x160000) return -1;
+  if (words < 256 || words > 0x180000) return -1;
   dsp_destroy();
   try {
     memory = std::make_unique<Memory>(validator, words);
@@ -35,10 +38,16 @@ int dsp_create(uint32_t words) {
     return 0;
   } catch (...) { dsp_destroy(); return -2; }
 }
+int dsp_bridge(uint32_t address) {
+  if (!dsp || address == 0 || address >= size) return -1;
+  memory->setExternalMemory(address, true);
+  bridge = address;
+  return 0;
+}
 int dsp_write(uint32_t bank, uint32_t address, uint32_t word) {
   if (!valid(bank, address) || word > 0xffffff) return -1;
   if (!memory->set(static_cast<EMemArea>(bank), address, word)) return -2;
-  if (bank == 0) dsp->clearOpcodeCache(address);
+  if (bank == 0 || (bridge && address >= bridge)) dsp->clearOpcodeCache(address);
   return 0;
 }
 int dsp_read(uint32_t bank, uint32_t address) {

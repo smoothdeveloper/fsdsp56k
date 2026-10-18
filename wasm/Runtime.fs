@@ -6,6 +6,7 @@ open Fable.Core.JsInterop
 
 type RegisterWrite = { register: int; word: int }
 type Segment = { bank: int; address: int; data: int array }
+type TraceRegion = { bank: int; address: int; words: int }
 
 /// Versioned transport for assembled kernels; firmware-specific addresses belong to the caller.
 type KernelImage =
@@ -20,7 +21,10 @@ type KernelImage =
     render: int
     trig: int option
     outputBank: int
-    output: int }
+    output: int
+    inputBank: int
+    input: int
+    externalMemory: int option }
 
 [<AllowNullLiteral>]
 type AudioContext =
@@ -49,7 +53,7 @@ let addProcessor (context: AudioContext) (url: string) : JS.Promise<unit> = jsNa
 [<Emit("fetch($0).then(r => { if (!r.ok) throw new Error('Cannot fetch DSP runtime: ' + r.status); return r.arrayBuffer(); }).then(b => WebAssembly.compile(b))")>]
 let compileModule (url: string) : JS.Promise<obj> = jsNative
 
-[<Emit("new AudioWorkletNode($0, 'dsp56300', {numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2], processorOptions: {module: $1}})")>]
+[<Emit("new AudioWorkletNode($0, 'dsp56300', {numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2], processorOptions: {module: $1}})")>]
 let createNode (context: AudioContext) (compiledModule: obj) : AudioNode = jsNative
 
 let load (node: AudioNode) (image: KernelImage) =
@@ -69,3 +73,17 @@ let registers (node: AudioNode) (values: RegisterWrite array) =
 
 let trig (node: AudioNode) =
   node.port.postMessage (createObj [ "type" ==> "trig" ])
+
+/// Optional intermediate-buffer traces; each region is sampled after every DSP block.
+let trace (node: AudioNode) (regions: TraceRegion array) =
+  node.port.postMessage (createObj [ "type" ==> "trace"; "regions" ==> regions ])
+
+[<AllowNullLiteral>]
+type GainNode =
+  abstract connect: obj -> unit
+
+[<Emit("(()=>{const n=$0.createGain();n.gain.value=$1;return n})()")>]
+let createGain (context: AudioContext) (value: float) : GainNode = jsNative
+
+[<Emit("$0.gain.value=$1")>]
+let setGain (node: GainNode) (value: float) : unit = jsNative

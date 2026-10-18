@@ -102,13 +102,14 @@ pub unsafe extern "C" fn fsd_assemble(source: *const c_char, out: *mut u8, cap: 
     write_str(&result, out, cap)
 }
 
-/// One emulated DSP with flat X, Y and P RAM from address 0.
+/// One emulated DSP; optional external X/Y regions share the P backing store.
 pub struct Emu {
     _x: Vec<u32>,
     _y: Vec<u32>,
     _p: Vec<u32>,
     state: DspState,
     jit: JitEngine,
+    bridge: u32,
 }
 
 fn region(buf: &mut [u32]) -> Vec<MemoryRegion> {
@@ -127,7 +128,27 @@ pub extern "C" fn fsd_emu_create(p_words: u32, x_words: u32, y_words: u32) -> *m
     let map = MemoryMap { x_regions: region(&mut x), y_regions: region(&mut y), p_regions: region(&mut p) };
     let state = DspState::new(map);
     let jit = JitEngine::new(p_words as usize);
-    Box::into_raw(Box::new(Emu { _x: x, _y: y, _p: p, state, jit }))
+    Box::into_raw(Box::new(Emu { _x: x, _y: y, _p: p, state, jit, bridge: 0 }))
+}
+
+/// X/Y external addresses share the P backing store; internal banks remain independent.
+#[unsafe(no_mangle)]
+pub extern "C" fn fsd_emu_create_bridged(p_words: u32, x_words: u32, y_words: u32, boundary: u32) -> *mut Emu {
+    if boundary == 0 || boundary >= p_words.min(x_words).min(y_words) || p_words < x_words.max(y_words) {
+        return std::ptr::null_mut();
+    }
+    let mut x = vec![0u32; x_words as usize];
+    let mut y = vec![0u32; y_words as usize];
+    let mut p = vec![0u32; p_words as usize];
+    let shared = p.as_mut_ptr();
+    let bridged = |buf: &mut [u32]| vec![
+        MemoryRegion { start: 0, end: boundary, kind: RegionKind::Buffer { base: buf.as_mut_ptr(), offset: 0 } },
+        MemoryRegion { start: boundary, end: buf.len() as u32, kind: RegionKind::Buffer { base: shared, offset: boundary } },
+    ];
+    let map = MemoryMap { x_regions: bridged(&mut x), y_regions: bridged(&mut y), p_regions: region(&mut p) };
+    let state = DspState::new(map);
+    let jit = JitEngine::new(p_words as usize);
+    Box::into_raw(Box::new(Emu { _x: x, _y: y, _p: p, state, jit, bridge: boundary }))
 }
 
 /// # Safety
@@ -153,7 +174,7 @@ pub unsafe extern "C" fn fsd_emu_read(emu: *const Emu, space: u32, addr: u32) ->
 pub unsafe extern "C" fn fsd_emu_write(emu: *mut Emu, space: u32, addr: u32, value: u32) {
     let emu = unsafe { &mut *emu };
     let s = space_of(space);
-    if s == MemSpace::P && emu.state.map.read_pram(addr) != value & 0xff_ffff {
+    if (s == MemSpace::P || (emu.bridge != 0 && addr >= emu.bridge)) && emu.state.map.read_pram(addr) != value & 0xff_ffff {
         emu.state.pram_dirty.mark_dirty(addr);
     }
     emu.state.write_memory(s, addr, value);

@@ -7,12 +7,15 @@ open dsp56k.Wasm
 [<AllowNullLiteral>]
 type Exports =
   abstract _dsp_create: int -> int
+  abstract _dsp_bridge: int -> int
   abstract _dsp_destroy: unit -> unit
   abstract _dsp_write: int * int * int -> int
   abstract _dsp_read: int * int -> int
   abstract _dsp_reg_write: int * int -> int
   abstract _dsp_reg_read: int -> int
   abstract _dsp_call: int * int -> int
+  abstract _dsp_cycles: unit -> float
+  abstract _dsp_operations: unit -> float
 
 [<ImportDefault("./dsp56300.mjs")>]
 let createDsp (options: obj) : JS.Promise<Exports> = jsNative
@@ -28,8 +31,10 @@ let validWord word = integer word && word >= 0 && word <= 0xffffff
 
 type Instance(exports: Exports, image: KernelImage) as this =
   let mutable beforeRender = Array.copy image.beforeRender
+  let mutable lastCycles = 0.
+  let mutable lastOperations = 0.
   do
-    if image.version <> 1 || not (integer image.words) || image.words < 256 || image.words > 0x160000 then
+    if image.version <> 1 || not (integer image.words) || image.words < 256 || image.words > 0x180000 then
       failwith "Unsupported kernel image"
     if not (integer image.frames) || image.frames < 1 || image.frames > 1024 then
       failwith "Invalid block size"
@@ -38,6 +43,10 @@ type Instance(exports: Exports, image: KernelImage) as this =
     if image.outputBank < 0 || image.outputBank > 2 then failwith "Invalid output bank"
     exports._dsp_create image.words |> check "create" |> ignore
     try
+      image.externalMemory |> Option.iter (fun address ->
+        if not (integer address) || address <= 0 || address >= image.words then
+          failwith "Invalid external-memory boundary"
+        exports._dsp_bridge address |> check "external memory" |> ignore)
       for segment in image.segments do
         if segment.address + segment.data.Length > image.words then failwith "Memory segment outside image"
         segment.data |> Array.iteri (fun index word -> this.Write(segment.bank, segment.address + index, word))
@@ -48,6 +57,13 @@ type Instance(exports: Exports, image: KernelImage) as this =
       reraise()
 
   member _.Image = image
+  member _.LastCycles = lastCycles
+  member _.LastOperations = lastOperations
+
+  member _.Read(bank, address) =
+    if not (integer bank && integer address) || bank < 0 || bank > 2 || address < 0 || address >= image.words then
+      failwith "Invalid memory read"
+    exports._dsp_read(bank, address) |> check "read"
 
   member _.Write(bank, address, word) =
     if not (integer bank && integer address && validWord word)
@@ -73,8 +89,16 @@ type Instance(exports: Exports, image: KernelImage) as this =
     if not (integer entry) || entry < 0 || entry >= image.words - 1 then failwith "Invalid entry point"
     exports._dsp_call(entry, 1000000) |> check "call"
 
+  member this.Trigger() =
+    this.Registers beforeRender
+    image.trig |> Option.iter (fun entry -> this.Call entry |> ignore)
+
   member this.Render() =
     this.Registers beforeRender
+    let cycles = exports._dsp_cycles()
+    let operations = exports._dsp_operations()
     this.Call image.render |> ignore
+    lastCycles <- exports._dsp_cycles() - cycles
+    lastOperations <- exports._dsp_operations() - operations
     Array.init (image.frames * 2) (fun i ->
       exports._dsp_read(image.outputBank, image.output + i) |> check "read")

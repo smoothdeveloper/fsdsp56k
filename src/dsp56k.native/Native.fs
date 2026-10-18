@@ -27,6 +27,9 @@ module Raw =
   extern nativeint fsd_emu_create(uint32 pWords, uint32 xWords, uint32 yWords)
 
   [<DllImport(Lib)>]
+  extern nativeint fsd_emu_create_bridged(uint32 pWords, uint32 xWords, uint32 yWords, uint32 boundary)
+
+  [<DllImport(Lib)>]
   extern void fsd_emu_destroy(nativeint emu)
 
   [<DllImport(Lib)>]
@@ -127,10 +130,16 @@ type Space =
   | Y = 1u
   | P = 2u
 
-/// One emulated DSP56300 with flat X, Y and P RAM.
-type Emulator(pWords: int, xWords: int, yWords: int) =
+/// One DSP56300 with independent internal banks and optional shared external P/X/Y RAM.
+type Emulator(pWords: int, xWords: int, yWords: int, ?externalMemory: int) =
   do load () |> ignore
-  let handle = Raw.fsd_emu_create(uint32 pWords, uint32 xWords, uint32 yWords)
+  let handle =
+    match externalMemory with
+    | None -> Raw.fsd_emu_create(uint32 pWords, uint32 xWords, uint32 yWords)
+    | Some boundary when boundary > 0 && boundary < min pWords (min xWords yWords) ->
+      Raw.fsd_emu_create_bridged(uint32 pWords, uint32 xWords, uint32 yWords, uint32 boundary)
+    | _ -> invalidArg "externalMemory" "Boundary must be inside all three banks"
+  do if handle = 0n then failwith "Could not create DSP emulator"
   let mutable disposed = false
 
   /// The P, X and Y words it was made with.
