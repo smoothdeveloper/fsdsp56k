@@ -110,13 +110,14 @@ type Ty =
   | TAcc
   | TArray of length: int       // a state field of Frac words
   | TLongArray of length: int   // a state field of Long values, element k hi:lo at words 2k, 2k+1
-  | TOther of Type
+  | TOther of string
 
-let tyOf (t: Type) =
-  if t = typeof<Frac> then TFrac
-  elif t = typeof<Long> then TLong
-  elif t = typeof<Acc> then TAcc
-  else TOther t
+let tyOf (t: Ir.IrTy) =
+  match t with
+  | Ir.TyFrac -> TFrac
+  | Ir.TyLong -> TLong
+  | Ir.TyAcc -> TAcc
+  | other -> TOther(Ir.IrTy.name other)
 
 /// Words per value in memory: Frac one, Long hi:lo, Acc hi:lo:ext (spills are exact).
 let words ty =
@@ -126,7 +127,7 @@ let words ty =
   | TAcc -> 3
   | TArray n -> n
   | TLongArray n -> 2 * n
-  | TOther t -> fail $"{t.Name} values have no place in DSP memory"
+  | TOther name -> fail $"{name} values have no place in DSP memory"
 
 /// The record fields and their workset words.
 type Field =
@@ -148,38 +149,62 @@ type Layout =
     | Some f -> f
     | None -> l.xState |> Array.find (fun f -> f.name = name)
 
-let layout (target: Target) (k: Kernel) =
-  let ps = FSharpType.GetRecordFields k.paramsType
-  if ps.Length > target.maxParams then fail $"{k.name}: {ps.Length} parameters, the target has {target.maxParams}"
+/// The record fields of a kernel, as the layout reads them.
+let fieldsOf (t: Type) : Ir.IrField array =
+  let irTy (p: PropertyInfo) =
+    let t = p.PropertyType
+    if t = typeof<Frac> then Ir.TyFrac
+    elif t = typeof<Acc> then Ir.TyAcc
+    elif t = typeof<Long> then Ir.TyLong
+    elif t = typeof<Frac array> then Ir.TyArray Ir.TyFrac
+    elif t = typeof<Long array> then Ir.TyArray Ir.TyLong
+    else Ir.TyOther t.Name
+  [| for p in FSharpType.GetRecordFields t ->
+       ({ name = p.Name; ty = irTy p; xMemory = p.GetCustomAttributes(typeof<XMemoryAttribute>, true).Length > 0
+          length =
+            match p.GetCustomAttributes(typeof<LengthAttribute>, true) with
+            | [| :? LengthAttribute as l |] when l.Words > 0 -> Some l.Words
+            | _ -> None } : Ir.IrField) |]
+
+/// Where the record fields of a kernel named `kernelName` go on `target`.
+let layoutOf (target: Target) (kernelName: string) (parameters: Ir.IrField array) (state: Ir.IrField array) =
+  if parameters.Length > target.maxParams then fail $"{kernelName}: {parameters.Length} parameters, the target has {target.maxParams}"
   let parameters =
-    ps |> Array.mapi (fun i p ->
-      if tyOf p.PropertyType <> TFrac then fail $"{k.name}: parameter {p.Name} must be a Frac"
-      { name = p.Name; ty = TFrac; offset = target.paramBase + i; bank = YMemory })
+    parameters |> Array.mapi (fun i p ->
+      if p.ty <> Ir.TyFrac then fail $"{kernelName}: parameter {p.name} must be a Frac"
+      { name = p.name; ty = TFrac; offset = target.paramBase + i; bank = YMemory })
   // Y fields from stateBase and X fields from X+0, each in the order declared
   let mutable at = target.stateBase
   let mutable xAt = 0
   let fields =
-    [| for p in (if k.stateType = typeof<unit> then [||] else FSharpType.GetRecordFields k.stateType) do
+    [| for p in state do
          let ty =
-           if p.PropertyType = typeof<Frac array> then
-             match p.GetCustomAttributes(typeof<LengthAttribute>, true) with
-             | [| :? LengthAttribute as l |] when l.Words > 0 -> TArray l.Words
-             | _ -> fail $"{k.name}: state field {p.Name} is an array: give its length, [<Length n>]"
-           elif p.PropertyType = typeof<Long array> then
-             match p.GetCustomAttributes(typeof<LengthAttribute>, true) with
-             | [| :? LengthAttribute as l |] when l.Words > 0 -> TLongArray l.Words
-             | _ -> fail $"{k.name}: state field {p.Name} is an array: give its length, [<Length n>] (in Longs)"
-           else tyOf p.PropertyType
+           match p.ty with
+           | Ir.TyArray Ir.TyFrac ->
+             match p.length with
+             | Some n -> TArray n
+             | None -> fail $"{kernelName}: state field {p.name} is an array: give its length, [<Length n>]"
+           | Ir.TyArray Ir.TyLong ->
+             match p.length with
+             | Some n -> TLongArray n
+             | None -> fail $"{kernelName}: state field {p.name} is an array: give its length, [<Length n>] (in Longs)"
+           | Ir.TyFrac -> TFrac
+           | Ir.TyLong -> TLong
+           | Ir.TyAcc -> TAcc
+           | other -> TOther(Ir.IrTy.name other)
          match ty with
          | TFrac | TLong | TAcc | TArray _ | TLongArray _ -> ()
-         | _ -> fail $"{k.name}: state field {p.Name} must be a Frac, a Long, an Acc or a [<Length n>] Frac or Long array"
-         if p.GetCustomAttributes(typeof<XMemoryAttribute>, true).Length > 0 then
-           { name = p.Name; ty = ty; offset = xAt; bank = XMemory }
+         | _ -> fail $"{kernelName}: state field {p.name} must be a Frac, a Long, an Acc or a [<Length n>] Frac or Long array"
+         if p.xMemory then
+           { name = p.name; ty = ty; offset = xAt; bank = XMemory }
            xAt <- xAt + words ty
          else
-           { name = p.Name; ty = ty; offset = at; bank = YMemory }
+           { name = p.name; ty = ty; offset = at; bank = YMemory }
            at <- at + words ty |]
-  if at > target.yLimit then fail $"{k.name}: the state needs Y+{at - 1}, the target has {target.yLimit} words"
-  if xAt > target.xLimit then fail $"{k.name}: the [<XMemory>] state needs X+{xAt - 1}, the target has {target.xLimit} words"
+  if at > target.yLimit then fail $"{kernelName}: the state needs Y+{at - 1}, the target has {target.yLimit} words"
+  if xAt > target.xLimit then fail $"{kernelName}: the [<XMemory>] state needs X+{xAt - 1}, the target has {target.xLimit} words"
   { parameters = parameters; state = fields |> Array.filter (fun f -> f.bank = YMemory); yWorkset = at
     xState = fields |> Array.filter (fun f -> f.bank = XMemory); xWorkset = xAt }
+
+let layout (target: Target) (k: Kernel) =
+  layoutOf target k.name (fieldsOf k.paramsType) (if k.stateType = typeof<unit> then [||] else fieldsOf k.stateType)

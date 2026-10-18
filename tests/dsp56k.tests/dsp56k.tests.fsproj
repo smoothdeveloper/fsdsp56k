@@ -34,6 +34,8 @@
     <Compile Include="ImportTests.fs" />
     <Compile Include="ToolTests.fs" />
     <Compile Include="KernelTests.fs" />
+    <Compile Include="KernelIrTests.fs" />
+    <Compile Include="IrFrontEndTests.fs" />
     <Compile Include="Main.fs" />
   </ItemGroup>
   <ItemGroup>

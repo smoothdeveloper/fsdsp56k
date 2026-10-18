@@ -13,18 +13,17 @@
 module dsp56k.kernel.Compile
 
 open System
-open System.Reflection
 open dsp56k
 open dsp56k.dsl
 open dsp56k.dsl.Asm
-open Microsoft.FSharp.Quotations
-open Microsoft.FSharp.Quotations.Patterns
+open dsp56k.kernel.Ir
+open dsp56k.kernel.Ir.Patterns
 open dsp56k.kernel.Kernel
 open System.Collections.Generic
 
 type Acc = dsp56k.kernel.Acc
 
-let owner (mi: MemberInfo) = match mi.DeclaringType with null -> "" | t -> string t.FullName
+let owner (m: Member) = m.Owner
 
 let someValue (v: obj | null) : obj option = match v with null -> None | v -> Some v
 
@@ -34,31 +33,28 @@ let someValue (v: obj | null) : obj option = match v with null -> None | v -> So
 let operators = "Microsoft.FSharp.Core.Operators"
 
 /// `a + b` on kernel types is Operators.op_Addition<Acc, Acc, Acc>: the type's own operator.
-let resolve (mi: MethodInfo) (args: Expr list) =
-  if owner mi = operators && mi.Name.StartsWith "op_" then
-    let types = args |> List.map _.Type |> List.toArray
+let resolve (m: Member) (args: Expr list) =
+  if owner m = operators && m.Name.StartsWith "op_" then
+    let types = args |> List.map _.Type
     types
-    |> Array.tryPick (fun t ->
-      match t.GetMethod(mi.Name, BindingFlags.Static ||| BindingFlags.Public, null, types, null) with
-      | null -> None
-      | m -> Some m)
-    |> Option.defaultValue mi
-  else mi
+    |> List.tryPick (fun t ->
+      match Ir.typeOperators.TryGetValue((t, m.Name, types)) with
+      | true, found -> Some found
+      | _ -> None)
+    |> Option.defaultValue m
+  else m
 
-/// Reflected definitions, read once: inlining and the use counts must see the same variables.
-let definitions = Collections.Concurrent.ConcurrentDictionary<MethodInfo, Expr option>()
-let reflected (mi: MethodInfo) = definitions.GetOrAdd(mi, fun mi -> Expr.TryGetReflectedDefinition mi)
+/// A call of one of F#'s generic operators, which `resolve` turns into the kernel type's own.
+let operatorCall (name: string) (returns: IrTy) (args: Expr list) = Expr.Call(Ir.fsharpOperator name returns, args)
 
-let intrinsic (m: MemberInfo) =
-  match m.GetCustomAttribute<IntrinsicAttribute>() with
-  | null -> None
-  | a -> Some a.Name
+/// A helper's body, read once (the member keeps it): inlining and the use counts must see the same variables.
+let reflected (m: Member) = m.Definition.Value
 
-let isConst (m: MemberInfo) = not (isNull (m.GetCustomAttribute<ConstAttribute>()))
+let intrinsic (m: Member) = m.Intrinsic
 
-let foldable (t: Type) =
-  t = typeof<Frac> || t = typeof<Acc> || t = typeof<Long> || t = typeof<Table>
-  || t.IsPrimitive || Microsoft.FSharp.Reflection.FSharpType.IsUnion t
+let isConst (m: Member) = m.IsConst
+
+let foldable (t: IrTy) = IrTy.foldable t
 
 /// FSharp.Core's generic operators cannot be invoked by reflection: evaluated here on ints,
 /// int64s, floats and bools.
@@ -104,12 +100,10 @@ let operator (name: string) (args: obj array) : obj option =
   | "op_GreaterThanOrEqual", _ -> cmp (fun c -> c >= 0)
   | _ -> None
 
-let invoke (mi: MethodInfo) (args: obj array) : obj | null =
+let invoke (mi: Member) (args: obj array) : obj | null =
   match (if owner mi = operators then operator mi.Name args else None) with
   | Some v -> v
-  | None ->
-  try mi.Invoke(null, args)
-  with :? TargetInvocationException as e -> fail $"{mi.Name}: {e.InnerException}"
+  | None -> mi.Invoke args
 
 // ---------------------------------------------------------------------------------------------
 // Compilation state.
@@ -123,7 +117,7 @@ type Home =
 
 type Ctx =
   { target   : Target
-    kernel   : Kernel
+    kernel   : IrKernel
     layout   : Layout
     items    : ResizeArray<Item>
     lines    : ResizeArray<int>     // the F# line each item came from (0: none)
@@ -156,7 +150,7 @@ type Ctx =
     unswitched : HashSet<Var>         // loops (by index) already split on a condition
     mutable bHeld  : bool             // an Acc local lives in B: nothing else may write it
     mutable bWrite : bool             // ...except the local's own updates
-    subs     : Dictionary<MethodInfo, Sub>   // [<Subroutine>] helpers called, compiled after the entries
+    subs     : Dictionary<Member, Sub>   // [<Subroutine>] helpers called, compiled after the entries
     floors   : Map<string, int>          // the least first word of a subroutine's (Refloor)
     kept     : HashSet<Var>                  // loops not unswitched: in [<NoUnswitch>] functions
     unrolled : HashSet<Var>                  // loops written out: in [<Unroll>] functions
@@ -172,8 +166,8 @@ type Ctx =
 /// A [<Subroutine>] helper: where its calls are, what they leave it.
 and Sub =
   { label    : string
-    mi       : MethodInfo
-    records  : Dictionary<Type, Var>              // the records (and output) its callers pass
+    mi       : Member
+    records  : Dictionary<IrTy, Var>              // the records (and output) its callers pass
     sites    : ResizeArray<CallSite>
     mutable compiled : bool
     mutable start    : int            // its first word, once compiled
@@ -222,12 +216,7 @@ let emit (ctx: Ctx) (it: Item) =
 let emitAll (ctx: Ctx) (its: Item seq) = for it in its do emit ctx it
 
 /// The source range quotations carry when compiled with --quotations-debug+.
-let debugRange (e: Expr) =
-  e.CustomAttributes |> List.tryPick (fun a ->
-    match a with
-    | NewTuple [ Value(:? string as tag, _); NewTuple [ Value(:? string as file, _); Value(:? int as line, _); _; _; _ ] ] when tag = "DebugRange" ->
-      Some(file, line)
-    | _ -> None)
+let debugRange (e: Expr) = e.Range |> Option.map (fun r -> r.file, r.line)
 
 let sourceLines = Collections.Concurrent.ConcurrentDictionary<string, string array>()
 
@@ -296,18 +285,18 @@ let effects =
 
 /// A helper the compiler inlines whose body only computes: no state written, no output, nothing
 /// but pure calls (it can run when the kernel is compiled, on constant arguments).
-let rec pureHelper (depth: int) (mi: MethodInfo) =
+let rec pureHelper (depth: int) (mi: Member) =
   depth < 8
   && (match reflected mi with
       | Some body ->
         let rec pureExpr (e: Expr) =
           match e with
-          | PropertySet _ | FieldSet _ -> false
+          | PropertySet _ -> false
           | Call(_, m, args) ->
             let pureCall =
               isConst m
               || (match intrinsic m with Some n -> not (Set.contains n effects) | None -> owner m = operators)
-              || (not m.IsGenericMethodDefinition && pureHelper (depth + 1) m)
+              || (not m.IsGeneric && pureHelper (depth + 1) m)
             pureCall && List.forall pureExpr args
           | ExprShape.ShapeVar _ -> true
           | ExprShape.ShapeLambda(_, b) -> pureExpr b
@@ -319,18 +308,16 @@ let rec tryConst (ctx: Ctx) (e: Expr) : obj option =
   match e with
   | Value(v, t) when foldable t -> someValue v
   | Var v when ctx.consts.ContainsKey v -> Some ctx.consts[v]
-  | PropertyGet(None, p, []) when foldable p.PropertyType -> someValue (p.GetValue null)
-  | PropertyGet(Some o, p, []) when foldable p.PropertyType ->
-    constObject ctx o |> Option.bind (fun x -> someValue (p.GetValue x))
+  | PropertyGet(None, p, []) when foldable p.ReturnType -> someValue (p.Get null)
+  | PropertyGet(Some o, p, []) when foldable p.ReturnType ->
+    constObject ctx o |> Option.bind (fun x -> someValue (p.Get x))
   | IfThenElse(c, t, f) ->
     match tryConst ctx c with
     | Some(:? bool as b) -> tryConst ctx (if b then t else f)
     | _ -> None
   // `match voice.layer with Metal t -> ...` on a constant: decided when compiling
   | UnionCaseTest(o, case) ->
-    constObject ctx o |> Option.map (fun x ->
-      let tag, _ = Microsoft.FSharp.Reflection.FSharpValue.GetUnionFields(x, case.DeclaringType)
-      (tag.Tag = case.Tag) :> obj)
+    constObject ctx o |> Option.map (fun x -> case.Test x :> obj)
   | Call(None, mi, args) ->
     let mi = resolve mi args
     let pure' = isConst mi || (match intrinsic mi with Some n -> not (Set.contains n effects) | None -> owner mi = operators)
@@ -348,8 +335,8 @@ let rec tryConst (ctx: Ctx) (e: Expr) : obj option =
 /// regions), their fields, constant-bound locals, folded expressions.
 and constObject (ctx: Ctx) (e: Expr) : obj option =
   match e with
-  | PropertyGet(None, p, []) -> someValue (p.GetValue null)
-  | PropertyGet(Some o, p, []) -> constObject ctx o |> Option.bind (fun x -> someValue (p.GetValue x))
+  | PropertyGet(None, p, []) -> someValue (p.Get null)
+  | PropertyGet(Some o, p, []) -> constObject ctx o |> Option.bind (fun x -> someValue (p.Get x))
   | Var v when ctx.consts.ContainsKey v -> Some ctx.consts[v]
   | _ -> tryConst ctx e
 
@@ -368,10 +355,10 @@ let rec normalize (e: Expr) : Expr =
   match e with
   // `let b = condition`: a word, Frac.ofBool, its uses tests of the word (a constant condition
   // stays a constant, the tests folded with it)
-  | Let(v, value, body) when v.Type = typeof<bool> && not v.IsMutable ->
-    let w = Var(v.Name, typeof<Frac>)
-    let test = <@@ (%%(Expr.Var w) : Frac) <> Frac.zero @@>
-    Expr.Let(w, Expr.Call(nonNull (typeof<Frac>.GetMethod "ofBool"), [ normalize value ]),
+  | Let(v, value, body) when v.Type = TyBool && not v.IsMutable ->
+    let w = Var(v.Name, TyFrac)
+    let test = Expr.Call(Ir.fsharpOperator "op_Inequality" TyBool, [ Expr.Var w; Ir.zero TyFrac ])
+    Expr.Let(w, Expr.Call(Ir.intrinsic "frac.ofBool", [ normalize value ]),
              normalize (body.Substitute(fun x -> if x = v then Some test else None)))
   // x |> f, f <| x, (a, b) ||> f: plain applications
   | Call(None, mi, [ x; f ]) when mi.Name = "op_PipeRight" && owner mi = operators -> normalize (Expr.Application(f, x))
@@ -405,7 +392,7 @@ let rec normalize (e: Expr) : Expr =
 
 /// Whether `e` (the helpers it calls included) may assign a record field named `name`.
 let writesField (name: string) (e: Expr) =
-  let seen = HashSet<MethodInfo>()
+  let seen = HashSet<Member>()
   let rec go (e: Expr) =
     match e with
     | PropertySet(_, p, _, _) when p.Name = name -> true
@@ -425,7 +412,7 @@ let noTouch = { reads = Set.empty; writes = Set.empty }
 let both (a: Touches) (b: Touches) = { reads = a.reads + b.reads; writes = a.writes + b.writes }
 
 /// Helpers' touches, their parameters and locals as any cursor, read once.
-let helperTouches = Collections.Concurrent.ConcurrentDictionary<MethodInfo, Touches>()
+let helperTouches = Collections.Concurrent.ConcurrentDictionary<Member, Touches>()
 
 let rec touches (inHelper: bool) (e: Expr) : Touches =
   let all xs = xs |> List.map (touches inHelper) |> List.fold both noTouch
@@ -437,7 +424,7 @@ let rec touches (inHelper: bool) (e: Expr) : Touches =
     both (all rest) { reads = Set.empty; writes = set [ "F:" + p.Name ] }
   | Call(None, mi, (PropertyGet(_, p, []) :: rest)) when mi.Name = "GetArray" ->
     both (all rest) { reads = set [ "F:" + p.Name ]; writes = Set.empty }
-  | Call(Some(Var c), mi, args) when c.Type = typeof<Cursor> ->
+  | Call(Some(Var c), mi, args) when c.Type = TyCursor ->
     let k = cursor c
     let own =
       match intrinsic mi with
@@ -446,7 +433,7 @@ let rec touches (inHelper: bool) (e: Expr) : Touches =
       | Some("cursor.put" | "cursor.putUp" | "cursor.putDown") -> { reads = set [ k ]; writes = set [ k; "M" ] }
       | _ -> { reads = set [ k; "M" ]; writes = set [ k ] }
     both (all args) own
-  | Call(Some o, _, args) when o.Type = typeof<Output> -> both (all args) { reads = set [ "O" ]; writes = set [ "O" ] }
+  | Call(Some o, _, args) when o.Type = TyOutput -> both (all args) { reads = set [ "O" ]; writes = set [ "O" ] }
   | Call(None, mi, args) ->
     match intrinsic (resolve mi args) with
     | Some "region.write" -> both (all args) { reads = Set.empty; writes = set [ "M" ] }
@@ -474,7 +461,7 @@ let conflict (earlier: Touches) (later: Touches) =
 /// otherwise places operands as the instructions want them, products before what they are
 /// added to). An expression with nothing to order is returned as it is, the same object.
 let rec ordered (e: Expr) : Expr =
-  let dsp (t: Type) = t = typeof<Frac> || t = typeof<Acc> || t = typeof<Long>
+  let dsp (t: IrTy) = t = TyFrac || t = TyAcc || t = TyLong
   match e with
   | Call(o, mi, args) ->
     let o' = o |> Option.map ordered
@@ -510,7 +497,7 @@ let rec intOfVars (e: Expr) =
   | _ -> false
 
 /// A call to a kernel helper: its parameters bound to the arguments.
-let inlined (mi: MethodInfo) (args: Expr list) =
+let inlined (mi: Member) (args: Expr list) =
   match reflected mi with
   | Some def ->
     let rec bind (body: Expr) (args: Expr list) =
@@ -521,22 +508,22 @@ let inlined (mi: MethodInfo) (args: Expr list) =
       | Lambda(v, rest), (Var _ as a) :: more -> (bind rest more : Expr).Substitute(fun x -> if x = v then Some a else None)
       // and an int of variables and constants (`i - 1`, a loop index): substituted, so the
       // body's s.field[k + 1] is the caller's s.field[i - 1 + 1]
-      | Lambda(v, rest), a :: more when a.Type = typeof<int> && intOfVars a ->
+      | Lambda(v, rest), a :: more when a.Type = TyInt && intOfVars a ->
         (bind rest more : Expr).Substitute(fun x -> if x = v then Some a else None)
       | Lambda(v, rest), (PropertyGet(Some(Var _), p, []) as a) :: more when not (writesField p.Name rest) ->
         (bind rest more : Expr).Substitute(fun x -> if x = v then Some a else None)
       | Lambda(v, rest), a :: more -> Expr.Let(v, a, bind rest more)
       // `let f () = ...` is a method of no parameters called with none: its unit argument
       // stands for nothing
-      | Lambda(v, rest), [] when v.Type = typeof<unit> && mi.GetParameters().Length = 0 -> rest
+      | Lambda(v, rest), [] when v.Type = TyUnit && mi.ParameterCount = 0 -> rest
       | body, [] -> body
       | _ -> fail $"{mi.Name}: partial application is not supported"
     ordered (normalize (bind def args))
   | None -> fail $"{owner mi}.{mi.Name} is neither an intrinsic nor a [<ReflectedDefinition>] function"
 
 /// A helper marked [<Subroutine>]: called, not inlined.
-let isSubroutine (mi: MethodInfo) =
-  not (isNull (mi.GetCustomAttribute<SubroutineAttribute>())) && (reflected mi).IsSome
+let isSubroutine (mi: Member) =
+  mi.Marks.Contains "Subroutine" && (reflected mi).IsSome
 
 /// A helper's parameters and body.
 let parametersOf (def: Expr) =
@@ -551,7 +538,7 @@ let parametersOf (def: Expr) =
 let stackLevels = 12
 
 /// A subroutine's name across compilations.
-let subKey (mi: MethodInfo) = $"{mi.DeclaringType.FullName}.{mi.Name}:{mi.MetadataToken}"
+let subKey (mi: Member) = mi.Key
 
 /// The registers a subroutine's arguments arrive in.
 let fracArgs = [ X0; Y0; X1; Y1 ]
@@ -649,7 +636,7 @@ let storeA (h: Home) =
   | TLong -> [| move a1 (at h 0); move a0 (at h 1) |]
   | TFrac -> fail "a Frac home takes a word, not an accumulator"
   | TArray _ | TLongArray _ -> fail "an array is written element by element"
-  | TOther t -> fail $"{t.Name} has no home"
+  | TOther t -> fail $"{t} has no home"
 
 /// The arguments of a call to intrinsic `name`.
 let (|Intr|_|) (name: string) (e: Expr) =
@@ -776,7 +763,7 @@ let rec wordLeaf (ctx: Ctx) (e: Expr) : Word option =
       | AOfLong(hi, lo) -> Some(WMem(if word = 0 then hi else lo))
       | AOfWord w when word = 0 -> Some w
       | _ -> None
-    | Call(None, mi, [ Var i ]) when mi.Name = "ofRaw" && mi.DeclaringType = typeof<Frac> && ctx.counters.ContainsKey i ->
+    | Call(None, mi, [ Var i ]) when mi.Name = "ofRaw" && mi.Declaring = TyFrac && ctx.counters.ContainsKey i ->
       Some(WMem(at ctx.counters[i] 0))
     | Call(None, mi, _) when intrinsic mi = Some "track.number" ->
       match ctx.trackHome with
@@ -963,7 +950,7 @@ let ringTapOf (ctx: Ctx) (value: Expr) : RingTap option =
   let under (env: (Var * Expr) list) (e: Expr) = List.foldBack (fun (v, x) b -> Expr.Let(v, x, b)) env e
   let rec find (env: (Var * Expr) list) (e: Expr) =
     match e with
-    | Let(v, x, b) when not v.IsMutable && not (v.Type = typeof<Cursor>) -> find (env @ [ v, x ]) b
+    | Let(v, x, b) when not v.IsMutable && not (v.Type = TyCursor) -> find (env @ [ v, x ]) b
     | Call(None, mi, args) when intrinsic (resolve mi args) = None && not (isSubroutine mi) && (reflected mi).IsSome ->
       find env (inlined mi args)
     | Intr "region.read" [ r; i ] ->
@@ -988,7 +975,7 @@ let ringTapOf (ctx: Ctx) (value: Expr) : RingTap option =
       | Intr "acc.hi" [ Intr "acc.addFrac" [ Intr "acc.andHi" [ m; x ]; b ] ] -> ring m x b
       | _ -> None
     | _ -> None
-  if value.Type <> typeof<Frac> then None else find [] value
+  if value.Type <> TyFrac then None else find [] value
 
 let snapshot (ctx: Ctx) =
   let count = ctx.items.Count
@@ -1039,7 +1026,7 @@ let invariantIf (ctx: Ctx) (index: Var) (body: Expr) =
         | Some n ->
           not (n.StartsWith "cursor.") && n <> "out.write" && n <> "out.pair" && n <> "region.read" && n <> "region.write"
           && n <> "loop.everyPass"
-        | None -> owner mi' = operators || isConst mi' || mi'.DeclaringType = typeof<Frac> || mi'.DeclaringType = typeof<Acc>
+        | None -> owner mi' = operators || isConst mi' || mi'.Declaring = TyFrac || mi'.Declaring = TyAcc
       ok && List.forall pure' args
     | _ -> false
   let rec find (e: Expr) =
@@ -1119,7 +1106,7 @@ let freePair (ctx: Ctx) =
 let yields (ctx: Ctx) (v: Var) (value: Expr) (body: Expr) =
   let rec carried (e: Expr) =
     match e with
-    | Let(w, _, b) when w.IsMutable && w.Type = typeof<Acc> && acrossControl w b -> true
+    | Let(w, _, b) when w.IsMutable && w.Type = TyAcc && acrossControl w b -> true
     | ExprShape.ShapeVar _ -> false
     | ExprShape.ShapeLambda(_, b) -> carried b
     | ExprShape.ShapeCombination(_, xs) -> List.exists carried xs
@@ -1133,14 +1120,14 @@ let selection (ctx: Ctx) (e: Expr) =
   | IfThenElse(c, t, f) ->
     let v = Var("select", e.Type, true)
     let leaf =
-      if e.Type = typeof<Frac> then (wordLeaf ctx f).IsSome
-      elif e.Type = typeof<Long> then (longLeaf ctx f).IsSome
+      if e.Type = TyFrac then (wordLeaf ctx f).IsSome
+      elif e.Type = TyLong then (longLeaf ctx f).IsSome
       else (accLeaf ctx f).IsSome
     let quiet = (touches false c).writes.IsEmpty && (touches false t).writes.IsEmpty
     if leaf && quiet then
       Expr.Let(v, f, Expr.Sequential(Expr.IfThenElse(c, Expr.VarSet(v, t), Expr.Value(())), Expr.Var v))
     else
-      let zero = Expr.PropertyGet(nonNull (e.Type.GetProperty "zero"))
+      let zero = Ir.zero e.Type
       Expr.Let(v, zero, Expr.Sequential(Expr.IfThenElse(c, Expr.VarSet(v, t), Expr.VarSet(v, f)), Expr.Var v))
   | _ -> e
 
@@ -1399,7 +1386,7 @@ and genWord (ctx: Ctx) (e: Expr) : unit =
       | Some "acc.hi", [x] -> emit ctx (move (accPart ctx x 1) x0)
       | Some "acc.lo", [x] -> emit ctx (move (accPart ctx x 0) x0)
       | Some "acc.sat", [x] -> emit ctx (move (accPart ctx x 2) x0)
-      | Some "frac.ofBool", [c] -> genWord ctx (selection ctx (Expr.IfThenElse(c, <@@ Frac.ofRaw 1 @@>, <@@ Frac.zero @@>)))
+      | Some "frac.ofBool", [c] -> genWord ctx (selection ctx (Expr.IfThenElse(c, Expr.Value(box (Frac.ofRaw 1), TyFrac), Ir.zero TyFrac)))
       | Some "table.read", [t; i] -> tableRead ctx t i 1 0 x0
       | Some "region.read", [_; i] when ctx.affineAt.ContainsKey i ->
         emit ctx (move ctx.affineAt[i] x0)
@@ -1422,12 +1409,12 @@ and genWord (ctx: Ctx) (e: Expr) : unit =
         importHere ctx cell.name cell.abiSymbol (move (xm (absL 0)) x0)
       // the word in a1: `lsr #n,a` or `lsr s,a`, then a1
       | Some("frac.lsr" | "frac.lsrBy" as op), [n; f] ->
-        let ofFrac = Expr.Call(nonNull (typeof<Acc>.GetMethod "ofFrac"), [ f ])
-        let shifted = Expr.Call(nonNull (typeof<Acc>.GetMethod(if op = "frac.lsr" then "lsr" else "lsrBy")), [ n; ofFrac ])
-        genWord ctx (Expr.Call(nonNull (typeof<Acc>.GetMethod "hi"), [ shifted ]))
+        let ofFrac = Expr.Call(Ir.intrinsic "acc.ofFrac", [ f ])
+        let shifted = Expr.Call(Ir.intrinsic (if op = "frac.lsr" then "acc.lsr" else "acc.lsrBy"), [ n; ofFrac ])
+        genWord ctx (Expr.Call(Ir.intrinsic "acc.hi", [ shifted ]))
       | Some "frac.lfsr", [taps; st] ->
         let taps = constInt ctx "LFSR taps" taps
-        genAcc ctx (Expr.Call(nonNull (typeof<Acc>.GetMethod "ofFrac"), [ st ]))
+        genAcc ctx (Expr.Call(Ir.intrinsic "acc.ofFrac", [ st ]))
         let skip = fresh ctx "LFSR"
         emit ctx (lsl a)
         emit ctx (bcc Cond.Cc skip)
@@ -1480,7 +1467,7 @@ and tableRead (ctx: Ctx) (t: Expr) (index: Expr) (width: int) (col: int) (dst: R
         emit ctx (move x0 r0)
   else
     // a1 = index * width, by shifts and adds
-    genAcc ctx (Expr.Call(nonNull (typeof<Acc>.GetMethod "ofFrac"), [ index ]))
+    genAcc ctx (Expr.Call(Ir.intrinsic "acc.ofFrac", [ index ]))
     if width > 1 then
       let bits = Convert.ToString(width, 2)
       emit ctx (tfr a b)
@@ -1507,7 +1494,7 @@ and indexInN0 (ctx: Ctx) (w: Expr) (extra: int) =
   match wordLeaf ctx w with
   | Some leaf when extra = 0 -> emitAll ctx (loadWord leaf (N 0))
   | _ ->
-    genAcc ctx (Expr.Call(nonNull (typeof<Acc>.GetMethod "ofFrac"), [ w ]))
+    genAcc ctx (Expr.Call(Ir.intrinsic "acc.ofFrac", [ w ]))
     if extra <> 0 then emit ctx (add (immL (extra &&& 0xffffff)) a)
     emit ctx (move a1 (N 0))
 
@@ -1535,7 +1522,7 @@ and computedMem (bank: Bank) : Mem =
 /// Whether computing `e` may write r0 or n0: table reads, region and computed array accesses,
 /// in e or the helpers it calls.
 and usesIndexRegs (ctx: Ctx) (e: Expr) =
-  let seen = HashSet<MethodInfo>()
+  let seen = HashSet<Member>()
   let rec go (e: Expr) =
     match e with
     | Call(None, mi, args) ->
@@ -1693,7 +1680,7 @@ and store (ctx: Ctx) (h: Home) (e: Expr) =
     | _ -> genLong ctx e
     emitAll ctx (storeA h)
   | TArray _ | TLongArray _ -> fail "an array state field is written element by element, s.field[k] <- v"
-  | TOther t -> fail $"{t.Name} values cannot be stored"
+  | TOther t -> fail $"{t} values cannot be stored"
 
 /// A value into the accumulator holding a local: multiplications onto the local and words added
 /// to it done there, anything else computed in A and copied.
@@ -1818,7 +1805,7 @@ and withLet (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> un
     body ()
     ctx.vars <- saved
   elif not v.IsMutable && ringGroup ctx v value bodyExpr body then ()
-  elif v.Type = typeof<Cursor> then withCursor ctx v value bodyExpr body
+  elif v.Type = TyCursor then withCursor ctx v value bodyExpr body
   elif (match tyOf v.Type with TOther _ -> true | _ -> false) then
     // not a DSP value: a table, a region, a configuration record... known at compile time
     match constObject ctx value with
@@ -1827,7 +1814,7 @@ and withLet (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> un
       ctx.consts <- ctx.consts.Add(v, c)
       body ()
       ctx.consts <- saved             // an inlined helper's variables are shared by its instances
-    | _ -> fail $"{v.Name}: a {v.Type.Name} must be an immutable constant (only Frac, Acc and Long live on the DSP)"
+    | _ -> fail $"{v.Name}: a {IrTy.name v.Type} must be an immutable constant (only Frac, Acc and Long live on the DSP)"
   else
   match tryConst ctx value with
   | Some c when not v.IsMutable ->
@@ -1878,7 +1865,7 @@ and ringGroup (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> 
       t.region.name = first.region.name && t.mask = first.mask && t.baseKey = first.baseKey && t.posKey = first.posKey
     let rec more (e: Expr) acc =
       match e with
-      | Let(w, x, b) when not w.IsMutable && w.Type = typeof<Frac> ->
+      | Let(w, x, b) when not w.IsMutable && w.Type = TyFrac ->
         match ringTapOf ctx x with
         | Some t when same t -> more b ((w, x, t) :: acc)
         | _ -> List.rev acc
@@ -1897,7 +1884,7 @@ and ringGroup (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> 
       genAcc ctx first.wrapped
       emit ctx (and' (immL first.mask) a)
       emit ctx (move a1 (N reg))
-      genAcc ctx (Expr.Call(nonNull (typeof<Acc>.GetMethod "ofFrac"), [ first.baseExpr ]))
+      genAcc ctx (Expr.Call(Ir.intrinsic "acc.ofFrac", [ first.baseExpr ]))
       importHere ctx first.region.name first.region.abiSymbol (move (immL 0) x0)
       emit ctx (add x0 a)
       emit ctx (move a1 (R reg))
@@ -1983,7 +1970,7 @@ and inMemory (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> u
 /// The Frac locals bound inside an expression while `v` is still read: those whose scope uses it.
 and rivalsOf (v: Var) (e: Expr) =
   match e with
-  | Let(w, value, body) when w.Type = typeof<Frac> ->
+  | Let(w, value, body) when w.Type = TyFrac ->
     (if body.GetFreeVars() |> Seq.contains v then [ w ] else []) @ rivalsOf v value @ rivalsOf v body
   | ExprShape.ShapeVar _ -> []
   | ExprShape.ShapeLambda(_, b) -> rivalsOf v b
@@ -1992,7 +1979,7 @@ and rivalsOf (v: Var) (e: Expr) =
 /// The Frac locals bound inside an expression.
 and innerLocals (e: Expr) =
   match e with
-  | Let(w, value, body) when w.Type = typeof<Frac> -> w :: innerLocals value @ innerLocals body
+  | Let(w, value, body) when w.Type = TyFrac -> w :: innerLocals value @ innerLocals body
   | ExprShape.ShapeVar _ -> []
   | ExprShape.ShapeLambda(_, b) -> innerLocals b
   | ExprShape.ShapeCombination(_, xs) -> List.collect innerLocals xs
@@ -2120,16 +2107,16 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
     let plus (a: Expr option) (b: Expr option) =
       match a, b with
       | None, x | x, None -> x
-      | Some x, Some y -> Some(<@@ Acc.hi (Acc.ofFrac (%%x : Frac) + (%%y : Frac)) @@>)
+      | Some x, Some y -> Some(Expr.Call(Ir.intrinsic "acc.hi", [ operatorCall "op_Addition" TyAcc [ Expr.Call(Ir.intrinsic "acc.ofFrac", [ x ]); y ] ]))
     let rec affine (env: Map<Var, Expr>) (e: Expr) : (Expr option * int * int) option =
       match tryConst ctx e with
       | Some(:? Frac as f) -> Some(None, 0, sext f.Word)
       | _ ->
         match e with
-        | Call(None, mi, [ Var i ]) when i = v && mi.Name = "ofRaw" && mi.DeclaringType = typeof<Frac> -> Some(None, 1, 0)
+        | Call(None, mi, [ Var i ]) when i = v && mi.Name = "ofRaw" && mi.Declaring = TyFrac -> Some(None, 1, 0)
         | Var x when env.ContainsKey x -> affine env env[x]
         | Var x when lets.ContainsKey x -> affine env lets[x]
-        | Var x when x.Type = typeof<Frac> && not (assignedIn.Contains x) && not (boundIn.Contains x) && ctx.vars.ContainsKey x ->
+        | Var x when x.Type = TyFrac && not (assignedIn.Contains x) && not (boundIn.Contains x) && ctx.vars.ContainsKey x ->
           Some(Some e, 0, 0)
         | Let(w, x, b) when not w.IsMutable -> affine (env.Add(w, x)) b
         | Intr "acc.hi" [ Intr "acc.addFrac" [ Intr "acc.ofFrac" [ a ]; b ] ] ->
@@ -2221,7 +2208,7 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
           arrays[p.Name] <- (min a c, max b c)
         | _ -> fail $"{p.Name} is not a [<Length n>] array"
         List.iter scan rest
-      | Call(None, mi, [ Var i ]) when i = v && mi.Name = "ofRaw" && mi.DeclaringType = typeof<Frac> -> counted <- true
+      | Call(None, mi, [ Var i ]) when i = v && mi.Name = "ofRaw" && mi.Declaring = TyFrac -> counted <- true
       // a helper given the index: what its body does with it once inlined
       | Call(None, mi, args) when intrinsic mi = None && not (isSubroutine mi) && (reflected mi).IsSome
                                   && args |> List.exists (fun a -> a.GetFreeVars() |> Seq.contains v) ->
@@ -2285,7 +2272,7 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
                 | None -> ctx.freeRegs.Head
               ctx.freeRegs <- ctx.freeRegs |> List.filter ((<>) reg)
               match inv with
-              | Some e -> genAcc ctx (Expr.Call(nonNull (typeof<Acc>.GetMethod "ofFrac"), [ e ]))
+              | Some e -> genAcc ctx (Expr.Call(Ir.intrinsic "acc.ofFrac", [ e ]))
               | None -> emit ctx (move (immL 0) a)
               if c * lo <> 0 then emit ctx (add (immL ((c * lo) &&& 0xffffff)) a)
               importHere ctx region.name region.abiSymbol (move (immL 0) x0)
@@ -2330,7 +2317,7 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
               | None -> ()
             if taken.Count = regions.Length then
               for region, reg in List.zip regions (List.ofSeq taken) do
-                genAcc ctx (Expr.Call(nonNull (typeof<Acc>.GetMethod "ofFrac"), [ Expr.Var w ]))
+                genAcc ctx (Expr.Call(Ir.intrinsic "acc.ofFrac", [ Expr.Var w ]))
                 importHere ctx region.name region.abiSymbol (move (immL 0) x0)
                 emit ctx (add x0 a)
                 emit ctx (move a1 (R reg))
@@ -2375,7 +2362,7 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
         ctx.freeRegs <- taken @ ctx.freeRegs
         let k = c * count
         if k <> 0 then
-          genStmt ctx (Expr.VarSet(w, <@@ Acc.hi (Acc.ofFrac (%%(Expr.Var w) : Frac) + Frac.ofRaw k) @@>))
+          genStmt ctx (Expr.VarSet(w, Expr.Call(Ir.intrinsic "acc.hi", [ operatorCall "op_Addition" TyAcc [ Expr.Call(Ir.intrinsic "acc.ofFrac", [ Expr.Var w ]); Expr.Value(box (Frac.ofRaw k), TyFrac) ] ])))
   | WhileLoop(cond, body) ->
     // the condition at the top, tested before each pass (none when it is false at once); the
     // condition and the body are compiled knowing the whole loop runs again after them
@@ -2410,9 +2397,9 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
       ctx.freeRegs <- freeRegs; ctx.released.Clear(); ctx.released.UnionWith released
       genStmt ctx f
       emit ctx (Label endLabel)
-  | Call(Some(Var o), mi, [x]) when o.Type = typeof<Output> && intrinsic mi = Some "out.write" ->
+  | Call(Some(Var o), mi, [x]) when o.Type = TyOutput && intrinsic mi = Some "out.write" ->
     storeWord ctx x (ym (inc r7))
-  | Call(Some(Var o), mi, [l; r]) when o.Type = typeof<Output> && intrinsic mi = Some "out.pair" ->
+  | Call(Some(Var o), mi, [l; r]) when o.Type = TyOutput && intrinsic mi = Some "out.pair" ->
     if ctx.target.channels <> 2 then fail $"{ctx.kernel.name}: WritePair needs a stereo target, {ctx.target.name} has {ctx.target.channels} channel(s)"
     storeWord ctx l (ym (inc r7))
     storeWord ctx r (ym (inc r7))
@@ -2459,7 +2446,7 @@ and liveTop (ctx: Ctx) =
     | _ -> top <- i + 1
   top
 
-and callSub (ctx: Ctx) (mi: MethodInfo) (args: Expr list) =
+and callSub (ctx: Ctx) (mi: Member) (args: Expr list) =
   // B holds a caller's Acc local: that local goes to memory instead (the subroutine may use B)
   if ctx.bHeld then raise BTaken
   let def = (reflected mi).Value
@@ -2475,10 +2462,10 @@ and callSub (ctx: Ctx) (mi: MethodInfo) (args: Expr list) =
       s
   let rec calling (s: Sub option) = match s with Some s when s.mi = mi -> true | Some s -> false | None -> false
   if calling ctx.inSub then fail $"{mi.Name}: a [<Subroutine>] cannot call itself"
-  let isRecord (t: Type) = t = ctx.kernel.paramsType || t = ctx.kernel.stateType || t = typeof<Output>
+  let isRecord (t: IrTy) = t = ctx.kernel.paramsType || t = ctx.kernel.stateType || t = TyOutput
   let pairs =
     match ps, args with
-    | [ u ], [] when u.Type = typeof<unit> -> []
+    | [ u ], [] when u.Type = TyUnit -> []
     | _ when ps.Length = args.Length -> List.zip ps args
     | _ -> fail $"{mi.Name}: a [<Subroutine>] takes all its arguments"
   let values =
@@ -2486,12 +2473,12 @@ and callSub (ctx: Ctx) (mi: MethodInfo) (args: Expr list) =
         if isRecord v.Type then
           match a with
           | Var w -> if not (sub.records.ContainsKey v.Type) then sub.records[v.Type] <- w
-          | _ -> fail $"{mi.Name}: pass the {v.Type.Name} record itself"
-        elif v.Type = typeof<unit> then ()
+          | _ -> fail $"{mi.Name}: pass the {IrTy.name v.Type} record itself"
+        elif v.Type = TyUnit then ()
         else
           match tyOf v.Type with
           | TFrac | TAcc | TLong -> yield v, a
-          | _ -> fail $"{mi.Name}: a [<Subroutine>] takes Frac, Acc and Long values and the records, not {v.Type.Name}" ]
+          | _ -> fail $"{mi.Name}: a [<Subroutine>] takes Frac, Acc and Long values and the records, not {IrTy.name v.Type}" ]
   let fracs = values |> List.filter (fun (v, _) -> tyOf v.Type = TFrac)
   let accs = values |> List.filter (fun (v, _) -> tyOf v.Type <> TFrac)
   // the caller's words the code after the call still reads: the subroutine's frame starts right
@@ -2581,7 +2568,7 @@ and compileSub (ctx: Ctx) (sub: Sub) =
     if sub.records.ContainsKey v.Type then
       let w = sub.records[v.Type]
       body <- body.Substitute(fun x -> if x = v then Some(Expr.Var w) else None)
-    elif v.Type = typeof<unit> || v.Type = ctx.kernel.paramsType || v.Type = ctx.kernel.stateType || v.Type = typeof<Output> then ()
+    elif v.Type = TyUnit || v.Type = ctx.kernel.paramsType || v.Type = ctx.kernel.stateType || v.Type = TyOutput then ()
     else
       let ty = tyOf v.Type
       let h = alloc ctx ty
@@ -2599,9 +2586,9 @@ and compileSub (ctx: Ctx) (sub: Sub) =
   let body = ordered (normalize body)
   let r = sub.mi.ReturnType
   pend ctx [ body ] (fun () ->
-    if r = typeof<Frac> then genWord ctx body
-    elif r = typeof<Acc> then genAcc ctx body
-    elif r = typeof<Long> then genLong ctx body
+    if r = TyFrac then genWord ctx body
+    elif r = TyAcc then genAcc ctx body
+    elif r = TyLong then genLong ctx body
     else genStmt ctx body)
   emit ctx rts
   sub.deepest <- ctx.deepest
@@ -2618,9 +2605,9 @@ and bitTest (ctx: Ctx) (n: Expr) (f: Expr) =
 
 and branchUnless (ctx: Ctx) (cond: Expr) (target: string) =
   let asAcc (x: Expr) =
-    if x.Type = typeof<Frac> then Expr.Call(nonNull (typeof<Acc>.GetMethod "ofFrac"), [ x ])
-    elif x.Type = typeof<Acc> then x
-    else fail $"comparisons are on Frac or Acc values, not {x.Type.Name}"
+    if x.Type = TyFrac then Expr.Call(Ir.intrinsic "acc.ofFrac", [ x ])
+    elif x.Type = TyAcc then x
+    else fail $"comparisons are on Frac or Acc values, not {IrTy.name x.Type}"
   match cond with
   | Intr "loop.everyPass" [ c ] -> branchUnless ctx c target
   // a bit of a word: `btst #n,d`, the bit in the carry
@@ -2685,7 +2672,7 @@ and branchUnless (ctx: Ctx) (cond: Expr) (target: string) =
 // Entry points.
 
 type Compiled =
-  { kernel   : Kernel
+  { kernel   : IrKernel
     target   : Target
     layout   : Layout
     items    : Item array
@@ -2694,7 +2681,7 @@ type Compiled =
     xWorkset : int              // X words used: the [<XMemory>] state (layout.xWorkset), then locals and spills
     yWorkset : int }            // Y words used: layout.yWorkset, then locals spilled past the X workset
 
-let entry (ctx: Ctx) (name: string) (mi: MethodInfo) =
+let entry (ctx: Ctx) (name: string) (mi: Member) =
   let def =
     match reflected mi with
     | Some d -> d
@@ -2702,8 +2689,8 @@ let entry (ctx: Ctx) (name: string) (mi: MethodInfo) =
   let rec body (e: Expr) =
     match e with
     | Lambda(v, rest) ->
-      if v.Type <> ctx.kernel.paramsType && v.Type <> ctx.kernel.stateType && v.Type <> typeof<Output> then
-        fail $"{mi.Name}: argument {v.Name} is a {v.Type.Name}, expected the parameters, the state or the output"
+      if v.Type <> ctx.kernel.paramsType && v.Type <> ctx.kernel.stateType && v.Type <> TyOutput then
+        fail $"{mi.Name}: argument {v.Name} is a {IrTy.name v.Type}, expected the parameters, the state or the output"
       body rest
     | e -> e
   ctx.next <- ctx.layout.xWorkset
@@ -2758,7 +2745,7 @@ let rec writes (e: Expr) : int option =
   let sum (xs: Expr list) =
     xs |> List.fold (fun acc x -> match acc, writes x with Some a, Some b -> Some(a + b) | _ -> None) (Some 0)
   match e with
-  | Call(Some(Var o), mi, _) when o.Type = typeof<Output> ->
+  | Call(Some(Var o), mi, _) when o.Type = TyOutput ->
     match intrinsic mi with
     | Some "out.write" -> Some 1
     | Some "out.pair" -> Some 2
@@ -2812,12 +2799,10 @@ let checkSize (c: Compiled) : Result<Compiled, string> =
 
 /// The loops of functions marked with `attr` (or functions of modules marked with it) a kernel's
 /// entries reach, themselves or through the helpers they call.
-let markedLoops (attr: Type) (k: Kernel) =
+let markedLoops (mark: string) (k: IrKernel) =
   let kept = HashSet<Var>()
-  let seen = HashSet<MethodInfo>()
-  let marked (mi: MethodInfo) =
-    not (isNull (mi.GetCustomAttribute attr))
-    || (match mi.DeclaringType with null -> false | t -> not (isNull (t.GetCustomAttribute attr)))
+  let seen = HashSet<Member>()
+  let marked (mi: Member) = mi.Marks.Contains mark
   let rec walk (keep: bool) (e: Expr) =
     match e with
     | ForIntegerRangeLoop(v, lo, hi, b) ->
@@ -2835,29 +2820,29 @@ let markedLoops (attr: Type) (k: Kernel) =
   kept
 
 /// The loops of [<NoUnswitch>] functions (or functions of [<NoUnswitch>] modules).
-let keptLoops (k: Kernel) = markedLoops typeof<NoUnswitchAttribute> k
+let keptLoops (k: IrKernel) = markedLoops "NoUnswitch" k
 
 /// The loops of [<Unroll>] functions (or functions of [<Unroll>] modules).
-let unrolledLoops (k: Kernel) = markedLoops typeof<UnrollAttribute> k
+let unrolledLoops (k: IrKernel) = markedLoops "Unroll" k
 
 /// A subroutine compiled below a call found later: compiled again from the start, each one's
 /// words from at least the given word.
 exception Refloor of Map<string, int>
 
-let rec generateWith (floors: Map<string, int>) (unswitchMax: int option) (target: Target) (k: Kernel) : Result<Compiled * int list, string> =
+let rec generateWith (floors: Map<string, int>) (unswitchMax: int option) (target: Target) (ik: IrKernel) : Result<Compiled * int list, string> =
   try
-    let layout = layout target k
+    let layout = layoutOf target ik.name ik.parameters (defaultArg ik.state [||])
     let ctx =
-      { target = target; kernel = k; layout = layout; items = ResizeArray(); lines = ResizeArray(); line = 0; sourceLine = 0; sourceFile = None
+      { target = target; kernel = ik; layout = layout; items = ResizeArray(); lines = ResizeArray(); line = 0; sourceLine = 0; sourceFile = None
         vars = Map.empty; consts = Map.empty; next = layout.xWorkset; high = layout.xWorkset; labels = 0
         cursors = Map.empty; freeRegs = [ 1; 2; 3; 4; 5 ]; tables = ResizeArray(); conts = []; released = Collections.Generic.HashSet(); trackHome = None
         indexed = Map.empty; counters = Map.empty; inductions = Map.empty; affineAt = Dictionary(HashIdentity.Reference); taps = Dictionary(); freeData = [ X1; Y1 ]; scores = Dictionary(); deadLocals = HashSet()
         unswitched = HashSet(); bHeld = false; bWrite = false
         subs = Dictionary(); inSub = None; depth = 0; deepest = 0; floors = floors
-        kept = keptLoops k; unrolled = unrolledLoops k; pending = []; unswitchMax = unswitchMax; unswitchCosts = ResizeArray() }
-    entry ctx "INIT" k.init
-    entry ctx "TRIG" k.trig
-    entry ctx "RENDER" k.render
+        kept = keptLoops ik; unrolled = unrolledLoops ik; pending = []; unswitchMax = unswitchMax; unswitchCosts = ResizeArray() }
+    entry ctx "INIT" ik.init
+    entry ctx "TRIG" ik.trig
+    entry ctx "RENDER" ik.render
     // the subroutines called, each once, those they call included
     let mutable pending = ctx.subs.Values |> Seq.filter (fun s -> not s.compiled) |> Seq.tryHead
     while pending.IsSome do
@@ -2882,30 +2867,30 @@ let rec generateWith (floors: Map<string, int>) (unswitchMax: int option) (targe
     for s in ctx.subs.Values do
       for site in s.sites do
         if site.caller.IsNone && site.depth + need s > stackLevels then
-          fail $"{k.name}: the call to {s.mi.Name} takes {site.depth + need s} system stack levels (a call one, a DO loop two), a machine may take {stackLevels}"
+          fail $"{ik.name}: the call to {s.mi.Name} takes {site.depth + need s} system stack levels (a call one, a DO loop two), a machine may take {stackLevels}"
     // the block size, once the entries compile
-    match reflected k.render |> Option.bind writes with
+    match reflected ik.render |> Option.bind writes with
     | Some n when n <> target.blockWords ->
-      fail $"{k.name}: RENDER writes {n} words, the block is {target.blockText}"
+      fail $"{ik.name}: RENDER writes {n} words, the block is {target.blockText}"
     | _ -> ()
     ctx.line <- 0; ctx.sourceLine <- 0
     for t in ctx.tables do
       emit ctx (Label(tableLabel t))
       for row in Array.chunkBySize 8 t.words do
         emit ctx (Dc(row |> Array.map (fun w -> Num(int64 w))))
-    let source = Expr.TryGetReflectedDefinition k.render |> Option.bind debugRange |> Option.map fst
-    Ok({ kernel = k; target = target; layout = ctx.layout; items = ctx.items.ToArray(); lines = ctx.lines.ToArray()
+    let source = reflected ik.render |> Option.bind debugRange |> Option.map fst
+    Ok({ kernel = ik; target = target; layout = ctx.layout; items = ctx.items.ToArray(); lines = ctx.lines.ToArray()
          source = source; xWorkset = min ctx.high target.xLimit
          yWorkset = ctx.layout.yWorkset + max 0 (ctx.high - target.xLimit) }, List.ofSeq ctx.unswitchCosts)
   with
   | KernelError m -> Error m
-  | Refloor floors' when floors'.Count <= 64 && floors' <> floors -> generateWith floors' unswitchMax target k
+  | Refloor floors' when floors'.Count <= 64 && floors' <> floors -> generateWith floors' unswitchMax target ik
 
 /// The compiled kernel, its size not checked, each loop unswitched only when its copy takes at
 /// most `unswitchMax` words (None: any); and what each unswitched loop's copy took.
 /// Code generation recurses once per nested let and statement: a long kernel nests thousands, more
 /// than a thread pool thread's stack holds. It runs on its own thread with a 256 MB stack.
-let generateUnswitching (unswitchMax: int option) (target: Target) (k: Kernel) =
+let generateIrUnswitching (unswitchMax: int option) (target: Target) (k: IrKernel) =
   let mutable result = Unchecked.defaultof<Result<Compiled * int list, string>>
   let mutable failure : System.Runtime.ExceptionServices.ExceptionDispatchInfo option = None
   let t =
@@ -2920,9 +2905,18 @@ let generateUnswitching (unswitchMax: int option) (target: Target) (k: Kernel) =
   failure |> Option.iter (fun f -> f.Throw())
   result
 
+/// The same for a kernel written as quotations.
+let generateUnswitching (unswitchMax: int option) (target: Target) (k: Kernel) =
+  generateIrUnswitching unswitchMax target (FromQuotation.kernel k)
+
 /// The compiled kernel, its size not checked (Optimize.compile checks it after its passes).
-let generate (target: Target) (k: Kernel) = generateUnswitching None target k |> Result.map fst
+let generateIr (target: Target) (k: IrKernel) = generateIrUnswitching None target k |> Result.map fst
 
 /// The compiled kernel, as the compiler generates it, refused when the target's machine
 /// cannot hold it.
-let compile (target: Target) (k: Kernel) : Result<Compiled, string> = generate target k |> Result.bind checkSize
+let compileIr (target: Target) (k: IrKernel) : Result<Compiled, string> = generateIr target k |> Result.bind checkSize
+
+/// A kernel written as quotations: read into the tree, then as above.
+let generate (target: Target) (k: Kernel) = generateIr target (FromQuotation.kernel k)
+
+let compile (target: Target) (k: Kernel) : Result<Compiled, string> = compileIr target (FromQuotation.kernel k)

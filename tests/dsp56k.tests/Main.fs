@@ -13,6 +13,8 @@ let all =
     ImportTests.tests
     ToolTests.tests
     KernelTests.tests
+    KernelIrTests.tests
+    IrFrontEndTests.tests
   ]
 
 [<EntryPoint>]

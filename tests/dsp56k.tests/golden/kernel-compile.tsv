@@ -1,0 +1,70 @@
+input-thru	machinedrum	ok	53	5da94dcfe9cc3555
+main-tap	machinedrum	ok	56	2e4b2885c4380eeb
+pluck	machinedrum	ok	170	968552982692c0cd
+probe-address-twice	machinedrum	ok	67	e5438ebb72aaf30b
+probe-arithmetic	machinedrum	ok	72	1cfac0cefc6c1668
+probe-banks	machinedrum	ok	97	5e5fd1be8c5ed144
+probe-bit-test	machinedrum	ok	145	63e6eb81f21da1ba
+probe-bool-let	machinedrum	ok	144	c48e00a8f94115c5
+probe-branch-registers	machinedrum	ok	89	88e71ee76d8805fb
+probe-clb-normf	machinedrum	ok	53	193119d5d17499c0
+probe-clb-normf-edges	machinedrum	ok	158	1d84a574d71d0334
+probe-computed-index	machinedrum	ok	173	37eeec698e969311
+probe-computed-past	machinedrum	ok	21	bd9e68a466445963
+probe-control	machinedrum	ok	97	fcd7bdf1ad055ad2
+probe-counted-loops	machinedrum	ok	110	4ca6e408a4919503
+probe-crowded-registers	machinedrum	error	-	63454ec9fd4eeab4	y1[i]: no address register is free for the loop over i (r1..r5 hold c1 (r1), c2 (r2), c3 (r3), c4 (r4), c5 (r5)). End a cursor before the loop, or index with a word counted when running: s.y1[Frac.index (Frac.ofRaw i)] (r0 and n0, no register held)
+probe-divide	machinedrum	ok	66	8e8613223bb82818
+probe-divide-carry	machinedrum	ok	66	b393b11b7a3daafa
+probe-fir	machinedrum	ok	88	f4ffb883efde6d21
+probe-four-acc	machinedrum	ok	191	240c212d7e2017a7
+probe-helper-records	machinedrum	ok	73	3fcbc039c94bc02c
+probe-index	machinedrum	ok	27	9b7ecf3c629dd341
+probe-index-arg	machinedrum	ok	59	75ff415a74f2c2b2
+probe-long-array	machinedrum	ok	146	4bca515e2645acd0
+probe-long-sat	machinedrum	ok	85	a93ed417a5ec55bf
+probe-many-arrays	machinedrum	ok	205	c750e79049eccb97
+probe-memory	machinedrum	ok	116	ad7ddf16df5ece1a
+probe-mulsu-dmac	machinedrum	ok	57	3398177a383e9896
+probe-order	machinedrum	ok	157	d1bbf1afabdaff83
+probe-piped	machinedrum	ok	33	c9594c3996f4e859
+probe-region-induction	machinedrum	ok	116	e014675fc088d78c
+probe-ring-taps	machinedrum	ok	250	c3578d0433285fc3
+probe-scaled-index	machinedrum	error	-	599a999915510cfe	the loop index i can index state arrays (s.field[i + c]) or be read as Frac.ofRaw i; not <expression>
+probe-shape-events	machinedrum	ok	113	5fadbb8b41aa651e
+probe-shape-selects	machinedrum	ok	130	ba6ec434a38f8906
+probe-shape-units	machinedrum	ok	64	a5163dcd4b0d2c1f
+probe-shifts	machinedrum	ok	136	fc048022acf0c1f7
+probe-size-14100	machinedrum	ok	1788	173bc2ad60c0b394
+probe-size-3400	machinedrum	ok	450	a8542ebefb4d74fc
+probe-size-8100	machinedrum	ok	1038	38d56890bfaef8d5
+probe-size-small	machinedrum	ok	30	347015f8740b6210
+probe-state-ring	machinedrum	ok	150	a1500bcd2b64f5bc
+probe-state-ring-off	machinedrum	error	-	e3268e71cb3bfb09	ring at Y+$9: a 6-word ring starts on a multiple of 8 in the workset (move the field)
+probe-stereo	machinedrum	error	-	0ff33fe26e5970df	probe-stereo: WritePair needs a stereo target, Machinedrum MDS has 1 channel(s)
+probe-subroutine-frames	machinedrum	ok	173	b6e94340b9f35b59
+probe-subroutines	machinedrum	ok	202	267f2edafd7ab6d6
+probe-subroutines-deep	machinedrum	error	-	9bd55f1bd0ab30b9	probe-subroutines-deep: the call to refresh takes 15 system stack levels (a call one, a DO loop two), a machine may take 12
+probe-unroll	machinedrum	ok	221	8b8a07d1810818cb
+probe-unroll-deep	machinedrum	error	-	b429f3326a5b8c0c	probe-unroll-deep: the call to level1 takes 14 system stack levels (a call one, a DO loop two), a machine may take 12
+probe-unroll-flat	machinedrum	ok	250	fd9f345e20d14cef
+probe-unsized	machinedrum	error	-	9bdc6a85771203d8	probe-unsized: state field history is an array: give its length, [<Length n>]
+probe-unswitch	machinedrum	ok	74	1d725920adb7ab7b
+probe-unswitch-each	machinedrum	ok	53	bcd93e8128c9d8fe
+probe-unswitch-kept	machinedrum	ok	53	8219c61bfb5caf10
+probe-wide	machinedrum	error	-	51c91938102b1889	probe-wide: RENDER writes 64 words, the block is 32 frames (one word each)
+probe-x-and-y-state	machinedrum	ok	176	9bf5da50146904ea
+probe-x-beyond	machinedrum	error	-	dcf9075ddecb5767	probe-x-beyond: the [<XMemory>] state needs X+64, the target has 64 words
+probe-x-full	machinedrum	ok	109	0fa3b2e070fe42ff
+probe-x-over	machinedrum	error	-	4a6ec08369eb90a1	probe-x-over: the [<XMemory>] state (64 words), locals and spills need more than 64 X words and the Y words after the state (Y+64 to Y+63)
+probe-x-state	machinedrum	ok	101	cf7cafeb9d0f9fe0
+probe-y-only	machinedrum	ok	16	67b23ab1411cb12f
+sine	machinedrum	ok	82	729f08f26ab982c6
+tx6-bd	machinedrum	ok	682	efcfab396776f3dc
+tx6-ch	machinedrum	ok	763	7280f80982ae9e9d
+tx6-cp	machinedrum	ok	1024	f985f2bf6ba8a68b
+tx6-cy	machinedrum	ok	722	81b722668e868e11
+tx6-ht	machinedrum	ok	700	4337cdb81b2e8e49
+tx6-lt	machinedrum	ok	763	97335dffdfc0d6ef
+tx6-oh	machinedrum	ok	763	6fbb362106708120
+tx6-sd	machinedrum	ok	675	d90148cdb6f28be3
