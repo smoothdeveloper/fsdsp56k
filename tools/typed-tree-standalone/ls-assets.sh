@@ -10,7 +10,7 @@ src="$here/../../src"
 rm -rf "$out"; mkdir -p "$out/assemblies"
 cp "$dist/worker.min.js" "$dist/bundle.min.js" "$out/"
 cp "$metadata"/*.dll "$out/assemblies/"
-for p in Dsp56k.Kernel.Intrinsics Dsp56k Dsp56k.Dsl Dsp56k.Kernel; do
+for p in Dsp56k.Kernel.Intrinsics Dsp56k Dsp56k.Dsl Dsp56k.Kernel Machinedrum; do
   dll=$(ls "$src"/*/bin/Debug/net10.0/$p.dll 2>/dev/null | head -1)
   test -n "$dll" || { echo "build $p first (dotnet build $src/dsp56k.kernel)" >&2; exit 1; }
   cp "$dll" "$out/assemblies/"

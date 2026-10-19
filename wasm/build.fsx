@@ -91,6 +91,10 @@ if not (memorySource.Contains "LOG_ERR_MEM_READ( _offset );") then
 File.WriteAllText(memoryFile,
   memorySource.Replace("LOG_ERR_MEM_READ( _offset );",
     "static unsigned diagnostics = 0; if (diagnostics++ < 4) { LOG_ERR_MEM_READ( _offset ); }"))
+// MACRI is MACI followed by convergent rounding; the interpreter must implement it.
+let aluSource = File.ReadAllText(Path.Combine(upstream, "source/dsp56kEmu/dsp_ops_alu.inl"))
+if aluSource.Contains "errNotImplemented(\"MACRI\");" then
+  failwith "This dsp56300 revision leaves MACRI unimplemented: update the dsp56300 checkout"
 printfn "[2/3] Configure WebAssembly interpreter"
 let build = Path.Combine(scratch, "build")
 run root "emcmake"

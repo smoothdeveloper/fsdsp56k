@@ -430,3 +430,45 @@ let functionsOf (checked': Checked) (file: string) : FunctionSpan array =
                yield { name = m.DisplayName; startLine = start; endLine = max start (lastLine body) }
              | _ -> () }
          for d in f.Declarations do yield! walk d |]
+
+/// A kernel's three entry points in a module: `init`, `trig` and `render`, or a prefix before them (`leanInit`, `leanTrig`,
+/// `leanRender`); the parameters and the state are the first two arguments of `render` and `init`/`trig` take those two.
+type EntryTriple = { prefix: string; init: string; trig: string; render: string }
+
+/// The entry triples of the module-level functions of the file `file`: `render` of three parameters (parameters, state, output)
+/// with an `init` and a `trig` of two, under the same prefix. A function with more parameters (a voice's configuration first)
+/// is not one: the module's wrappers that fix it are.
+let entriesOf (checked': Checked) (file: string) : EntryTriple[] =
+  let arity = Dictionary<string, int>()
+  for f in checked'.contents do
+    if f.FileName = file then
+      let rec walk (d: FSharpImplementationFileDeclaration) =
+        match d with
+        | FSharpImplementationFileDeclaration.Entity(e, subs) when e.IsFSharpModule || e.IsNamespace -> List.iter walk subs
+        | FSharpImplementationFileDeclaration.MemberOrFunctionOrValue(m, args, _) when m.IsModuleValueOrMember && not m.IsCompilerGenerated ->
+          arity[m.DisplayName] <- args |> List.sumBy List.length
+        | _ -> ()
+      for d in f.Declarations do walk d
+  let has (name: string) (n: int) = match arity.TryGetValue name with | true, k -> k = n | _ -> false
+  [| for KeyValue(name, _) in arity do
+       let lower = name.ToLowerInvariant()
+       if lower.EndsWith "render" && (name = "render" || name.EndsWith "Render") then
+         let prefix = name.Substring(0, name.Length - "render".Length)
+         let named (word: string) = if prefix = "" then word.ToLowerInvariant() else prefix + word
+         if has name 3 && has (named "Init") 2 && has (named "Trig") 2 then
+           yield { prefix = prefix; init = named "Init"; trig = named "Trig"; render = name } |]
+  |> Array.sortBy (fun t -> t.prefix)
+
+/// The line each field of the record `typeName` (its full name) is declared on, in declaration order.
+let fieldLines (checked': Checked) (typeName: string) : (string * int)[] =
+  let found = ResizeArray<string * int>()
+  let rec walk (d: FSharpImplementationFileDeclaration) =
+    match d with
+    | FSharpImplementationFileDeclaration.Entity(e, subs) ->
+      if e.TryFullName = Some typeName && e.IsFSharpRecord then
+        for f in e.FSharpFields do found.Add((f.Name, f.DeclarationLocation.StartLine))
+      List.iter walk subs
+    | _ -> ()
+  for f in checked'.contents do
+    for d in f.Declarations do walk d
+  found.ToArray()

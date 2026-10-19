@@ -60,6 +60,12 @@ after a nonreturning call. This hosts isolated trusted kernels, not a complete d
 
 ## Exact checks
 
+`MACRI` is signed immediate MAC followed by convergent rounding; `build.fsx` stops on a dsp56300 revision that
+leaves it unimplemented. Run
+`dotnet fsi wasm/check_macri.fsx` from the repository root to compare 672 cases with
+the Rust native emulator: four source registers, both destinations, signs, negative
+operands, rounding boundaries, all accumulator words and CCR. No firmware is needed.
+
 `pnpm check` verifies bounds, return handling, replacement of cached instructions and
 the instruction watchdog. Supply image/reference pairs to check output, state and scratch
 words against an independent emulator; no reference images are tracked here:

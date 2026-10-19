@@ -100,5 +100,11 @@ type Instance(exports: Exports, image: KernelImage) as this =
     this.Call image.render |> ignore
     lastCycles <- exports._dsp_cycles() - cycles
     lastOperations <- exports._dsp_operations() - operations
-    Array.init (image.frames * 2) (fun i ->
-      exports._dsp_read(image.outputBank, image.output + i) |> check "read")
+    match image.channels with
+    | Some 1 ->
+      // a mono block, each word on both channels
+      Array.init (image.frames * 2) (fun i ->
+        exports._dsp_read(image.outputBank, image.output + i / 2) |> check "read")
+    | _ ->
+      Array.init (image.frames * 2) (fun i ->
+        exports._dsp_read(image.outputBank, image.output + i) |> check "read")

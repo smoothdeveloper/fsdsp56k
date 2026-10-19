@@ -24,7 +24,9 @@ type KernelImage =
     output: int
     inputBank: int
     input: int
-    externalMemory: int option }
+    externalMemory: int option
+    /// 1: the output buffer holds one word a frame (a mono block), played on both channels; absent or 2: left, right pairs.
+    channels: int option }
 
 [<AllowNullLiteral>]
 type AudioContext =
