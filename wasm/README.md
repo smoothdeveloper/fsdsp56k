@@ -86,3 +86,38 @@ and its adapter/readback; the remainder includes sample copies and trace capture
 Telemetry transfer and browser/device audio overhead are excluded. Pausing/loading
 resets the measurement window. Coarse clocks discount one tick before counting a
 definite deadline overrun. Verify with `dotnet fsi wasm/check_processing_timing.fsx`.
+
+# Direct Fable/Rust kernels
+
+The same build emits `portable-processor.mjs`, registered as `fsharp-rust-wasm`.
+`PortableRuntime.fs` provides the F# node/load/parameter/resource bindings. Supply a
+compiled direct-kernel `WebAssembly.Module` with the C ABI in `portable/RustAbi.fs`.
+Each node instantiates that module separately, isolating track, scratch and resource state.
+No firmware or machine address mapping belongs to this processor.
+
+The current transport supports 16 stereo frames at 44100 Hz, eight parameter slots and
+indexed resource arrays. Loading initializes a fresh kernel; messages take effect between
+callbacks. It shares the interpreter's gain/play/trig and level/timing messages, including
+output traces, and accepts `snapshot` for an exact state diagnostic. Input-dependent kernels
+are not supported by this direct host yet. Timing includes C-ABI output copies; it does not
+invent DSP cycle/instruction counts for native execution.
+
+A Node harness verifies the actual built processor's messages, sample conversion and state
+against a portable fixture. It does not measure browser scheduling:
+
+```sh
+node out/wasm/portable-check.mjs fixture.json kernels.wasm
+```
+
+Direct images now specify `inputResource`: use `-1` for generators, or the resource index of
+an interleaved input buffer. Each callback converts incoming float samples to signed 24-bit words
+before each 16-frame render (mono is duplicated; a disconnected input supplies zero). Effects
+return the input trace alongside output for the existing feeder meter. `init` reruns kernel
+initialization without replacing persistent state, so warm-init preservation can be checked.
+The Node replay checker covers this bridge, warm init and callbacks up to 128 frames.
+
+For intermediate signals, send `resource-trace` with `regions` containing `bank` (resource index),
+`address` (word offset), and `words` (1–64). Up to eight regions return rolling 1024-word arrays
+in the level message's `traces`; without that command, the existing input trace is retained.
+Fixtures can set `audio.traceRegions`; the worklet checker verifies their final words against
+host resource snapshots as well as audio and persistent state.

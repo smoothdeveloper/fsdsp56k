@@ -82,7 +82,17 @@ type Frac =
   /// The nearest fraction, limited to [-1, 1 - 2^-23].
   [<Const>]
   static member q23 (v: float) =
+#if FABLE_COMPILER_RUST
+    // Rust Fable lacks the MidpointRounding overload; explicitly retain ties-to-even.
+    let scaled = v * 8388608.0
+    let lower = Math.Floor scaled
+    let fraction = scaled - lower
+    let r =
+      if fraction < 0.5 || (fraction = 0.5 && lower % 2.0 = 0.0) then lower
+      else lower + 1.0
+#else
     let r = Math.Round(v * 8388608.0, MidpointRounding.ToEven)
+#endif
     { Frac.Raw = int (max -8388608.0 (min 8388607.0 r)) }
 
   [<Const>]
@@ -284,7 +294,16 @@ and [<Struct>] Acc =
   [<Intrinsic "acc.clb">]
   static member clb (a: Acc) =
     let v = if a.Raw < 0L then ~~~a.Raw else a.Raw     // the sign bits as leading zeros
+#if FABLE_COMPILER
+    // Fable has no LeadingZeroCount replacement; retain exact integer semantics.
+    let mutable count = 0
+    let mutable bit = 1L <<< 55
+    while bit <> 0L && v &&& bit = 0L do
+      count <- count + 1
+      bit <- bit >>> 1
+#else
     let count = 56 - (64 - System.Numerics.BitOperations.LeadingZeroCount(uint64 v))
+#endif
     { Acc.Raw = (if a.Raw = 0L then 0L else int64 (9 - count)) <<< 24 }
 
   /// `normf s,a`: a shifted right (arithmetic) by s when s is positive, left by -s when it is
@@ -535,13 +554,29 @@ module Main =
 
 /// The track the machine plays on, and the tracks' external memory (MDS import 6: 1,536 words a
 /// track, X and Y the same storage; the harness gives it Y memory).
+#if FABLE_COMPILER_RUST
+module private TrackStorage =
+  // Fable Rust 5.18 generates invalid field access for static auto-properties.
+  let mutable current = 0
+  let memory =
+    { name = "track_memory"; bank = YMemory; abiSymbol = 6
+      address = 0x1000; words = Array.zeroCreate (1536 * 16) }
+#endif
+
 type Track =
   /// The track number the firmware passes in R1, 0..15 (`current` on the .NET side).
   [<Intrinsic "track.number">]
   static member number () = Frac.ofRaw Track.current
+#if FABLE_COMPILER_RUST
+  static member current
+    with get () = TrackStorage.current
+    and set value = TrackStorage.current <- value
+  static member memory = TrackStorage.memory
+#else
   static member val current = 0 with get, set
   static member val memory =
     { name = "track_memory"; bank = YMemory; abiSymbol = 6; address = 0x1000; words = Array.zeroCreate (1536 * 16) }
+#endif
 
 /// The block being rendered: one word per frame, or a left, right pair per frame on a stereo
 /// target (Kernel.Target.channels).

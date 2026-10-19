@@ -6,10 +6,12 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="../../portable/Host.fs" Link="PortableHost.fs" />
     <Compile Include="Cache.fs" />
     <Compile Include="Grade.fs" />
     <Compile Include="Html.fs" />
     <Compile Include="Audio.fs" />
+    <Compile Include="Portable.fs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../dsp56k/dsp56k.fsproj" />

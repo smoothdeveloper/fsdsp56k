@@ -24,6 +24,7 @@ them; samples and the command-line tool sit on top.
 | `src/dsp56k.kernel.intrinsics` | `Frac`, `Acc`, `Long`, `Table`, `Output`: DSP56300 arithmetic as .NET code, each operation tagged with the compiler's intrinsic name |
 | `src/dsp56k.kernel` | Quotation compiler from `[<ReflectedDefinition>]` kernels to DSL items (direct translation, no optimisation yet), and a .NET host running the same kernel |
 | `src/dsp56k.kernel.grade` | Runs a scenario three ways (.NET kernel, compiled program, reference) on a harness (the MDS track, or a program image of your own loaded at fixed addresses) and reports correctness, fidelity, cost and listing alignment |
+| `portable` | Opt-in direct F# execution: .NET, Fable JavaScript, Fable Rust/WASM; exact sample checks and render timing ([usage](portable/README.md)) |
 | **On top** | |
 | `src/dsp56k.tool` | The `fsdsp56k` command line |
 | `samples` | DSL programs reproducing shipped machines word for word |

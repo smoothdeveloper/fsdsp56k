@@ -9,6 +9,9 @@
     <Compile Include="Kernel.fs" />
     <Compile Include="ProcessingTiming.fs" />
     <Compile Include="Processor.fs" />
+    <Compile Include="PortableRuntime.fs" />
+    <Compile Include="PortableProcessor.fs" />
     <Compile Include="Check.fs" />
+    <Compile Include="PortableCheck.fs" />
   </ItemGroup>
 </Project>

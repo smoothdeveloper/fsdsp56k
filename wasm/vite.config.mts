@@ -6,9 +6,9 @@ export default defineConfig({
   build: {
     outDir: '../out/wasm',
     emptyOutDir: false,
-    lib: { entry: { processor: './Processor.fs', check: './Check.fs' }, formats: ['es'] },
+    lib: { entry: { processor: './Processor.fs', 'portable-processor': './PortableProcessor.fs', check: './Check.fs', 'portable-check': './PortableCheck.fs' }, formats: ['es'] },
     rollupOptions: {
-      external: id => id.endsWith('dsp56300.mjs') || id.startsWith('node:'),
+      external: id => (id.endsWith('dsp56300.mjs') || id.endsWith('portable-processor.mjs')) || id.startsWith('node:'),
       output: { entryFileNames: '[name].mjs', chunkFileNames: '[name].mjs' }
     }
   }

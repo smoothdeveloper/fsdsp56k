@@ -1,0 +1,10 @@
+<Project>
+  <ItemGroup>
+    <Compile Include="../src/dsp56k.kernel.intrinsics/Intrinsics.fs" Link="Intrinsics.fs" />
+    <Compile Include="../out/portable/sources/Sine.fs" Link="Sine.fs" />
+    <Compile Include="../out/portable/sources/Pluck.fs" Link="Pluck.fs" />
+    <Compile Include="../out/portable/sources/InputThru.fs" Link="InputThru.fs" />
+    <Compile Include="Host.fs" />
+    <Compile Include="Adapters.fs" />
+  </ItemGroup>
+</Project>
