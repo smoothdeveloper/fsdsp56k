@@ -1,0 +1,18 @@
+<Project>
+  <!-- packages for the local feed: dotnet pack -c Release -p:Version=0.0.0.1-alpha.g<sha> -o ~/.nuget/local-feed
+       The package ids are the project names (Dsp56k, Dsp56k.Dsl, Machinedrum, ...). To rename them, set PackageId here,
+       per project: <PackageId Condition="'$(MSBuildProjectName)' == 'machinedrum'">Fsdsp56k.Machinedrum</PackageId> -->
+  <PropertyGroup>
+    <Version Condition="'$(Version)' == ''">0.0.0.1-alpha.local</Version>
+    <Authors>smoothdeveloper</Authors>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
+    <RepositoryUrl>https://github.com/smoothdeveloper/fsdsp56k</RepositoryUrl>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <PropertyGroup Condition="$(MSBuildProjectDirectory.StartsWith('$(MSBuildThisFileDirectory)src')) And '$(MSBuildProjectName)' != 'dsp56k.tool'">
+    <IsPackable>true</IsPackable>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(IsPackable)' == 'true'">
+    <None Include="$(MSBuildThisFileDirectory)LICENSE" Pack="true" PackagePath="" Visible="false" />
+  </ItemGroup>
+</Project>

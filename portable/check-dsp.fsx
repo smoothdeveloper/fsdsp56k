@@ -14,8 +14,8 @@ open dsp56k.kernel
 open dsp56k.kernel.Grade
 
 if not (dsp56k.Native.load()) then failwith "Build the native DSP emulator first"
-let map = { firmwareMap with resources = standIns; setup = loadResources }
-let harness = firmware Kernel.mds map
+let map = { memoryMap with resources = standIns; setup = loadResources }
+let harness = imageHarness Kernel.mds map
 let scenario =
   { name = "portable adapter integration"
     steps = [ Words [| 0x1800; 0x500000 |]; Init; Trig; Render 16

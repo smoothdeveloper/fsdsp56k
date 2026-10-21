@@ -1,8 +1,8 @@
 /// Grading a compiled kernel. One scenario (parameter settings, INIT, TRIG, RENDER blocks) runs
 /// three ways: the kernel as .NET code, the compiled program on the emulator and, when there is
 /// one, a reference on the emulator. Where programs run is a `Harness`: the Machinedrum MDS
-/// track (packages, the shipped machines as references) or a firmware's DSP (`firmware`, with
-/// routines at absolute addresses as references, `image`). The grade reports
+/// track (packages, the shipped machines as references) or a target image's DSP (`imageHarness`,
+/// with routines at fixed addresses as references, `image`). The grade reports
 ///
 /// - correctness: the compiled program against the .NET kernel, output and state, word for word;
 /// - fidelity: the compiled program's output against the reference's, word for word;
@@ -246,7 +246,7 @@ let loadResources (emu: Emulator) =
   emu.Write(Native.Space.X, Input.position.address, Input.position.value)
   emu.Write(Native.Space.X, Main.position.address, Main.position.value)
 
-/// The import symbols of the stand-ins, at their addresses: a firmware map's `resources` for
+/// The import symbols of the stand-ins, at their addresses: a memory map's `resources` for
 /// kernels that read them, with `loadResources` as its setup.
 let standIns =
   Map [ 1, Rom.sine.address; 2, Input.ring.address; 3, Input.position.address; 4, Main.ring.address
@@ -385,28 +385,28 @@ let mdsReference (bytes: byte array) =
   | _, Error e -> Error $"reference: %A{e}"
 
 // ---------------------------------------------------------------------------------------------
-// Firmware harnesses: programs at absolute addresses, called the way a host program
-// calls a routine. The firmware's words and tables come from the caller.
+// Image harnesses: programs at fixed addresses, called the way a host program calls a routine.
+// The image's words and tables come from the caller.
 
-/// Where things are on the firmware's DSP.
-type FirmwareMap =
+/// Where things are on the target's DSP: its memory map.
+type MemoryMap =
   { memory     : int * int * int        // P, X, Y words of the emulator
     workset    : int                    // r6 on each call
     output     : int                    // r7 on each call: the RENDER block, in Y
     stub       : int                    // P: three free words for the jsr/stop call stub
     kernelBase : int                    // P: where a compiled kernel is loaded
     registers  : (int * int) list       // further registers on each call (emulator codes), after r6, r7, m0..m7 linear
-    resources  : Map<int, int>          // MDS import symbol to address, for kernels reading firmware memory
+    resources  : Map<int, int>          // MDS import symbol to address, for kernels reading the target's memory
     setup      : Emulator -> unit       // what both programs find in memory (ROM tables, ...), once per session
     maxCycles  : int }                  // per call
 
-let firmwareMap =
+let memoryMap =
   { memory = 0x10000, 0x10000, 0x10000; workset = 0x100; output = 0x200; stub = 0xff00; kernelBase = 0x1000
     registers = []; resources = Map.empty; setup = ignore; maxCycles = 2_000_000 }
 
-/// A reference made of firmware routines: program words at absolute P addresses and the entry
+/// A reference made of a target image's routines: program words at fixed P addresses and the entry
 /// points a host program calls.
-type FirmwareImage =
+type TargetImage =
   { name         : string
     program      : (int * int array) list                  // P words at absolute addresses
     data         : (Native.Space * int * int array) list   // words loaded after the program: tables, patches
@@ -418,7 +418,7 @@ type FirmwareImage =
     yWorkset     : int
     items        : Item array }                            // the routines, labelled INIT, TRIG, RENDER, for the shape
 
-/// A listing of firmware routines for the shape: `words` (loaded at `origin`) disassembled from
+/// A listing of a target image's routines for the shape: `words` (loaded at `origin`) disassembled from
 /// the entry points, labelled with their names (INIT, TRIG, RENDER). Pass the routines' own span:
 /// every word becomes an instruction or `dc`, and jumps out of the span stay addresses.
 let disassemble (origin: int) (words: int array) (entries: (string * int) list) =
@@ -435,7 +435,7 @@ let disassemble (origin: int) (words: int array) (entries: (string * int) list) 
     | _ -> [| it |])
 
 /// An emulator with the map's memory, `load` run after the map's setup.
-let firmwareSession (target: Kernel.Target) (map: FirmwareMap) (load: Emulator -> unit) (init: int option, trig: int option, render: int) =
+let imageSession (target: Kernel.Target) (map: MemoryMap) (load: Emulator -> unit) (init: int option, trig: int option, render: int) =
   let p, x, y = map.memory
   let emu = new Emulator(p, x, y)
   map.setup emu
@@ -464,21 +464,21 @@ let firmwareSession (target: Kernel.Target) (map: FirmwareMap) (load: Emulator -
 
 /// The P words a map holds from `kernelBase`: up to the call stub when it lies above, else to
 /// the end of the emulator's P memory.
-let mapRoom (map: FirmwareMap) =
+let mapRoom (map: MemoryMap) =
   let p, _, _ = map.memory
   (if map.stub >= map.kernelBase then map.stub else p) - map.kernelBase
 
 /// Why a program of `words` does not fit the map, if it does not.
-let mapOverflow (map: FirmwareMap) (words: int) =
+let mapOverflow (map: MemoryMap) (words: int) =
   let room = mapRoom map
   if words <= room then None
   else
     let limit = if map.stub >= map.kernelBase then $"below the call stub at P:${map.stub:x4}" else "in the emulator's P memory"
-    Some $"the program is {words} words; the firmware map loads it at P:${map.kernelBase:x4}, room for {room} words {limit}, {words - room} over"
+    Some $"the program is {words} words; the memory map loads it at P:${map.kernelBase:x4}, room for {room} words {limit}, {words - room} over"
 
 /// The compiled kernel's words at `map.kernelBase`, relocated and its imports patched from
 /// `map.resources`, and its entry addresses.
-let place (map: FirmwareMap) (compiled: Compile.Compiled) =
+let place (map: MemoryMap) (compiled: Compile.Compiled) =
   match Assembler.assembleItems compiled.items with
   | Error e -> Error(Assembler.errorText e)
   | Ok r ->
@@ -498,14 +498,14 @@ let place (map: FirmwareMap) (compiled: Compile.Compiled) =
               match map.resources.TryFind symbol with
               | Some address -> words[at l d] <- (words[at l d] + address) &&& 0xffffff
               | None -> yield $"import kind {kind} symbol {symbol}" ]
-      if not missing.IsEmpty then Error $"""{compiled.kernel.name}: the firmware map has no address for {String.concat ", " (List.distinct missing)}"""
+      if not missing.IsEmpty then Error $"""{compiled.kernel.name}: the memory map has no address for {String.concat ", " (List.distinct missing)}"""
       else
         let entry name = map.kernelBase + int r.symbols[name] - org
         Ok(words, (entry "INIT", entry "TRIG", entry "RENDER"))
 
-/// Compiled kernels on a firmware's DSP: placed at `map.kernelBase` and called the way a host
+/// Compiled kernels on a target image's DSP: placed at `map.kernelBase` and called the way a host
 /// program calls a routine. Settings are refused until the caller gives `settings`.
-let firmware (target: Kernel.Target) (map: FirmwareMap) =
+let imageHarness (target: Kernel.Target) (map: MemoryMap) =
   { name = target.name; target = target
     parameterNames = [||]
     settings = fun _ -> raise (Kernel.KernelError $"{target.name}: this harness has no settings conversion; give parameter words (Words), or the harness's settings")
@@ -515,17 +515,17 @@ let firmware (target: Kernel.Target) (map: FirmwareMap) =
       |> Result.map (fun (words, (init, trig, render)) ->
         { name = compiled.kernel.name; programWords = words.Length; xWorkset = compiled.xWorkset; yWorkset = compiled.yWorkset
           declaredCycles = 0; items = compiled.items
-          start = fun () -> firmwareSession target map (fun emu -> emu.Load(Native.Space.P, map.kernelBase, words)) (Some init, Some trig, render) }) }
+          start = fun () -> imageSession target map (fun emu -> emu.Load(Native.Space.P, map.kernelBase, words)) (Some init, Some trig, render) }) }
 
-/// A firmware image as a reference on the same map.
-let image (target: Kernel.Target) (map: FirmwareMap) (img: FirmwareImage) =
+/// A target image as a reference on the same map.
+let image (target: Kernel.Target) (map: MemoryMap) (img: TargetImage) =
   { name = img.name; programWords = img.programWords; xWorkset = img.xWorkset; yWorkset = img.yWorkset
     declaredCycles = 0; items = img.items
     start = fun () ->
       let load (emu: Emulator) =
         for address, words in img.program do emu.Load(Native.Space.P, address, words)
         for space, address, words in img.data do emu.Load(space, address, words)
-      firmwareSession target map load (img.init, img.trig, img.render) }
+      imageSession target map load (img.init, img.trig, img.render) }
 
 // ---------------------------------------------------------------------------------------------
 // Shape: listings side by side.
@@ -674,7 +674,7 @@ let private runKey (h: Harness) (scenario: Scenario) =
   GradeCache.assemblyHash typeof<Run>.Assembly |> Option.iter (fun a -> key.Hash("grade", a))
   key
 
-/// A session's memory and registers as started, hashed: the program, the firmware and the tables.
+/// A session's memory and registers as started, hashed: the program, the target image and the tables.
 let private sessionHash (p: Program) =
   use session = p.start ()
   let emu = session.Emulator

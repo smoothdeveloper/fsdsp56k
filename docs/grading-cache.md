@@ -15,7 +15,7 @@ It is off unless `FSDSP56K_GRADE_CACHE` names the store's folder. `gradeAt` (so 
 | Run | Key |
 | --- | --- |
 | .NET kernel | the kernel's name; the text of its init/trig/render reflected definitions and, transitively, of every reflected definition they call; the values of the script-level bindings they read; the files of the assemblies they reach (the intrinsics' .NET models among them) and of the host's (`Dsp56k.Kernel`); the parameter and state types (properties, types, attributes) |
-| compiled program, reference | the emulator's P, X and Y memory and its registers as the session starts (the program as loaded, the firmware, the tables, the harness's setup), the workset, the emulator library's file, the program's sizes and the state words read back |
+| compiled program, reference | the emulator's P, X and Y memory and its registers as the session starts (the program as loaded, the target image, the tables, the harness's setup), the workset, the emulator library's file, the program's sizes and the state words read back |
 | both | the harness's name, target and cycle limit; the scenario as the run sees it (settings turned into parameter words by the harness); this assembly's file; `FSDSP56K_GRADE_SALT` |
 
 An assembly is hashed by its content, not its file: the metadata (the MVID blanked), the method

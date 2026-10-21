@@ -10,6 +10,17 @@
     <Compile Include="Disassembler.fs" />
   </ItemGroup>
 
+  <!-- the emulator built in native/ (a cargo release build), for the packages' users: runtimes/<rid>/native -->
+  <PropertyGroup>
+    <NativeLibraryFile Condition="$([MSBuild]::IsOSPlatform('OSX'))">libfsdsp56k_native.dylib</NativeLibraryFile>
+    <NativeLibraryFile Condition="$([MSBuild]::IsOSPlatform('Linux'))">libfsdsp56k_native.so</NativeLibraryFile>
+    <NativeLibraryFile Condition="$([MSBuild]::IsOSPlatform('Windows'))">fsdsp56k_native.dll</NativeLibraryFile>
+    <NativeLibraryPath>$(MSBuildThisFileDirectory)../../native/target/release/$(NativeLibraryFile)</NativeLibraryPath>
+  </PropertyGroup>
+  <ItemGroup Condition="Exists('$(NativeLibraryPath)')">
+    <None Include="$(NativeLibraryPath)" Pack="true" PackagePath="runtimes/$(NETCoreSdkRuntimeIdentifier)/native/" Visible="false" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="../dsp56k/dsp56k.fsproj" />
   </ItemGroup>

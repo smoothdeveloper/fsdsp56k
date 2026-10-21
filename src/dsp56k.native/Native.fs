@@ -65,7 +65,8 @@ let libraryFile =
   else "libfsdsp56k_native.so"
 
 /// Where the library is looked for: $FSDSP56K_NATIVE (file or folder), then native/target/release
-/// in the working directory, the assembly's folder, or any of their parents.
+/// in the working directory, the assembly's folder, or any of their parents, then runtimes/<rid>/native in the assembly's
+/// folder (where a package reference puts the library the Dsp56k.Native package carries).
 let candidates () =
   [| match Environment.GetEnvironmentVariable "FSDSP56K_NATIVE" with
      | null | "" -> ()
@@ -76,7 +77,8 @@ let candidates () =
        while not (isNull dir) do
          let d = nonNull dir
          Path.Combine(d.FullName, "native", "target", "release", libraryFile)
-         dir <- d.Parent |]
+         dir <- d.Parent
+     Path.Combine(AppContext.BaseDirectory, "runtimes", RuntimeInformation.RuntimeIdentifier, "native", libraryFile) |]
 
 let locate () = candidates () |> Array.tryFind File.Exists
 

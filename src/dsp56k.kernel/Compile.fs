@@ -115,6 +115,17 @@ type Home =
     reg    : Reg option     // a Frac local kept in X1 or Y1 instead of memory, an Acc local in B
     bound  : float }        // an Acc local's largest magnitude (< 1: a1:a0 hold it, sign-extended)
 
+/// An F# local as the code keeps it, for a debugger: where it lives (or the constant it folded to) and the lines of the
+/// entry's own file its scope covers. A home's offset is from r6, in its space; a register home has `reg`.
+type Binding =
+  { name     : string
+    ty       : string
+    home     : Home option
+    constant : string option
+    line     : int
+    first    : int
+    last     : int }
+
 type Ctx =
   { target   : Target
     kernel   : IrKernel
@@ -159,6 +170,7 @@ type Ctx =
                                              // what a call's frame must not overwrite either
     unswitchMax : int option                 // unswitch a loop only when its copy takes at most these words
     unswitchCosts : ResizeArray<int>         // the words each unswitched loop's copy took
+    bindings : ResizeArray<Binding>          // the locals and where they live, for the step view
     mutable inSub  : Sub option       // the subroutine being compiled
     mutable depth  : int              // system stack levels taken here: two a DO loop
     mutable deepest : int }           // the most, in the entry or subroutine being compiled
@@ -256,6 +268,25 @@ let lined (ctx: Ctx) (e: Expr) (gen: unit -> unit) =
 let fresh (ctx: Ctx) what =
   ctx.labels <- ctx.labels + 1
   $"K_{what}_{ctx.labels}"
+
+/// `body` run in the scope of the local `v`, which lives at `home` (None: folded to `constant`): recorded for the
+/// step view with the lines its code took. The compiler's own temporaries (`_arg1`, `matchValue`, names with @) are left out.
+let bound (ctx: Ctx) (v: Var) (home: Home option) (constant: obj option) (body: unit -> unit) =
+  let start = ctx.lines.Count
+  let line = ctx.sourceLine
+  body ()
+  let own = not (v.Name.StartsWith "_" || v.Name.Contains "@" || v.Name = "matchValue" || v.Name.StartsWith "patternInput")
+  if own then
+    let lines = [ for i in start .. ctx.lines.Count - 1 do if ctx.lines[i] > 0 then ctx.lines[i] ]
+    let lines = if line > 0 then line :: lines else lines
+    ctx.bindings.Add
+      { name     = v.Name
+        ty       = IrTy.name v.Type
+        home     = home
+        constant = constant |> Option.map (fun c -> match c with null -> "null" | c -> sprintf "%A" c)
+        line     = line
+        first    = (if lines.IsEmpty then 0 else List.min lines)
+        last     = (if lines.IsEmpty then 0 else List.max lines) }
 
 /// A local's words. Locals are a stack of words in X after the [<XMemory>] state; past the X
 /// workset (a kernel whose X state leaves too little), they go on in Y after the Y state, the
@@ -990,6 +1021,7 @@ let ringTapOf (ctx: Ctx) (value: Expr) : RingTap option =
 
 let snapshot (ctx: Ctx) =
   let count = ctx.items.Count
+  let bindings = ctx.bindings.Count
   let line, vars, consts, next, high, cursors, freeRegs, conts = ctx.line, ctx.vars, ctx.consts, ctx.next, ctx.high, ctx.cursors, ctx.freeRegs, ctx.conts
   let sourceLine = ctx.sourceLine
   let released, deadLocals = List.ofSeq ctx.released, List.ofSeq ctx.deadLocals
@@ -999,6 +1031,7 @@ let snapshot (ctx: Ctx) =
   let unswitched = List.ofSeq ctx.unswitched
   fun () ->
     ctx.items.RemoveRange(count, ctx.items.Count - count)
+    ctx.bindings.RemoveRange(bindings, ctx.bindings.Count - bindings)
     ctx.lines.RemoveRange(count, ctx.lines.Count - count)
     ctx.tables.RemoveRange(tables, ctx.tables.Count - tables)
     ctx.line <- line; ctx.sourceLine <- sourceLine; ctx.vars <- vars; ctx.consts <- consts; ctx.next <- next; ctx.high <- high
@@ -1823,7 +1856,7 @@ and withLetAt (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> 
     // read with its tap group: bound to its home
     let saved = ctx.vars
     ctx.vars <- ctx.vars.Add(v, ctx.taps[v])
-    body ()
+    bound ctx v (Some ctx.taps[v]) None body
     ctx.vars <- saved
   elif not v.IsMutable && ringGroup ctx v value bodyExpr body then ()
   elif v.Type = TyCursor then withCursor ctx v value bodyExpr body
@@ -1833,7 +1866,7 @@ and withLetAt (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> 
     | Some c when not v.IsMutable ->
       let saved = ctx.consts
       ctx.consts <- ctx.consts.Add(v, c)
-      body ()
+      bound ctx v None (Some c) body
       ctx.consts <- saved             // an inlined helper's variables are shared by its instances
     | _ -> fail $"{v.Name}: a {IrTy.name v.Type} must be an immutable constant (only Frac, Acc and Long live on the DSP)"
   else
@@ -1841,18 +1874,19 @@ and withLetAt (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> 
   | Some c when not v.IsMutable ->
     let saved = ctx.consts
     ctx.consts <- ctx.consts.Add(v, c)
-    body ()
+    bound ctx v None (Some c) body
     ctx.consts <- saved
   | _ when substitutable ctx v value bodyExpr ->
     let saved = ctx.vars
     match value with
-    | Var w -> ctx.vars <- ctx.vars.Add(v, ctx.vars[w]); body (); ctx.vars <- saved
+    | Var w -> ctx.vars <- ctx.vars.Add(v, ctx.vars[w]); bound ctx v (Some ctx.vars[w]) None body; ctx.vars <- saved
     | PropertyGet(Some(Var s), p, []) ->
       let f =
         if s.Type = ctx.kernel.stateType then field ctx p.Name
         else ctx.layout.parameters |> Array.find (fun f -> f.name = p.Name)
-      ctx.vars <- ctx.vars.Add(v, { space = spaceOf f; offset = f.offset; ty = TFrac; reg = None; bound = infinity })
-      body ()
+      let h = { space = spaceOf f; offset = f.offset; ty = TFrac; reg = None; bound = infinity }
+      ctx.vars <- ctx.vars.Add(v, h)
+      bound ctx v (Some h) None body
       ctx.vars <- saved
     | _ -> fail "unreachable"
   | _ when tyOf v.Type = TAcc && not ctx.bHeld && score ctx v >= 2 && acrossControl v bodyExpr
@@ -1865,7 +1899,7 @@ and withLetAt (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> 
       ctx.bHeld <- true
       let saved = ctx.vars
       ctx.vars <- ctx.vars.Add(v, h)
-      body ()
+      bound ctx v (Some h) None body
       ctx.vars <- saved
       ctx.bHeld <- false
     with BTaken ->
@@ -1929,7 +1963,7 @@ and ringGroup (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> 
       for (w, _, _), h in List.tail (List.zip group homes) do ctx.taps[w] <- h
       let saved = ctx.vars
       ctx.vars <- ctx.vars.Add(v, homes.Head)
-      try body ()
+      try bound ctx v (Some homes.Head) None body
       finally
         // also when the code is given up and generated again (BTaken)
         ctx.vars <- saved
@@ -1981,7 +2015,7 @@ and inMemory (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> u
     ctx.next <- afterHome
     let saved = ctx.vars
     ctx.vars <- ctx.vars.Add(v, h)
-    body ()
+    bound ctx v (Some h) None body
     ctx.vars <- saved
     ctx.next <- mark
     match register with
@@ -2700,7 +2734,10 @@ type Compiled =
     lines    : int array        // per item, the F# line it came from (0: none)
     source   : string option    // the kernel's F# file, from the quotations' debug ranges
     xWorkset : int              // X words used: the [<XMemory>] state (layout.xWorkset), then locals and spills
-    yWorkset : int }            // Y words used: layout.yWorkset, then locals spilled past the X workset
+    yWorkset : int              // Y words used: layout.yWorkset, then locals spilled past the X workset
+    /// The F# locals, where each lives (r6-relative, or a register) or the constant it folded to, and the lines of
+    /// the entry's file its scope covers: the register and memory map of a step view.
+    bindings : Binding array }
 
 let entry (ctx: Ctx) (name: string) (mi: Member) =
   let def =
@@ -2860,7 +2897,8 @@ let rec generateWith (floors: Map<string, int>) (unswitchMax: int option) (targe
         indexed = Map.empty; counters = Map.empty; inductions = Map.empty; affineAt = Dictionary(HashIdentity.Reference); taps = Dictionary(); freeData = [ X1; Y1 ]; scores = Dictionary(); deadLocals = HashSet()
         unswitched = HashSet(); bHeld = false; bWrite = false
         subs = Dictionary(); inSub = None; depth = 0; deepest = 0; floors = floors
-        kept = keptLoops ik; unrolled = unrolledLoops ik; pending = []; unswitchMax = unswitchMax; unswitchCosts = ResizeArray() }
+        kept = keptLoops ik; unrolled = unrolledLoops ik; pending = []; unswitchMax = unswitchMax; unswitchCosts = ResizeArray()
+        bindings = ResizeArray() }
     entry ctx "INIT" ik.init
     entry ctx "TRIG" ik.trig
     entry ctx "RENDER" ik.render
@@ -2902,7 +2940,8 @@ let rec generateWith (floors: Map<string, int>) (unswitchMax: int option) (targe
     let source = reflected ik.render |> Option.bind debugRange |> Option.map fst
     Ok({ kernel = ik; target = target; layout = ctx.layout; items = ctx.items.ToArray(); lines = ctx.lines.ToArray()
          source = source; xWorkset = min ctx.high target.xLimit
-         yWorkset = ctx.layout.yWorkset + max 0 (ctx.high - target.xLimit) }, List.ofSeq ctx.unswitchCosts)
+         yWorkset = ctx.layout.yWorkset + max 0 (ctx.high - target.xLimit)
+         bindings = ctx.bindings.ToArray() }, List.ofSeq ctx.unswitchCosts)
   with
   | KernelError m -> Error m
   | Refloor floors' when floors'.Count <= 64 && floors' <> floors -> generateWith floors' unswitchMax target ik

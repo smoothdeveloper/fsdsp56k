@@ -47,8 +47,19 @@ type DspProcessor(options: obj) as this =
   // register activity: how many blocks changed each register since the last report (`activity` turns it on)
   let mutable writes: int array option = None
   let mutable steps = 0
+  // words a step answers with, each (bank, offset from r6): the locals and state of a step view
+  let mutable watch: (int * int) array = [||]
 
   do this.port.onmessage <- fun event -> this.message event?data
+
+  /// The watched words at r6 (snapshot word 6) now; -1 for one outside memory.
+  member _.watched(snapshot: int array) =
+    match kernel with
+    | Some engine when snapshot.Length > 6 ->
+      [| for bank, offset in watch ->
+           let address = (snapshot[6] + offset) &&& 0xffffff
+           try engine.Read(bank, address) with _ -> -1 |]
+    | _ -> [||]
 
   member _.error(error: obj) =
     playing <- false
@@ -106,6 +117,10 @@ type DspProcessor(options: obj) as this =
           regionTraces <- Array.init regions.Length (fun _ -> Array.zeroCreate 1024)
           regionCursors <- Array.zeroCreate regions.Length
         | "memory" -> engine.Write(data?bank, data?address, data?word)
+        | "watch" ->
+          let words: obj array = data?words
+          if words.Length > 256 then failwith "Too many watched words"
+          watch <- [| for w in words -> (w?bank: int), (w?offset: int) |]
         | "registers" -> engine.ConfigureRegisters data?values
         | "trig" -> engine.Trigger()
         | "activity" -> writes <- if (data?value: bool) then Some(Array.zeroCreate 40) else None
@@ -115,7 +130,9 @@ type DspProcessor(options: obj) as this =
           let entry: int = if isNull data?entry then engine.Image.render else data?entry
           engine.Begin entry
           steps <- 0
-          this.port.postMessage (createObj [ "type" ==> "step"; "status" ==> 0; "pc" ==> engine.PC; "steps" ==> steps; "registers" ==> engine.Snapshot() ])
+          let now = engine.Snapshot()
+          this.port.postMessage (createObj [ "type" ==> "step"; "status" ==> 0; "pc" ==> engine.PC; "steps" ==> steps; "registers" ==> now
+                                             "watched" ==> this.watched now ])
         | "step" ->
           let count: int = if isNull data?count then 1 else data?count
           if not (integer count) || count < 1 || count > 100000 then failwith "Invalid step count"
@@ -130,7 +147,7 @@ type DspProcessor(options: obj) as this =
           let written = [| for i in 0 .. after.Length - 1 do if after[i] <> before[i] then i |]
           this.port.postMessage (createObj [
             "type" ==> "step"; "status" ==> status; "pc" ==> engine.PC; "steps" ==> steps
-            "registers" ==> after; "written" ==> written ])
+            "registers" ==> after; "written" ==> written; "watched" ==> this.watched after ])
         | _ -> failwith "Unknown runtime message"
     with error -> this.error (box error.Message)
 

@@ -5,6 +5,9 @@
 F# tooling for the Motorola DSP56300 family, and on top of it, support for writing Elektron
 Machinedrum machines (MDX X.20 MDS packages).
 
+fsdsp56k is free software under the GNU Affero General Public License, version 3 or any later version
+(AGPL-3.0-or-later): see [LICENSE](LICENSE) and [Licence](#licence).
+
 ## Layers
 
 The DSP56300 libraries know nothing about the Machinedrum; the Machinedrum libraries build on
@@ -55,7 +58,6 @@ let words = Program.words clearWorkset        // assembled with the same encoder
 let listing = Program.source clearWorkset     // Motorola syntax, for asm56300 or review
 ```
 
-
 ## Kernels
 
 A machine can also be written as ordinary F# over fixed-point types, run as .NET code and
@@ -103,7 +105,7 @@ latter with modulo addressing (M = n - 1) as TX8-CY's six-word Y ring (`lua (r6+
 `movec #5,m4`, `move #3,n4`); `Up`, `Down`, `PutUp` and `PutDown` move one word either way
 whatever the step. A ring must start on a multiple of the power of two at or above its length
 (the compiler says so otherwise), and only on the Machinedrum, whose r6 is 64-word aligned. Beyond arithmetic, kernels use cursors (an address register walking a
-region, linear or modulo, with a step), firmware resources (the sine ROM, the input and
+region, linear or modulo, with a step), the MDS resources (the sine table, the input and
 main-output rings and their position words, the shared temporary memory), tables placed in
 program memory, MPYR/MACR, and an LFSR step.
 
@@ -189,11 +191,24 @@ What the tests check:
 
 Not vendored. `scripts/fetch-fixtures.sh` clones them into `fixtures/`, which is git-ignored:
 
-- etcetc000/kitbasher (GPL-3.0; its examples and TX6 carry MIT licences)
+- etcetc000/kitbasher (GPL-3.0-or-later; its TX6 machines and the `examples/physical/ks` example carry MIT licences)
 - murdenihcam/murdenihcam-usr-machines (published with its assembly, no licence)
 - jmamma/MDS (format documentation and examples; no licence published)
 
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) credits every ported file, its original and its
 authors.
 
+The machines and kernels ported from these sources keep their own licences and attributions, listed per source and
+per file in THIRD-PARTY-NOTICES.md; they are not covered by this repository's AGPL licence. kitbasher is GPL-3.0-or-later,
+its TX6 machines and KS example MIT; murdenihcam's machines and jmamma/MDS have no published licence, and their ports
+are here as credited study and test material.
+
 `native/` depends on mborgerson/dsp56300 (MIT) through Cargo.
+
+## Licence
+
+fsdsp56k is licensed under the GNU Affero General Public License, version 3 or (at your option) any later
+version (AGPL-3.0-or-later); the full text is in [LICENSE](LICENSE). The crates in `native/` and `portable/`
+carry the same licence. The ported machines credit their authors and keep their terms
+([THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)); dependencies keep theirs (mborgerson/dsp56300: MIT; the
+dsp56300 interpreter the explorer builds to WebAssembly: GPL-3.0, not in this repository).

@@ -90,6 +90,10 @@ let activity (node: AudioNode) (value: bool) =
 let beginStep (node: AudioNode) (entry: int option) =
   node.port.postMessage (createObj [ "type" ==> "begin"; "entry" ==> (match entry with Some e -> box e | None -> null) ])
 
+/// The words each `step` message also answers with (`watched`, in order): (bank 1 X, 2 Y; offset from r6).
+let watch (node: AudioNode) (words: (int * int) array) =
+  node.port.postMessage (createObj [ "type" ==> "watch"; "words" ==> [| for bank, offset in words -> createObj [ "bank" ==> bank; "offset" ==> offset ] |] ])
+
 let step (node: AudioNode) (count: int) =
   node.port.postMessage (createObj [ "type" ==> "step"; "count" ==> count ])
 
