@@ -106,3 +106,6 @@ run root "cmake" [ "--build"; build; "-j"; "4" ]
 for name in [ "dsp56300.mjs"; "dsp56300.wasm" ] do
   File.Copy(Path.Combine(scratch, "dist", name), Path.Combine(root, "out/wasm", name), true)
 File.Copy(Path.Combine(upstream, "LICENSE.md"), Path.Combine(root, "out/wasm/LICENSE.dsp56300.md"), true)
+// GPL-3.0: the corresponding source is that revision with the adaptations above (this script)
+File.WriteAllText(Path.Combine(root, "out/wasm/SOURCE.txt"),
+  $"dsp56300.wasm and dsp56300.mjs are built from {origin},\nwith the adaptations of wasm/build.fsx and the wrapper wasm/runtime.cpp of fsdsp56k. Licence: GPL-3.0 (LICENSE.dsp56300.md).\n")

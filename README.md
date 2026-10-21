@@ -190,6 +190,10 @@ What the tests check:
 Not vendored. `scripts/fetch-fixtures.sh` clones them into `fixtures/`, which is git-ignored:
 
 - etcetc000/kitbasher (GPL-3.0; its examples and TX6 carry MIT licences)
+- murdenihcam/murdenihcam-usr-machines (published with its assembly, no licence)
 - jmamma/MDS (format documentation and examples; no licence published)
+
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) credits every ported file, its original and its
+authors.
 
 `native/` depends on mborgerson/dsp56300 (MIT) through Cargo.

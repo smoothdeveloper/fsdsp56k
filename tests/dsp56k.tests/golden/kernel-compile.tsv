@@ -1,6 +1,6 @@
-input-thru	machinedrum	ok	53	5da94dcfe9cc3555
-main-tap	machinedrum	ok	56	2e4b2885c4380eeb
-pluck	machinedrum	ok	170	968552982692c0cd
+input-thru	machinedrum	ok	53	53bbcacca906e4e8
+main-tap	machinedrum	ok	56	cdc8fa43eba3b164
+pluck	machinedrum	ok	170	25a7b08e232ba2e1
 probe-address-twice	machinedrum	ok	67	e5438ebb72aaf30b
 probe-arithmetic	machinedrum	ok	72	1cfac0cefc6c1668
 probe-banks	machinedrum	ok	97	5e5fd1be8c5ed144
@@ -59,12 +59,12 @@ probe-x-full	machinedrum	ok	109	0fa3b2e070fe42ff
 probe-x-over	machinedrum	error	-	4a6ec08369eb90a1	probe-x-over: the [<XMemory>] state (64 words), locals and spills need more than 64 X words and the Y words after the state (Y+64 to Y+63)
 probe-x-state	machinedrum	ok	101	cf7cafeb9d0f9fe0
 probe-y-only	machinedrum	ok	16	67b23ab1411cb12f
-sine	machinedrum	ok	82	729f08f26ab982c6
-tx6-bd	machinedrum	ok	682	efcfab396776f3dc
-tx6-ch	machinedrum	ok	763	7280f80982ae9e9d
-tx6-cp	machinedrum	ok	1024	f985f2bf6ba8a68b
-tx6-cy	machinedrum	ok	722	81b722668e868e11
-tx6-ht	machinedrum	ok	700	4337cdb81b2e8e49
-tx6-lt	machinedrum	ok	763	97335dffdfc0d6ef
-tx6-oh	machinedrum	ok	763	6fbb362106708120
-tx6-sd	machinedrum	ok	675	d90148cdb6f28be3
+sine	machinedrum	ok	82	436aff521f6b270d
+tx6-bd	machinedrum	ok	682	5fa71056bf0718b9
+tx6-ch	machinedrum	ok	763	0d40ad1410f12fc3
+tx6-cp	machinedrum	ok	1024	4c41a697ccfb463d
+tx6-cy	machinedrum	ok	722	8469ef403a5d2cd4
+tx6-ht	machinedrum	ok	700	fcd8614df49003f8
+tx6-lt	machinedrum	ok	763	f924ed1ec063b229
+tx6-oh	machinedrum	ok	763	a2cc1377b910db4e
+tx6-sd	machinedrum	ok	675	7c4bc6e8633420ab

@@ -18,6 +18,11 @@ constexpr EReg registers[] = {
   Reg_X0, Reg_X1, Reg_Y0, Reg_Y1,
   Reg_A0, Reg_A1, Reg_A2, Reg_B0, Reg_B1, Reg_B2
 };
+// What a snapshot holds after the 34 registers above: PC, SR, OMR, LA, LC, SP (not SSH/SSL: reading SSH pops the stack).
+constexpr EReg control[] = { Reg_PC, Reg_SR, Reg_OMR, Reg_LA, Reg_LC, Reg_SP };
+constexpr unsigned snapshotWords = std::size(registers) + std::size(control);
+uint32_t snapshot[snapshotWords];
+uint32_t stepSentinel = 0;
 bool valid(uint32_t bank, uint32_t address) {
   return dsp && bank < 3 && address < size;
 }
@@ -83,4 +88,32 @@ int dsp_call(uint32_t entry, uint32_t limit) {
   }
   return -2;
 }
+// Stepping, for a debugger: dsp_begin calls `entry` as dsp_call does, then each dsp_step runs one instruction and
+// says whether the routine returned (1), is still running (0) or the PC left memory (-3).
+int dsp_begin(uint32_t entry) {
+  if (!dsp || entry >= size - 1) return -1;
+  stepSentinel = size - 1;
+  dsp->setPC(stepSentinel);
+  dsp->jsr(entry);
+  return 0;
 }
+int dsp_step() {
+  if (!dsp || stepSentinel == 0) return -1;
+  if (dsp->getPC().toWord() >= size) return -3;
+  dsp->execInterpreter();
+  if (dsp->getPC().toWord() == stepSentinel) { stepSentinel = 0; return 1; }
+  return 0;
+}
+int dsp_pc() { return dsp ? static_cast<int>(dsp->getPC().toWord()) : -1; }
+// Every register at once (the numbering of dsp_reg_read, then PC, SR, OMR, LA, LC, SP): dsp_snapshot takes it and
+// returns how many words it has, dsp_snapshot_word reads one; a step's writes are what differs from the previous one.
+int dsp_snapshot() {
+  if (!dsp) return -1;
+  unsigned i = 0;
+  for (const auto r : registers) { int64_t v = 0; dsp->readRegToInt(r, v); snapshot[i++] = static_cast<uint32_t>(v & 0xffffff); }
+  for (const auto r : control)   { int64_t v = 0; dsp->readRegToInt(r, v); snapshot[i++] = static_cast<uint32_t>(v & 0xffffff); }
+  return static_cast<int>(snapshotWords);
+}
+int dsp_snapshot_word(uint32_t i) { return i < snapshotWords ? static_cast<int>(snapshot[i]) : -1; }
+}
+

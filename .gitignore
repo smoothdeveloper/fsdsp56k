@@ -19,6 +19,10 @@ fable_modules/
 dist/
 vite.log
 
+# editor state
+.idea/
+.cursor/
+
 # local notes: kept next to the checkout, never committed
 *.local.md
 .local/

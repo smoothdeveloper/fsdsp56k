@@ -1,3 +1,4 @@
+// Attribution: ported from https://github.com/etcetc000/kitbasher (mds/tx6/bd/bd.asm) at 510bdbd, by Matthew Fecher (AnalogMatthew), Fadedlimes; MIT. See THIRD-PARTY-NOTICES.md.
 /// The TX6 BD control tables, as kitbasher ships them in mds/tx6/bd/bd.asm (no generator is
 /// published). From that file:
 ///

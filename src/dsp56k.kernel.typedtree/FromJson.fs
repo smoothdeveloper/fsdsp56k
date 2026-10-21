@@ -53,7 +53,7 @@ let rec tyOf (j: J) : Ir.IrTy =
       if kind = "array" then Ir.TyArray(tyOf (List.head (items (field j "args"))))
       else
         match name with
-        | "dsp56k.kernel.Frac" -> Ir.TyFrac
+        | "dsp56k.kernel.Frac" | "dsp56k.kernel.Frac`1" -> Ir.TyFrac  // `Frac<Hz>` too
         | "dsp56k.kernel.Acc" -> Ir.TyAcc
         | "dsp56k.kernel.Long" -> Ir.TyLong
         | "dsp56k.kernel.Table" -> Ir.TyTable
@@ -285,7 +285,9 @@ type Tree(root: J, host: Host) =
             i
       // a static property is a call with a unit argument in the typed tree
       let unitArgs = argsJ |> List.forall isUnit
-      if (bool' (field m "property") || bool' (field m "getter") || member'.ParameterCount = 0) && unitArgs then
+      // `Units.plain x` only retypes a unit's Frac: it is `x`
+      if member'.Intrinsic = Some "unit.plain" && args'.Length = 1 then args'.Head
+      elif (bool' (field m "property") || bool' (field m "getter") || member'.ParameterCount = 0) && unitArgs then
         make (Ir.NPropertyGet(optional (field j "o"), member', []))
       else make (Ir.NCall(optional (field j "o"), member', args'))
     | "FieldGet" ->

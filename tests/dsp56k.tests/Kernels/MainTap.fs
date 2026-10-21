@@ -1,3 +1,4 @@
+// Attribution: ported from https://github.com/jmamma/MDS (machines/examples/imports/main_tap.asm56k) at c446179, by Justin Mammarella (jmamma); no licence published. See THIRD-PARTY-NOTICES.md.
 /// jmamma/MDS machines/examples/imports/main_tap.asm56k as a kernel: the main output, mono, now
 /// or up to two blocks late.
 [<ReflectedDefinition>]

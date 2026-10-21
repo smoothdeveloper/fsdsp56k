@@ -12,3 +12,16 @@ nuget Fable.Browser.Dom
 nuget Fable.Browser.Event
 nuget Fable.Core
 nuget FSharp.Compiler.Service
+
+// are prereleases, pinned to the set that is known to build together
+nuget Nacara.Core = 2.0.0-beta.6
+nuget Nacara.Plugin.Markdown = 1.0.0-beta.2
+nuget Nacara.Plugin.Highlight.TreeSitter = 1.0.0-beta.3
+nuget Nacara.Plugin.Search = 1.0.0-beta.1
+nuget Nacara.Plugin.Sitemap = 1.0.0-beta.1
+nuget Nacara.Plugin.FSharpApi = 1.0.0-beta.5
+nuget Nacara.Plugin.Assets.LightningCss = 1.0.0-beta.1
+nuget Nacara.Plugin.Assets.Esbuild = 1.0.0-beta.1
+nuget Nacara.Plugin.Assets.Nuglify = 1.0.0-beta.1
+nuget Nacara.Plugin.Deploy.GitHubPages = 1.0.0-beta.2
+nuget Nacara.Theme.Default = 1.0.0-beta.14

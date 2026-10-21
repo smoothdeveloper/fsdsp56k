@@ -1,3 +1,4 @@
+// Attribution: ported from https://github.com/etcetc000/kitbasher (mds/tx6/cp/cp.asm) at 510bdbd, by Matthew Fecher (AnalogMatthew), Fadedlimes; MIT. See THIRD-PARTY-NOTICES.md.
 /// kitbasher's TX6 CP (mds/tx6/cp/cp.asm, MIT; Simple606-inspired, by Matthew Fecher and
 /// Fadedlimes, see Tx6CpTables.fs for the notice) as a kernel: LCG noise through a TUNE biquad,
 /// under a gain built per block from a burst sequence, a tail, a late tail, a foundation thump

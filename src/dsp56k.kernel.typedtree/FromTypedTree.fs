@@ -98,7 +98,8 @@ let rec irTy (t: FSharpType) : Ir.IrTy =
     if e.IsArrayType then Ir.TyArray(irTy t.GenericArguments[0])
     else
       match e.TryFullName with
-      | Some "dsp56k.kernel.Frac" -> Ir.TyFrac
+      // `Frac<Hz>`: a Frac with a unit of measure, which the typed tree keeps as a type of its own
+      | Some "dsp56k.kernel.Frac" | Some "dsp56k.kernel.Frac`1" -> Ir.TyFrac
       | Some "dsp56k.kernel.Acc" -> Ir.TyAcc
       | Some "dsp56k.kernel.Long" -> Ir.TyLong
       | Some "dsp56k.kernel.Table" -> Ir.TyTable
@@ -328,7 +329,9 @@ type Converter(source: Source) =
             i
       // a static property is a call with a unit argument in the typed tree
       let unitArgs = args |> List.forall (fun a -> irTy a.Type = Ir.TyUnit)
-      if (m.IsProperty || m.IsPropertyGetterMethod || member'.ParameterCount = 0) && unitArgs then make (Ir.NPropertyGet(Option.map this.Expr instance, member', []))
+      // `Units.plain x` only retypes a unit's Frac: it is `x`
+      if member'.Intrinsic = Some "unit.plain" && args'.Length = 1 then args'.Head
+      elif (m.IsProperty || m.IsPropertyGetterMethod || member'.ParameterCount = 0) && unitArgs then make (Ir.NPropertyGet(Option.map this.Expr instance, member', []))
       else make (Ir.NCall(Option.map this.Expr instance, member', args'))
     | FSharpFieldGet(instance, record, f) -> make (Ir.NPropertyGet(Option.map this.Expr instance, this.Field(record, f), []))
     | FSharpFieldSet(instance, record, f, value) ->
@@ -460,6 +463,26 @@ let entriesOf (checked': Checked) (file: string) : EntryTriple[] =
   |> Array.sortBy (fun t -> t.prefix)
 
 /// The line each field of the record `typeName` (its full name) is declared on, in declaration order.
+/// The unit of measure each field of a record carries on its type (`pitch : Frac<Hz>` gives ("pitch", "Hz")): erased
+/// once compiled, so only the typed tree has it.
+let fieldMeasures (checked': Checked) (typeName: string) : (string * string)[] =
+  let found = ResizeArray<string * string>()
+  let rec walk (d: FSharpImplementationFileDeclaration) =
+    match d with
+    | FSharpImplementationFileDeclaration.Entity(e, subs) ->
+      if e.TryFullName = Some typeName && e.IsFSharpRecord then
+        for f in e.FSharpFields do
+          // `Frac<Hz>` is the type `Frac`1` of the tree, its measure the argument
+          let t = f.FieldType.StripAbbreviations()
+          if t.HasTypeDefinition && t.TypeDefinition.TryFullName = Some "dsp56k.kernel.Frac`1" && t.GenericArguments.Count = 1 then
+            let m = t.GenericArguments[0]
+            found.Add((f.Name, (if m.HasTypeDefinition then m.TypeDefinition.DisplayName else m.Format(FSharpDisplayContext.Empty))))
+      List.iter walk subs
+    | _ -> ()
+  for f in checked'.contents do
+    for d in f.Declarations do walk d
+  found.ToArray()
+
 let fieldLines (checked': Checked) (typeName: string) : (string * int)[] =
   let found = ResizeArray<string * int>()
   let rec walk (d: FSharpImplementationFileDeclaration) =

@@ -1,6 +1,7 @@
 /// Opt-in direct-target benchmark. Existing DSP grading remains unchanged.
 #load "../src/dsp56k.kernel.intrinsics/Intrinsics.fs"
 #load "Host.fs"
+#load "Targets.fsx"
 open System
 open System.IO
 open System.Diagnostics
@@ -21,9 +22,21 @@ let run executable arguments =
 let dotnet = Path.Combine(__SOURCE_DIRECTORY__, "bin", "Release", "net10.0", "Portable.Net.dll")
 let javascript = Path.Combine(output, "js", "grade.mjs")
 let args = fsi.CommandLineArgs[1..]
-if args |> Array.exists (fun value -> value <> "--javascript" && value <> "--dotnet" && value <> "--rust-wasm") then
-  failwith "Usage: dotnet fsi portable/grade.fsx [--dotnet] [--javascript] [--rust-wasm]"
-let targets = if args.Length = 0 then [| "--dotnet"; "--javascript" |] else args
+let legacy = args |> Array.filter (fun value -> Targets.names |> Array.exists (fun name -> value = "--" + name))
+for index, value in Array.indexed args do
+  if value <> "--targets" && not (Array.contains value legacy)
+     && (index = 0 || args[index - 1] <> "--targets") then
+    invalidArg "arguments" $"Unknown option: {value}"
+let targets =
+  Targets.selected args
+    (if legacy.Length = 0 then [| "dotnet"; "javascript" |] else legacy |> Array.map (fun value -> value[2..]))
+let configuration: Targets.Configuration =
+  { root       = root
+    project    = Path.Combine(__SOURCE_DIRECTORY__, "portable.net.fsproj")
+    output     = output
+    manifest   = Path.Combine(__SOURCE_DIRECTORY__, "Cargo.toml")
+    javascript = Path.Combine(output, "js")
+    dotnet     = dotnet }
 
 let step action words blocks = { action = action; words = words; blocks = blocks }
 let scenario first second =
@@ -36,7 +49,16 @@ let cases =
      "input-thru", scenario [| 0; 0x500000 |] [| 1; 0x700000 |] |]
 
 run "dotnet" [ "fsi"; "portable/prepare.fsx" ]
-run "dotnet" [ "build"; "portable/portable.net.fsproj"; "-c"; "Release"; "--ignore-failed-sources"; "-p:NuGetAudit=false" ]
+Targets.timedBuild configuration "dotnet" "dotnet"
+  [ "build"; "portable/portable.net.fsproj"; "-c"; "Release"; "--ignore-failed-sources"; "-p:NuGetAudit=false" ]
+if targets |> Array.exists (fun target -> target = "javascript" || target.StartsWith "dotnet-wasm") then
+  Targets.timedBuild configuration "javascript" "pnpm" [ "--dir"; "portable"; "build" ]
+if targets |> Array.exists (fun target -> target = "rust-native" || target = "rust-wasm") then
+  let arguments =
+    [ "fsi"; "portable/build-rust.fsx" ]
+    @ (if Array.contains "rust-wasm" targets then [] else [ "--emit-only" ])
+  Targets.timedBuild configuration "fable-rust" "dotnet" arguments
+Targets.build configuration targets
 let rows = ResizeArray<string>()
 rows.Add "kernel\ttarget\truntime\tblocks\tmedian_render_ms\tworst_render_ms\taudio_ms\treal_time_factor\toutput_checks\tstate_checks\tbuffer_checks"
 let mutable completed = 0
@@ -50,13 +72,8 @@ for kernel, steps in cases do
   for target in targets do
     completed <- completed + 1
     printfn "[%d/%d] %s %s: checking and measuring" completed (cases.Length * targets.Length) kernel target
-    let result = Path.Combine(output, kernel + "." + target[2..] + ".json")
-    let arguments = [ path; result; "2"; "5" ]
-    if target = "--dotnet" then run "dotnet" (dotnet :: arguments)
-    elif target = "--javascript" then run "node" (javascript :: arguments)
-    else
-      let wasm = Path.Combine(output, "cargo", "wasm32-unknown-unknown", "release", "dsp56k_portable.wasm")
-      run "node" (javascript :: "--wasm" :: wasm :: arguments)
+    let result = Path.Combine(output, kernel + "." + target + ".json")
+    Targets.grade configuration target path result 2 5
     let m = JsonSerializer.Deserialize<Measurement>(File.ReadAllText result)
     rows.Add(String.concat "\t"
       [ m.kernel; m.target; m.runtime; string m.blocks; string m.medianRenderMs
@@ -96,6 +113,7 @@ let artifacts =
     yield dotnet
     yield! Directory.EnumerateFiles(Path.Combine(output, "js"), "*.mjs")
     yield Path.Combine(output, "cargo/wasm32-unknown-unknown/release/dsp56k_portable.wasm")
+    yield! Targets.artifacts configuration targets
   }
 for path in artifacts |> Seq.sort do
   if File.Exists path then

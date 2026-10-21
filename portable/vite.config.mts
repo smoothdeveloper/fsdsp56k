@@ -7,7 +7,7 @@ export default defineConfig({
     outDir: '../out/portable/js',
     emptyOutDir: true,
     lib: {
-      entry: { grade: './Runner.fs', kernels: './Adapters.fs', 'rust-wasm': './RustWasm.fs' },
+      entry: { grade: './Runner.fs', kernels: './Adapters.fs', 'rust-wasm': './RustWasm.fs', 'dotnet-wasm-grade': './BrowserHost.fs' },
       formats: ['es']
     },
     rollupOptions: {

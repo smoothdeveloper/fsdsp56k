@@ -16,9 +16,16 @@ The normal .NET intrinsic implementations and the DSP instruction compiler were 
 or replaced. Input resources generated from `Math.Sin` are stand-ins, not firmware tables;
 other kernels need their actual resources supplied identically to all targets.
 
-.NET browser AOT is a separate integration: this machine initially had no WebAssembly
-workloads. It needs an explicit runtime host and measured worklet loading/memory behavior.
-Keep it labelled unavailable until it has produced and passed a fixture run.
+The direct suite also has .NET NativeAOT and interpreted/AOT browser-wasm runners.
+The latter run inside .NET's WebAssembly runtime hosted by Node, not an AudioWorklet;
+their measurements do not establish worklet loading or scheduling behavior.
+`install-wasm.fsx` installs the required workload into a writable SDK copy.
+
+NativeAOT cannot use the previous reflection-based JSON serializer or the runner's generic
+`printf` specialization: a real run failed with missing native code for `CaptureFinal1<double>`.
+`Json.fs` now reads/writes the fixed protocol explicitly, and native console output uses
+`Console.WriteLine`. FSharp.Core still emits aggregate trim/AOT warnings; exact fixture runs
+validate the exercised paths, not arbitrary reflection-heavy F# code.
 
 When a shared `.props` source list changes, Fable 5.18's cached project crack can omit newly
 included files. Building with `--noCache` refreshes those options.

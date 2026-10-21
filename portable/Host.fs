@@ -102,6 +102,10 @@ let grade target runtime now create warmup trials (fixture: Fixture) =
      || fixture.sampleRate <= 0 || warmup < 0 || trials < 1 then
     invalidArg "fixture" "Invalid portable grading version, audio dimensions or trial count"
   let actual, memory = capture create fixture.steps
+  let bufferNames (buffers: Buffer array) = buffers |> Array.map _.name |> Array.sort
+  if bufferNames fixture.buffers <> bufferNames memory
+     || (fixture.buffers |> Array.distinctBy _.name).Length <> fixture.buffers.Length then
+    failwith $"{fixture.kernel}: expected buffer names must cover every declared buffer exactly once"
   if actual.Length <> fixture.expected.Length || actual.Length = 0 then
     failwith $"{fixture.kernel}: expected {fixture.expected.Length} nonempty blocks, got {actual.Length}"
   let mutable outputChecks, stateChecks, bufferChecks = 0, 0, 0

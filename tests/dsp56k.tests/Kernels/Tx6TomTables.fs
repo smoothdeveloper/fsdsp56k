@@ -1,3 +1,4 @@
+// Attribution: ported from https://github.com/etcetc000/kitbasher (mds/tx6/lt/lt.asm, mds/tx6/ht/ht.asm) at 510bdbd, by Matthew Fecher (AnalogMatthew), Fadedlimes; MIT. See THIRD-PARTY-NOTICES.md.
 /// The TX6 LT and HT tables, as kitbasher ships them in mds/tx6/lt/lt.asm and mds/tx6/ht/ht.asm
 /// (no generator is published). From those files:
 ///

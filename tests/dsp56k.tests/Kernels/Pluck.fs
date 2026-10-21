@@ -1,3 +1,4 @@
+// Attribution: ported from https://github.com/jmamma/MDS (machines/examples/imports/pluck.asm56k) at c446179, by Justin Mammarella (jmamma); no licence published. See THIRD-PARTY-NOTICES.md.
 /// jmamma/MDS machines/examples/imports/pluck.asm56k as a kernel: a Karplus-Strong string in the
 /// track's own external memory (MDS import 6), one period long: a trigger fills it with noise,
 /// then each sample is the average of the two oldest times the loop gain.
@@ -5,11 +6,12 @@
 module samples.kernels.Pluck
 
 open dsp56k.kernel
+open dsp56k.kernel.Units
 
 type Params =
-  { ptch : Frac       // oscillator increment P: the frequency is P x 44,100 / 2^21
-    dec  : Frac       // loop gain, Q23
-    lev  : Frac }     // output level, unipolar Q23
+  { ptch : Frac<Hz>     // oscillator increment P: the frequency is P x 44,100 / 2^21
+    dec  : Frac<ratio>  // loop gain, Q23
+    lev  : Frac<ratio> }  // output level, unipolar Q23
 
 type State =
   { mutable region  : Frac    // this track's 1,536 words, as an offset in the tracks' memory
@@ -35,8 +37,8 @@ let init (_: Params) (s: State) =
 let trig (p: Params) (s: State) =
   // L = 2^21 / P samples, at most 512 (86 Hz), at least 2
   let mutable length = Acc.ofFrac (Frac.ofRaw 512)
-  if Acc.ofFrac (Frac.ofRaw 4096) <= Acc.ofFrac p.ptch then
-    length <- Acc.ofFrac (Acc.lo (Acc.divide (Acc.ofRaw 0x200000L) p.ptch))
+  if Acc.ofFrac (Frac.ofRaw 4096) <= Acc.ofFrac (plain p.ptch) then
+    length <- Acc.ofFrac (Acc.lo (Acc.divide (Acc.ofRaw 0x200000L) (plain p.ptch)))
     if length < Acc.ofFrac (Frac.ofRaw 2) then length <- Acc.ofFrac (Frac.ofRaw 2)
   s.pending <- Acc.hi length              // one period of noise first
   s.last <- Acc.hi (length - Frac.ofRaw 1)
@@ -56,7 +58,7 @@ let render (p: Params) (s: State) (out: Output) =
       for _ in 0 .. 31 do
         n <- Frac.lfsr taps n
         string.Put n
-        out.Write(Acc.sat (n * p.lev))
+        out.Write(Acc.sat (n * plain p.lev))
       s.noise <- n
     else
       // the string: the average of the two oldest samples, times the loop gain
@@ -65,9 +67,9 @@ let render (p: Params) (s: State) (out: Output) =
         let oldest = string.Peek()
         let average = Acc.sat ((Acc.ofFrac oldest + prev) >>> 1)
         prev <- oldest
-        let v = Acc.sat (average * p.dec)
+        let v = Acc.sat (average * plain p.dec)
         string.Put v
-        out.Write(Acc.sat (v * p.lev))
+        out.Write(Acc.sat (v * plain p.lev))
       s.prev <- prev
     s.pos <- string.Position()
 

@@ -1,3 +1,4 @@
+// Attribution: ported from https://github.com/etcetc000/kitbasher (mds/tx6/ch/ch.asm, mds/tx6/oh/oh.asm, mds/tx6/cy/cy.asm) at 510bdbd, by Matthew Fecher (AnalogMatthew), Fadedlimes; MIT. See THIRD-PARTY-NOTICES.md.
 /// The TX6 CH, OH and CY tables, as kitbasher ships them in mds/tx6/ch/ch.asm, oh/oh.asm and
 /// cy/cy.asm (no generator is published). From those files:
 ///

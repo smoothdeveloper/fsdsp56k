@@ -16,6 +16,7 @@ if not (File.Exists tool) then
 run "dotnet" [ "fsi"; "portable/prepare.fsx" ]
 printfn "[1/2] Fable 5.18.0 -> Rust"
 run tool [ "portable/portable.rust.fsproj"; "--lang"; "rust"; "--outDir"; "out/portable/rust" ]
+if fsi.CommandLineArgs |> Array.contains "--emit-only" then exit 0
 printfn "[2/2] Rust -> wasm32-unknown-unknown (release)"
 // rustup's target libraries must match rustc; a Homebrew rustc can shadow it on macOS.
 let info = ProcessStartInfo("rustup", WorkingDirectory = root, UseShellExecute = false, RedirectStandardOutput = true)

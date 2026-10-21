@@ -80,6 +80,25 @@ let trig (node: AudioNode) =
 let trace (node: AudioNode) (regions: TraceRegion array) =
   node.port.postMessage (createObj [ "type" ==> "trace"; "regions" ==> regions ])
 
+/// With `true`, each `level` message carries `writes`: per register (the numbers of `RegisterWrite`, then PC, SR, OMR, LA, LC,
+/// SP), how many blocks changed it since the last one.
+let activity (node: AudioNode) (value: bool) =
+  node.port.postMessage (createObj [ "type" ==> "activity"; "value" ==> value ])
+
+/// Stepping: `beginStep` stops the audio and starts a routine (the render entry by default), `step` runs `count`
+/// instructions; each answers a `step` message: status (1: returned), pc, steps, registers (a snapshot), written.
+let beginStep (node: AudioNode) (entry: int option) =
+  node.port.postMessage (createObj [ "type" ==> "begin"; "entry" ==> (match entry with Some e -> box e | None -> null) ])
+
+let step (node: AudioNode) (count: int) =
+  node.port.postMessage (createObj [ "type" ==> "step"; "count" ==> count ])
+
+/// The names of a snapshot's words, in order.
+let registerNames =
+  [| "r0"; "r1"; "r2"; "r3"; "r4"; "r5"; "r6"; "r7"; "n0"; "n1"; "n2"; "n3"; "n4"; "n5"; "n6"; "n7"
+     "m0"; "m1"; "m2"; "m3"; "m4"; "m5"; "m6"; "m7"; "x0"; "x1"; "y0"; "y1"; "a0"; "a1"; "a2"; "b0"; "b1"; "b2"
+     "pc"; "sr"; "omr"; "la"; "lc"; "sp" |]
+
 [<AllowNullLiteral>]
 type GainNode =
   abstract connect: obj -> unit

@@ -17,7 +17,10 @@ for index, name in Array.indexed sources do
   let registration = @"(?m)^let kernel = Kernel\.define [^\r\n]+<@[^\r\n]+$"
   if Regex.Matches(source, registration).Count <> 1 then
     failwith $"{relative}: expected one single-line kernel registration; update staging explicitly"
-  let staged = Regex.Replace(source, registration, "// Quotation registration belongs only to the DSP compiler host.")
+  // Unit annotations and their identity cast are compile-time metadata only.
+  let numerical = Regex.Replace(source, @"Frac<(Hz|ratio)>", "Frac")
+  let numerical = numerical.Replace("open dsp56k.kernel.Units", "").Replace("plain ", "")
+  let staged = Regex.Replace(numerical, registration, "// Quotation registration belongs only to the DSP compiler host.")
   if staged.Contains "<@" then failwith $"{relative}: unstaged quotation"
   File.WriteAllText(Path.Combine(output, name + ".fs"), staged)
   manifest.Add $"{relative}\t{SHA256.HashData(File.ReadAllBytes path) |> Convert.ToHexString}"

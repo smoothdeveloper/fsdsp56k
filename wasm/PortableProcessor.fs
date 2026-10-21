@@ -129,6 +129,7 @@ type PortableProcessor(options: obj) as this =
                   inputCursor <- (inputCursor + 1) % inputTrace.Length
             let renderStart = clock()
             let count: int = exports?dsp_render()
+            rendering <- rendering + max 0. (clock() - renderStart)
             if count <> block.Length then failwith "Invalid portable stereo block"
             for word in 0 .. block.Length - 1 do block[word] <- exports?dsp_output word
             for regionIndex in 0 .. regions.Length - 1 do
@@ -137,7 +138,6 @@ type PortableProcessor(options: obj) as this =
                 let position = regionCursors[regionIndex]
                 regionTraces[regionIndex][position] <- exports?dsp_resource_word(region.bank, region.address + word)
                 regionCursors[regionIndex] <- (position + 1) % 1024
-            rendering <- rendering + max 0. (clock() - renderStart)
             cursor <- 0
           let signed word = float (word <<< 8 >>> 8) / 8388608.
           left[index] <- float32 (signed block[cursor] * gain)

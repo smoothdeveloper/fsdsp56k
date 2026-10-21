@@ -1,5 +1,6 @@
 #load "../src/dsp56k.kernel.intrinsics/Intrinsics.fs"
 #load "Host.fs"
+#load "Json.fs"
 open dsp56k.Portable
 
 let mutable value = 0
@@ -21,6 +22,7 @@ let fixture =
 let mutable clock = 0.
 let now () = clock <- clock + 1.; clock
 let result = grade "test" "test" now create 0 1 fixture
+assert (dsp56k.PortableJson.fixture (dsp56k.PortableJson.writeFixture fixture) = fixture)
 assert (result.outputChecks = 1 && result.stateChecks = 1 && result.bufferChecks > 0)
 let refuses fixture =
   try grade "test" "test" now create 0 1 fixture |> ignore; false
@@ -28,6 +30,8 @@ let refuses fixture =
 assert (refuses { fixture with expected = [| { expected[0] with output = [| 8 |] } |] })
 assert (refuses { fixture with expected = [| { expected[0] with state = [| 8 |] } |] })
 assert (refuses { fixture with buffers = [| { memory[0] with words = [| 1 |] } |] })
+assert (refuses { fixture with buffers = [||] })
+assert (refuses { fixture with buffers = Array.append memory [| memory[0] |] })
 assert (refuses { fixture with version = 2 })
 printfn "[1/2] Portable grade rejects output, state, buffer and schema mismatches: passed"
 

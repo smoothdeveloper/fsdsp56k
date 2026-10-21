@@ -1,3 +1,4 @@
+// Attribution: ported from https://github.com/etcetc000/kitbasher (mds/tx6/sd/sd.asm) at 510bdbd, by Matthew Fecher (AnalogMatthew), Fadedlimes; MIT. See THIRD-PARTY-NOTICES.md.
 /// kitbasher's TX6 SD (mds/tx6/sd/sd.asm, MIT; Simple606-inspired, by Matthew Fecher and
 /// Fadedlimes, see Tx6SdTables.fs for the notice) as a kernel: a gliding damped body mode and LCG
 /// noise through a COLR biquad, each under a fast + slow gain ramped per sample. A gate holds the

@@ -1,3 +1,4 @@
+// Attribution: ported from https://github.com/etcetc000/kitbasher (mds/tx6/lt/lt.asm, mds/tx6/ht/ht.asm) at 510bdbd, by Matthew Fecher (AnalogMatthew), Fadedlimes; MIT. See THIRD-PARTY-NOTICES.md.
 /// kitbasher's TX6 LT and HT toms (mds/tx6/lt/lt.asm and ht/ht.asm, MIT; Simple606-inspired,
 /// by Matthew Fecher and Fadedlimes, see Tx6TomTables.fs for the notice) as one engine and two
 /// kernels. Two damped resonator modes and LCG noise through a biquad, mixed under a gain that

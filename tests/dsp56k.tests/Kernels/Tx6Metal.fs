@@ -1,3 +1,4 @@
+// Attribution: ported from https://github.com/etcetc000/kitbasher (mds/tx6/ch/ch.asm, mds/tx6/oh/oh.asm, mds/tx6/cy/cy.asm) at 510bdbd, by Matthew Fecher (AnalogMatthew), Fadedlimes; MIT. See THIRD-PARTY-NOTICES.md.
 /// kitbasher's TX6 CH and OH hats and CY cymbal (mds/tx6/ch, oh and cy, MIT; Simple606-inspired,
 /// by Matthew Fecher and Fadedlimes, see Tx6MetalTables.fs for the notice) as one engine and
 /// three kernels. LCG noise through a biquad and two undamped "metal" partials, each under its

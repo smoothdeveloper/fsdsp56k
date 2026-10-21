@@ -20,8 +20,9 @@ type AudioWorkletProcessor() =
 [<Emit("$0.then($1).catch($2)")>]
 let finish (pending: JS.Promise<'a>) (success: 'a -> unit) (failure: obj -> unit) : unit = jsNative
 
-// AudioWorkletGlobalScope has no fetch or URL. Compile on the page, instantiate on the audio thread.
-[<Emit("({instantiateWasm: (imports, receive) => { const instance = new WebAssembly.Instance($0, imports); receive(instance); return instance.exports; }})")>]
+// AudioWorkletGlobalScope has no fetch or URL. Compile on the page, instantiate on the audio thread; locateFile keeps the
+// glue from resolving the .wasm against import.meta.url (new URL), which it does at load when no locateFile is given.
+[<Emit("({locateFile: (path) => path, instantiateWasm: (imports, receive) => { const instance = new WebAssembly.Instance($0, imports); receive(instance); return instance.exports; }})")>]
 let instantiateOptions (compiledModule: obj) : obj = jsNative
 
 [<AttachMembers>]
@@ -43,6 +44,9 @@ type DspProcessor(options: obj) as this =
   let mutable regions: TraceRegion array = [||]
   let mutable regionTraces: int array array = [||]
   let mutable regionCursors: int array = [||]
+  // register activity: how many blocks changed each register since the last report (`activity` turns it on)
+  let mutable writes: int array option = None
+  let mutable steps = 0
 
   do this.port.onmessage <- fun event -> this.message event?data
 
@@ -104,6 +108,29 @@ type DspProcessor(options: obj) as this =
         | "memory" -> engine.Write(data?bank, data?address, data?word)
         | "registers" -> engine.ConfigureRegisters data?values
         | "trig" -> engine.Trigger()
+        | "activity" -> writes <- if (data?value: bool) then Some(Array.zeroCreate 40) else None
+        | "begin" ->
+          // stepping stops the audio until `play`
+          playing <- false
+          let entry: int = if isNull data?entry then engine.Image.render else data?entry
+          engine.Begin entry
+          steps <- 0
+          this.port.postMessage (createObj [ "type" ==> "step"; "status" ==> 0; "pc" ==> engine.PC; "steps" ==> steps; "registers" ==> engine.Snapshot() ])
+        | "step" ->
+          let count: int = if isNull data?count then 1 else data?count
+          if not (integer count) || count < 1 || count > 100000 then failwith "Invalid step count"
+          let before = engine.Snapshot()
+          let mutable status = 0
+          let mutable taken = 0
+          while status = 0 && taken < count do
+            status <- engine.Step()
+            taken <- taken + 1
+          steps <- steps + taken
+          let after = engine.Snapshot()
+          let written = [| for i in 0 .. after.Length - 1 do if after[i] <> before[i] then i |]
+          this.port.postMessage (createObj [
+            "type" ==> "step"; "status" ==> status; "pc" ==> engine.PC; "steps" ==> steps
+            "registers" ==> after; "written" ==> written ])
         | _ -> failwith "Unknown runtime message"
     with error -> this.error (box error.Message)
 
@@ -127,7 +154,7 @@ type DspProcessor(options: obj) as this =
                   let word = int (System.Math.Round(max -8388608. (min 8388607. (float sample * 8388608.)))) &&& 0xffffff
                   engine.Write(engine.Image.inputBank, engine.Image.input + frame * 2 + channel, word)
             let renderStart = clock()
-            block <- engine.Render()
+            block <- (match writes with Some counts -> engine.RenderCounting counts | None -> engine.Render())
             rendering <- rendering + max 0. (clock() - renderStart)
             for index in 0 .. regions.Length - 1 do
               let region = regions[index]
@@ -154,7 +181,9 @@ type DspProcessor(options: obj) as this =
           this.port.postMessage (createObj [
             "type" ==> "level"; "peak" ==> level
             "samples" ==> samples; "traces" ==> traces
-            "timing" ==> timing.Take(); "timer" ==> timer ])
+            "timing" ==> timing.Take(); "timer" ==> timer
+            "writes" ==> (match writes with Some counts -> box (Array.copy counts) | None -> null) ])
+          writes |> Option.iter (fun counts -> Array.fill counts 0 counts.Length 0)
           level <- 0.
           quanta <- 0
       with error ->

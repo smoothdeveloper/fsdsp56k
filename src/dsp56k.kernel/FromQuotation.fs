@@ -77,6 +77,8 @@ let rec convert (e: Expr) : Ir.Expr =
   | Var v -> make (Ir.NVar(varOf v))
   | Lambda(v, body) -> make (Ir.NLambda(varOf v, convert body))
   | Application(f, a) -> make (Ir.NApplication(convert f, convert a))
+  // `Units.plain x` only retypes a unit's Frac: it is `x`
+  | Call(None, mi, [ x ]) when intrinsicOf mi = Some "unit.plain" -> convert x
   | Call(o, mi, args) -> make (Ir.NCall(Option.map convert o, memberOf mi, List.map convert args))
   | PropertyGet(o, p, idx) -> make (Ir.NPropertyGet(Option.map convert o, memberOf p, List.map convert idx))
   | PropertySet(o, p, idx, x) -> make (Ir.NPropertySet(Option.map convert o, memberOf p, List.map convert idx, convert x))

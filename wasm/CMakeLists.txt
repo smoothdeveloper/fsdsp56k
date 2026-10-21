@@ -19,5 +19,5 @@ target_link_options(dsp56300 PRIVATE
   --no-entry -fexceptions
   -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=web,worker,node
   -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=134217728
-  "-sEXPORTED_FUNCTIONS=['_dsp_create','_dsp_bridge','_dsp_destroy','_dsp_write','_dsp_read','_dsp_reg_write','_dsp_reg_read','_dsp_call','_dsp_cycles','_dsp_operations']")
+  "-sEXPORTED_FUNCTIONS=['_dsp_create','_dsp_bridge','_dsp_destroy','_dsp_write','_dsp_read','_dsp_reg_write','_dsp_reg_read','_dsp_call','_dsp_cycles','_dsp_operations','_dsp_begin','_dsp_step','_dsp_pc','_dsp_snapshot','_dsp_snapshot_word']")
 set_target_properties(dsp56300 PROPERTIES SUFFIX ".mjs")

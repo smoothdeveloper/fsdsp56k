@@ -1,3 +1,4 @@
+// Attribution: ported from https://github.com/jmamma/MDS (machines/examples/imports/input_thru.asm56k) at c446179, by Justin Mammarella (jmamma); no licence published. See THIRD-PARTY-NOTICES.md.
 /// jmamma/MDS machines/examples/imports/input_thru.asm56k as a kernel: external input A or B,
 /// read from the firmware's input ring.
 [<ReflectedDefinition>]

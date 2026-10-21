@@ -1,3 +1,4 @@
+// Attribution: ported from https://github.com/etcetc000/kitbasher (mds/tx6/bd/bd.asm) at 510bdbd, by Matthew Fecher (AnalogMatthew), Fadedlimes; MIT. See THIRD-PARTY-NOTICES.md.
 /// kitbasher's TX6 BD (mds/tx6/bd/bd.asm, MIT; Simple606-inspired, by Matthew Fecher and
 /// Fadedlimes, see Tx6BdTables.fs for the notice) as a kernel: a swept sine body from a
 /// two-pole resonator, a HEAT-controlled third harmonic, a low-passed noise click whose gain

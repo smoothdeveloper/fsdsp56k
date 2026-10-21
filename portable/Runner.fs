@@ -21,26 +21,33 @@ let arguments () : string array = jsNative
 [<Emit("process.version + ' / ' + process.platform + ' / ' + process.arch")>]
 let runtime () : string = jsNative
 let target = "fable-js"
+let parseFixture text : Fixture = parse text
+let writeFixture value = serialize value
+let writeMeasurement value = serialize value
 #else
 open System
 open System.IO
-open System.Text.Json
 let read path (_: string) = File.ReadAllText path
 let write (path: string) (text: string) = File.WriteAllText(path, text)
-let parse<'a> text = JsonSerializer.Deserialize<'a>(text: string)
-let serialize value = JsonSerializer.Serialize value
+let parseFixture = PortableJson.fixture
+let writeFixture = PortableJson.writeFixture
+let writeMeasurement = PortableJson.writeMeasurement
 let now () = float (Diagnostics.Stopwatch.GetTimestamp()) * 1000. / float Diagnostics.Stopwatch.Frequency
 let arguments () = Environment.GetCommandLineArgs()[1..]
-let runtime () = Runtime.InteropServices.RuntimeInformation.FrameworkDescription
-let target = "dotnet"
+let runtime () =
+  let info = Runtime.InteropServices.RuntimeInformation.FrameworkDescription
+  $"{info} / {Runtime.InteropServices.RuntimeInformation.RuntimeIdentifier}"
+let target = if Runtime.CompilerServices.RuntimeFeature.IsDynamicCodeSupported then "dotnet" else "dotnet-aot"
 #endif
 
 let private measure selectedTarget create path result warmup trials =
-  let fixture: Fixture = read path "utf8" |> parse
+  let fixture = read path "utf8" |> parseFixture
   let measured = grade selectedTarget (runtime()) now (create fixture.kernel) (int warmup) (int trials) fixture
-  write result (serialize measured)
-  printfn "%s %s: exact output/state/buffers; %.3f ms render, %.1fx real time"
-    selectedTarget fixture.kernel measured.medianRenderMs measured.realTimeFactor
+  write result (writeMeasurement measured)
+  let milliseconds = measured.medianRenderMs.ToString("F3", System.Globalization.CultureInfo.InvariantCulture)
+  let speed = measured.realTimeFactor.ToString("F1", System.Globalization.CultureInfo.InvariantCulture)
+  System.Console.WriteLine
+    $"{selectedTarget} {fixture.kernel}: exact output/state/buffers; {milliseconds} ms render, {speed}x real time"
 
 #if FABLE_COMPILER
 [<Import("readFileSync", "node:fs")>]
@@ -56,14 +63,20 @@ let run () =
     finish (PortableRustWasm.instantiate (readBinary wasm)) (fun exports ->
       measure "fable-rust-wasm" (PortableRustWasm.create exports) path result warmup trials)
 #endif
+#if !FABLE_COMPILER
+  | [| "--native"; library; path; result; warmup; trials |] ->
+    let create, lifetime = PortableRustNative.load library
+    use _keepAlive = lifetime
+    measure "fable-rust-native" create path result warmup trials
+#endif
   | [| "--reference"; path |] ->
-    let fixture: Fixture = read path "utf8" |> parse
+    let fixture = read path "utf8" |> parseFixture
     let expected, buffers = capture (fun () -> PortableAdapters.create fixture.kernel) fixture.steps
-    write path (serialize { fixture with expected = expected; buffers = buffers })
-    printfn "Reference: %s, %d blocks" fixture.kernel expected.Length
+    write path (writeFixture { fixture with expected = expected; buffers = buffers })
+    System.Console.WriteLine $"Reference: {fixture.kernel}, {expected.Length} blocks"
   | [| path; result; warmup; trials |] ->
     measure target (fun name () -> PortableAdapters.create name) path result warmup trials
-  | _ -> failwith "Usage: runner [--wasm module.wasm] fixture.json result.json warmup trials | runner --reference fixture.json"
+  | _ -> failwith "Usage: runner [--wasm module.wasm | --native library] fixture.json result.json warmup trials | runner --reference fixture.json"
 
 #if FABLE_COMPILER
 run()

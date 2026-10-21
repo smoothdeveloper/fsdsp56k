@@ -6,5 +6,9 @@
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
   <Import Project="Sources.props" />
-  <ItemGroup><Compile Include="Runner.fs" /></ItemGroup>
+  <ItemGroup>
+    <Compile Include="Json.fs" />
+    <Compile Include="RustNative.fs" />
+    <Compile Include="Runner.fs" />
+  </ItemGroup>
 </Project>

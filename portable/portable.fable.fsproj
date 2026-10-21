@@ -9,5 +9,6 @@
   <ItemGroup>
     <Compile Include="RustWasm.fs" />
     <Compile Include="Runner.fs" />
+    <Compile Include="BrowserHost.fs" />
   </ItemGroup>
 </Project>

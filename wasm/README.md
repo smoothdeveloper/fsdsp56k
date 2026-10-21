@@ -14,10 +14,13 @@ cd wasm
 pnpm install --frozen-lockfile
 pnpm build
 pnpm check
+sh to-webui.sh
 ```
 
-`build.fsx` exports a dsp56300 checkout (with its `source/asmjit` submodule), at the commit checked out, into
-`.bench/wasm/upstream`.
+`build.fsx` takes the DSP56300 sources from a dsp56300 checkout (with its submodule `source/asmjit`, at the commits
+checked out) and exports them into `.bench/wasm/upstream`. `out/wasm/SOURCE.txt` names the revision built, for the
+GPL-3.0 source offer. Checked with dsp56300 `7d84319`: the 14
+kernels of the samples give the native emulator's output exactly (`fixture-all 48`, then `check.mjs`).
 It applies checked build adaptations: skip native JIT allocation/trampoline creation,
 omit the native instruction-cache flush, disable native assertion backtraces, and permit
 32-bit function pointers in an unused JIT emitter. Unmapped-read diagnostics are capped
@@ -35,6 +38,15 @@ can remain read-only; an explicit `EM_CACHE` takes precedence.
 Generated runtime files go to `out/wasm`, including the upstream GPL-3.0 licence.
 Do not distribute the generated interpreter without the corresponding upstream source,
 these adaptations and its licence. No firmware is included in this project.
+
+## Stepping and register snapshots
+
+`_dsp_begin(entry)` starts a routine as `_dsp_call` does; `_dsp_step()` runs one instruction (1: returned, 0: running).
+A `do` loop runs whole in one step: the upstream interpreter executes a hardware loop inside the `do` instruction.
+`_dsp_snapshot()` takes every register (the `RegisterWrite` numbers, then PC, SR, OMR, LA, LC, SP; not SSH/SSL, whose
+read pops the stack) and `_dsp_snapshot_word(i)` reads one. In the worklet, `begin` and `step` messages answer `step`
+messages (status, pc, steps, registers, written); `activity` adds to each `level` message how many blocks changed each
+register (`writes`), a cheap feed for a display.
 
 ## Fable client
 
@@ -65,6 +77,7 @@ leaves it unimplemented. Run
 `dotnet fsi wasm/check_macri.fsx` from the repository root to compare 672 cases with
 the Rust native emulator: four source registers, both destinations, signs, negative
 operands, rounding boundaries, all accumulator words and CCR. No firmware is needed.
+dsp56300 `7d84319` passes all 672 cases.
 
 `pnpm check` verifies bounds, return handling, replacement of cached instructions and
 the instruction watchdog. Supply image/reference pairs to check output, state and scratch

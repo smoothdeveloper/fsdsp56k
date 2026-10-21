@@ -79,8 +79,26 @@ finish (createDsp (createObj [])) (fun exports ->
   equal "replace shared opcode via X" 0 (exports._dsp_write(1, 128, 0))
   equal "shared return via Y" 0 (exports._dsp_write(2, 129, 0xc))
   equal "shared opcode cache invalidation" 2 (exports._dsp_call(128, 100))
+  // stepping: CLR A, NOP, RTS one instruction at a time, the snapshot showing A1 cleared after the first
+  equal "step: fresh DSP" 0 (exports._dsp_create 256)
+  equal "step: no routine begun" -1 (exports._dsp_step())
+  equal "step: CLR A" 0 (exports._dsp_write(0, 200, 0x200013))
+  equal "step: NOP" 0 (exports._dsp_write(0, 201, 0x000000))
+  equal "step: RTS" 0 (exports._dsp_write(0, 202, 0x00000c))
+  equal "step: A1 set" 0 (exports._dsp_reg_write(29, 0x123456))
+  equal "step: begin" 0 (exports._dsp_begin 200)
+  equal "step: PC at the entry" 200 (exports._dsp_pc())
+  equal "step: snapshot size" 40 (exports._dsp_snapshot())
+  equal "step: A1 before" 0x123456 (exports._dsp_snapshot_word 29)
+  equal "step: CLR A runs" 0 (exports._dsp_step())
+  exports._dsp_snapshot() |> ignore
+  equal "step: A1 after CLR A" 0 (exports._dsp_snapshot_word 29)
+  equal "step: PC after CLR A" 201 (exports._dsp_snapshot_word 34)
+  equal "step: NOP runs" 0 (exports._dsp_step())
+  equal "step: RTS returns" 1 (exports._dsp_step())
+  equal "step: nothing left" -1 (exports._dsp_step())
   exports._dsp_destroy()
-  printfn "[1/1] Runtime bounds, RTS, code invalidation and instruction watchdog: passed"
+  printfn "[1/1] Runtime bounds, RTS, code invalidation, instruction watchdog and stepping: passed"
   let paths = arguments()
   if paths.Length % 2 <> 0 then failwith "Pass image/reference pairs"
   for index in 0 .. 2 .. paths.Length - 1 do

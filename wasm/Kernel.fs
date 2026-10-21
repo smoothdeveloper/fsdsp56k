@@ -16,6 +16,11 @@ type Exports =
   abstract _dsp_call: int * int -> int
   abstract _dsp_cycles: unit -> float
   abstract _dsp_operations: unit -> float
+  abstract _dsp_begin: int -> int
+  abstract _dsp_step: unit -> int
+  abstract _dsp_pc: unit -> int
+  abstract _dsp_snapshot: unit -> int
+  abstract _dsp_snapshot_word: int -> int
 
 [<ImportDefault("./dsp56300.mjs")>]
 let createDsp (options: obj) : JS.Promise<Exports> = jsNative
@@ -92,6 +97,32 @@ type Instance(exports: Exports, image: KernelImage) as this =
   member this.Trigger() =
     this.Registers beforeRender
     image.trig |> Option.iter (fun entry -> this.Call entry |> ignore)
+
+  /// Every register: R0..R7, N0..N7, M0..M7, X0, X1, Y0, Y1, A0, A1, A2, B0, B1, B2 (the numbers of `RegisterWrite`), then
+  /// PC, SR, OMR, LA, LC, SP.
+  member _.Snapshot() =
+    let n = exports._dsp_snapshot() |> check "snapshot"
+    Array.init n exports._dsp_snapshot_word
+
+  /// Starts `entry` for stepping (the prepared registers restored, as for a render); `Step` then runs one instruction:
+  /// 1 when the routine has returned, 0 while it runs.
+  member this.Begin entry =
+    if not (integer entry) || entry < 0 || entry >= image.words - 1 then failwith "Invalid entry point"
+    this.Registers beforeRender
+    exports._dsp_begin entry |> check "begin" |> ignore
+
+  member _.Step() = exports._dsp_step() |> check "step"
+  member _.PC = exports._dsp_pc()
+
+  /// Renders one block, counting in `counts` each register whose value the block changed.
+  member this.RenderCounting(counts: int array) =
+    this.Registers beforeRender
+    let before = this.Snapshot()
+    let output = this.Render()
+    let after = this.Snapshot()
+    for i in 0 .. min counts.Length after.Length - 1 do
+      if after[i] <> before[i] then counts[i] <- counts[i] + 1
+    output
 
   member this.Render() =
     this.Registers beforeRender
