@@ -13,6 +13,7 @@ let all =
     ImportTests.tests
     ToolTests.tests
     KernelTests.tests
+    HandTests.tests
     KernelIrTests.tests
     IrFrontEndTests.tests
     TypedTreeFrontEndTests.tests

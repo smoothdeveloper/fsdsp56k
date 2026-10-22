@@ -22,6 +22,14 @@ probe-divide	machinedrum	ok	66	8e8613223bb82818
 probe-divide-carry	machinedrum	ok	66	b393b11b7a3daafa
 probe-fir	machinedrum	ok	88	f4ffb883efde6d21
 probe-four-acc	machinedrum	ok	191	240c212d7e2017a7
+probe-hand-inline	machinedrum	ok	61	790aca58571f7206
+probe-hand-missing	machinedrum	error	-	01a689a608c186c1	badMissing: [<HandWritten "dsp56k.tests.HandTests.Routines.missing">]: no module value dsp56k.tests.HandTests.Routines.missing (its full name, as workshop.hand.shape, or a value of the helper's module)
+probe-hand-omr	machinedrum	error	-	8bb58de88f7f5b21	badOmr (hand-written, dsp56k.tests.HandTests.Routines.writesOmr) changes omr: r6, r7 and the control registers are the host's and the compiler's (output goes through (r7)+)
+probe-hand-r6	machinedrum	error	-	6900ca28a3d3dae5	badR6 (hand-written, dsp56k.tests.HandTests.Routines.writesR6) changes r6: r6, r7 and the control registers are the host's and the compiler's (output goes through (r7)+)
+probe-hand-rts	machinedrum	error	-	ecb0e6d5d539c2ce	badRts (hand-written, dsp56k.tests.HandTests.Routines.returnsEarly) returns from inside (an rts before its end): written at each call it cannot, mark the helper [<Subroutine>] too
+probe-hand-sub	machinedrum	ok	42	5661ca940607f6cf
+probe-hand-type	machinedrum	error	-	3c4857761fce9de5	badType: [<HandWritten "dsp56k.tests.HandTests.Routines.notRoutine">] names Int32, not DSL items (an Item array)
+probe-hand-wrong	machinedrum	ok	38	b2c4e92f4410af8b
 probe-helper-records	machinedrum	ok	73	3fcbc039c94bc02c
 probe-index	machinedrum	ok	27	9b7ecf3c629dd341
 probe-index-arg	machinedrum	ok	59	75ff415a74f2c2b2
