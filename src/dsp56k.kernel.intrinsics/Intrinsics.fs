@@ -47,6 +47,13 @@ type XMemoryAttribute() =
 type SubroutineAttribute() =
   inherit Attribute()
 
+/// A helper always inlined at its calls, never made a subroutine by the compiler's own choice
+/// (Optimize picks helpers called from several places in INIT and TRIG as subroutines when that
+/// saves program words): `[<Inline>] let ramp (s: S) (x: Frac) = ...`.
+[<AttributeUsage(AttributeTargets.Method, AllowMultiple = false)>]
+type InlineAttribute() =
+  inherit Attribute()
+
 /// Loops in this function (or every function of this module) are not unswitched: a condition
 /// the loop does not change is tested on each pass rather than splitting the loop into a copy
 /// for each outcome (smaller code, a test and a branch more per pass).

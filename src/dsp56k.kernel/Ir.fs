@@ -138,7 +138,7 @@ type Member =
     /// A property that can be assigned.
     CanWrite: bool
     /// Marks that apply to the member or, for NoUnswitch and Unroll, to the module that declares it: "Subroutine",
-    /// "NoUnswitch", "Unroll".
+    /// "Inline", "NoUnswitch", "Unroll".
     Marks: Set<string>
     /// A name that tells this member from any other across compilations (a subroutine's label).
     Key: string

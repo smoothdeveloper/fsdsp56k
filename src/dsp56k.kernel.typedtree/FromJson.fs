@@ -160,6 +160,7 @@ type Tree(root: J, host: Host) =
       let has (name: string) (xs: J list) = xs |> List.exists (fun a -> str (field a "t") = name)
       let marks =
         Set.ofList [ if has "dsp56k.kernel.SubroutineAttribute" attrs then "Subroutine"
+                     if has "dsp56k.kernel.InlineAttribute" attrs then "Inline"
                      if has "dsp56k.kernel.NoUnswitchAttribute" attrs || has "dsp56k.kernel.NoUnswitchAttribute" ownerAttrs then "NoUnswitch"
                      if has "dsp56k.kernel.UnrollAttribute" attrs || has "dsp56k.kernel.UnrollAttribute" ownerAttrs then "Unroll" ]
       let intrinsic =

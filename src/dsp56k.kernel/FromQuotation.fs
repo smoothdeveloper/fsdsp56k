@@ -54,10 +54,11 @@ let private members = ConcurrentDictionary<MemberInfo, Ir.Member>()
 
 let varOf (v: Var) : Ir.Var = vars.GetOrAdd(v, fun v -> Ir.Var(v.Name, tyOf v.Type, v.IsMutable, v.Type.MetadataToken))
 
-/// The marks the generator reads: [<Subroutine>] on the method, [<NoUnswitch>] and [<Unroll>] on the method or its module.
+/// The marks the generator reads: [<Subroutine>] and [<Inline>] on the method, [<NoUnswitch>] and [<Unroll>] on the method or its module.
 let private marksOf (m: MemberInfo) =
   let on (attr: Type) = not (isNull (m.GetCustomAttribute attr)) || (match m.DeclaringType with null -> false | t -> not (isNull (t.GetCustomAttribute attr)))
   Set.ofList [ if not (isNull (m.GetCustomAttribute typeof<SubroutineAttribute>)) then "Subroutine"
+               if not (isNull (m.GetCustomAttribute typeof<InlineAttribute>)) then "Inline"
                if on typeof<NoUnswitchAttribute> then "NoUnswitch"
                if on typeof<UnrollAttribute> then "Unroll" ]
 

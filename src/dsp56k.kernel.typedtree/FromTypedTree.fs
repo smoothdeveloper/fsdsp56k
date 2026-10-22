@@ -208,6 +208,7 @@ type Converter(source: Source) =
       let hasOnModule (name: string) = attributeNamed name moduleAttrs |> Option.isSome
       let marks =
         Set.ofList [ if has "dsp56k.kernel.SubroutineAttribute" then "Subroutine"
+                     if has "dsp56k.kernel.InlineAttribute" then "Inline"
                      if has "dsp56k.kernel.NoUnswitchAttribute" || hasOnModule "dsp56k.kernel.NoUnswitchAttribute" then "NoUnswitch"
                      if has "dsp56k.kernel.UnrollAttribute" || hasOnModule "dsp56k.kernel.UnrollAttribute" then "Unroll" ]
       let declaring = match m.DeclaringEntity with Some e -> irTy (e.AsType()) | None -> Ir.TyOther ""
