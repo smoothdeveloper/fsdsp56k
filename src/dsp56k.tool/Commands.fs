@@ -225,7 +225,7 @@ let loadMachine (path: string) (slot: int option) =
 
 /// How run, stress and audition pick their machine: the host, and for F# source the kernel and
 /// definition; a package's slot.
-type Choice = { host: string option; slot: int option; kernel: string option; json: string option }
+type Choice = { host: string option; slot: int option; kernel: string option; json: string option; defines: string list }
 
 /// A machine for the chosen host from a package, or from F# source (built and compiled here); and
 /// whether it came from source, so it runs on the harness with the grade's stand-ins.
@@ -234,7 +234,7 @@ let load (choice: Choice) (path: string) =
   |> Result.bind (fun host ->
     match host with
     | dsp56k.kernel.Kernel.KernelHost.Machinedrum ->
-      if Kernels.isSource path then Kernels.load host path choice.kernel choice.json |> Result.map (fun m -> m, true)
+      if Kernels.isSource path then Kernels.load host path choice.defines choice.kernel choice.json |> Result.map (fun m -> m, true)
       else loadMachine path choice.slot |> Result.map (fun m -> m, false))
 
 /// A machine on the track harness with the grade's stand-ins (the sine ROM, the input and main
@@ -250,7 +250,7 @@ let trackFor fromSource (pkg: Mds.Package) (machine: Mds.Machine) banks =
   if fromSource then harnessTrack pkg machine banks else new Track.Track(pkg, Some machine, Track.defaultLayout, banks)
 
 let run (args: ParseResults<RunArgs>) =
-  let choice = { host = args.TryGetResult RunArgs.Host; slot = args.TryGetResult RunArgs.Slot; kernel = args.TryGetResult RunArgs.Kernel; json = args.TryGetResult RunArgs.Json }
+  let choice = { host = args.TryGetResult RunArgs.Host; slot = args.TryGetResult RunArgs.Slot; kernel = args.TryGetResult RunArgs.Kernel; json = args.TryGetResult RunArgs.Json; defines = args.GetResults RunArgs.Define }
   match load choice (args.GetResult RunArgs.Input) with
   | Error e -> fail e
   | Ok((name, pkg, machine), fromSource) ->
@@ -360,7 +360,7 @@ let stress (args: ParseResults<StressArgs>) =
   | Error e -> fail e
   | Ok plan ->
     let listening = args.Contains StressArgs.Audition
-    let choice = { host = args.TryGetResult StressArgs.Host; slot = args.TryGetResult StressArgs.Slot; kernel = args.TryGetResult StressArgs.Kernel; json = args.TryGetResult StressArgs.Json }
+    let choice = { host = args.TryGetResult StressArgs.Host; slot = args.TryGetResult StressArgs.Slot; kernel = args.TryGetResult StressArgs.Kernel; json = args.TryGetResult StressArgs.Json; defines = args.GetResults StressArgs.Define }
     let rate = 44100
     let caseSeconds = args.GetResult(StressArgs.Case_Seconds, 0.75)
     let blocks = if listening then max 1 (int (caseSeconds * float rate / 32.0)) else args.GetResult(StressArgs.Blocks, 16)
@@ -442,7 +442,7 @@ let audition (args: ParseResults<AuditionArgs>) =
   | true, _ -> midiList ()
   | false, None -> fail "audition needs a machine: .mds, .syx, .fsproj, .fsx or .fs (or --midi-list)"
   | false, Some input ->
-  let choice = { host = args.TryGetResult AuditionArgs.Host; slot = args.TryGetResult AuditionArgs.Slot; kernel = args.TryGetResult AuditionArgs.Kernel; json = args.TryGetResult AuditionArgs.Json }
+  let choice = { host = args.TryGetResult AuditionArgs.Host; slot = args.TryGetResult AuditionArgs.Slot; kernel = args.TryGetResult AuditionArgs.Kernel; json = args.TryGetResult AuditionArgs.Json; defines = args.GetResults AuditionArgs.Define }
   match load choice input with
   | Error e -> fail e
   | Ok((name, pkg, machine), fromSource) ->
@@ -500,3 +500,41 @@ let audition (args: ParseResults<AuditionArgs>) =
       0
     finally
       System.Console.CancelKeyPress.RemoveHandler onCancel
+
+/// The scenario `grade` plays: two bars at the defaults, four trigs a bar, then each control swept
+/// from its default and the pairwise combinations (the grade's own sweeps).
+let gradeScenario (machine: Mds.Machine) =
+  let cs = Stress.controls machine
+  let defaults = cs |> Array.map _.standard
+  let pattern : dsp56k.kernel.Grade.Pattern =
+    { name = "the defaults, four trigs a bar"; bpm = 120.0; names = cs |> Array.map _.name
+      bars = [ for _ in 1 .. 2 -> { values = dsp56k.kernel.Grade.Settings defaults; trigs = [ 0, []; 4, []; 8, []; 12, [] ] } ] }
+  dsp56k.kernel.Grade.play dsp56k.kernel.Kernel.mds.frames (dsp56k.kernel.Grade.exhaustive cs dsp56k.kernel.Grade.Settings pattern)
+
+/// `grade`: an F# kernel compiled and run on the emulator against the same F# run as .NET code, word
+/// for word, with its costs; then each hand-written helper in the kernel (the RENDER cycles with its
+/// F# compiled instead) and on its own (its routine against its F#, call by call). Exit code 1 when
+/// anything differs.
+let grade (args: ParseResults<GradeArgs>) =
+  let source = args.GetResult GradeArgs.Input
+  match Kernels.kernelAndMachine source (args.GetResults GradeArgs.Define) (args.TryGetResult GradeArgs.Kernel) (args.TryGetResult GradeArgs.Json) with
+  | Error e -> fail e
+  | Ok(k, machine) ->
+    let scenario = gradeScenario machine
+    let harness = dsp56k.kernel.Grade.mdsHarness machine
+    let graded handOff = dsp56k.kernel.Grade.gradeAtWith handOff dsp56k.kernel.Optimize.Peephole harness k None scenario
+    match graded Set.empty with
+    | Error e -> fail e
+    | Ok report ->
+      printfn "%s" (dsp56k.kernel.Grade.text report)
+      args.TryGetResult GradeArgs.Listing |> Option.iter (fun path -> File.WriteAllText(path, dsp56k.dsl.Program.source report.compiled.items))
+      match dsp56k.kernel.HandCheck.inKernel graded report k with
+      | Error e -> fail e
+      | Ok inside ->
+        let alone = dsp56k.kernel.HandCheck.alone harness.target (args.GetResult(GradeArgs.Calls, 1024)) (args.GetResult(GradeArgs.Seed, 1)) k
+        if not (inside.IsEmpty && alone.IsEmpty) then printfn "\n%s" (dsp56k.kernel.HandCheck.text inside alone)
+        let same =
+          report.correctness.IsEmpty
+          && inside |> List.forall _.correct
+          && alone |> List.forall (fun a -> a.skipped.IsSome || (a.hand = a.arguments && a.compiled |> Option.forall ((=) a.arguments)))
+        if same then 0 else 1

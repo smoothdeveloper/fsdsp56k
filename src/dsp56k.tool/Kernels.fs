@@ -1,4 +1,4 @@
-/// Kernels from F# source for run, stress and audition: a project (.fsproj), a script (.fsx) or one
+/// Kernels from F# source for run, stress, audition and grade: a project (.fsproj), a script (.fsx) or one
 /// file (.fs) is built, its assembly loaded, and its kernels (module values of type Kernel.Kernel)
 /// found by reflection; the quotation front end then compiles the chosen one for its host.
 ///
@@ -46,10 +46,12 @@ let private references () =
       let n = string (Path.GetFileName f)
       if n.StartsWith "Dsp56k." || n.StartsWith "Machinedrum." || n = "FSharp.Core.dll" then yield f ]
 
-/// A project around one source file, in a scratch folder per file, referencing the toolchain.
-let private wrap (source: string) =
+/// A project around one source file, in a scratch folder per file and its `defines` (conditional
+/// compilation symbols, as `#if HAND_SHAPE` reads them), referencing the toolchain.
+let private wrap (source: string) (defines: string list) =
   let full = Path.GetFullPath source
-  let dir = Path.Combine(Path.GetTempPath(), "fsdsp56k-temp-builds", (GradeCache.shaText full).Substring(0, 16))
+  let symbols = String.concat ";" defines
+  let dir = Path.Combine(Path.GetTempPath(), "fsdsp56k-temp-builds", (GradeCache.shaText (full + "|" + symbols)).Substring(0, 16))
   Directory.CreateDirectory dir |> ignore
   let text = File.ReadAllText full
   let compiled =
@@ -73,6 +75,7 @@ let private wrap (source: string) =
         "    <DisableImplicitFSharpCoreReference>true</DisableImplicitFSharpCoreReference>"
         "    <AssemblyName>fsdsp56k.tempbuild</AssemblyName>"
         "    <NoWarn>FS0988;FS3370</NoWarn>"
+        if symbols <> "" then $"    <DefineConstants>$(DefineConstants);{symbols}</DefineConstants>"
         "  </PropertyGroup>"
         "  <ItemGroup>"
         $"""    <Compile Include="{compiled}" />"""
@@ -85,13 +88,16 @@ let private wrap (source: string) =
   if not (File.Exists path) || File.ReadAllText path <> project then File.WriteAllText(path, project)
   path
 
-/// Build the project (or the one wrapped around a file) and return the assembly it makes.
-let build (source: string) =
-  let project = if source.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) then Path.GetFullPath source else wrap source
-  let dir = string (Path.GetDirectoryName project)
-  dotnet dir [ "build"; project; "-c"; "Debug"; "-nologo"; "-v:q" ]
-  |> Result.bind (fun _ -> dotnet dir [ "msbuild"; project; "-getProperty:TargetPath"; "-nologo" ])
-  |> Result.map (fun out -> out.Trim())
+/// Build the project (or the one wrapped around a file, with `defines`) and return the assembly it makes.
+let build (source: string) (defines: string list) =
+  let isProject = source.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase)
+  if isProject && not defines.IsEmpty then Error "--define is for a .fs or .fsx kernel: a project sets its own DefineConstants"
+  else
+    let project = if isProject then Path.GetFullPath source else wrap source defines
+    let dir = string (Path.GetDirectoryName project)
+    dotnet dir [ "build"; project; "-c"; "Debug"; "-nologo"; "-v:q" ]
+    |> Result.bind (fun _ -> dotnet dir [ "msbuild"; project; "-getProperty:TargetPath"; "-nologo" ])
+    |> Result.map (fun out -> out.Trim())
 
 /// The kernels an assembly defines: its static properties of type Kernel.Kernel.
 let kernelsIn (assembly: Assembly) =
@@ -128,20 +134,23 @@ let machineFor (k: Kernel.Kernel) =
              { Mds.param (n.Substring(0, min 4 n.Length)) Mds.UnipolarQ23 with defaultValue = 64 } |]
       maxTrackCycles = Abi.trackCycleLimit }
 
-/// The kernel in `source` compiled for `host`, as a package and its machine.
-let load (host: Kernel.KernelHost) (source: string) (name: string option) (json: string option) =
-  build source
+/// The kernel in `source` (built with `defines`), and its machine: the definition in `json`, or
+/// one made from its parameter fields.
+let kernelAndMachine (source: string) (defines: string list) (name: string option) (json: string option) =
+  build source defines
   |> Result.bind (fun path ->
     let assembly = Assembly.LoadFrom path
     choose name (kernelsIn assembly))
   |> Result.bind (fun k ->
-    let machine =
-      match json with
-      | Some j -> Mds.fromJson (File.ReadAllText j) |> Result.mapError (sprintf "%A")
-      | None -> Ok(machineFor k)
-    machine
-    |> Result.bind (fun m ->
-      Optimize.compile Optimize.Peephole host.target k
-      |> Result.mapError (sprintf "%A")
-      |> Result.bind (Grade.build m))
+    match json with
+    | Some j -> Mds.fromJson (File.ReadAllText j) |> Result.mapError (sprintf "%A") |> Result.map (fun m -> k, m)
+    | None -> Ok(k, machineFor k))
+
+/// The kernel in `source` compiled for `host`, as a package and its machine.
+let load (host: Kernel.KernelHost) (source: string) (defines: string list) (name: string option) (json: string option) =
+  kernelAndMachine source defines name json
+  |> Result.bind (fun (k, m) ->
+    Optimize.compile Optimize.Peephole host.target k
+    |> Result.mapError (sprintf "%A")
+    |> Result.bind (Grade.build m)
     |> Result.map (fun built -> k.name, built.package, built.machine))

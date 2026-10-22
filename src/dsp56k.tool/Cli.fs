@@ -118,6 +118,7 @@ type RunArgs =
   | Host of name: string
   | Kernel of name: string
   | Json of path: string
+  | Define of symbol: string
   | Settings of values: string
   | Blocks of int
   | Trig_Every of blocks: int
@@ -132,6 +133,7 @@ type RunArgs =
       | Host _ -> "the host the machine runs under (default machinedrum; also md)."
       | Kernel _ -> "the kernel to take from F# source defining several (by its Kernel.define name)."
       | Json _ -> "with F# source: the machine definition (the mds_pack.py JSON) instead of one made from the parameter fields."
+      | Define _ -> "with an F# kernel (.fs, .fsx): a conditional compilation symbol, as HAND_SHAPE for `#if HAND_SHAPE` (repeatable)."
       | Settings _ -> "front-panel settings, comma separated (default: the parameters' defaults)."
       | Blocks _ -> "32-sample blocks to render (default 1378, about one second)."
       | Trig_Every _ -> "retrigger every N blocks (default: once, at the start)."
@@ -145,6 +147,7 @@ type StressArgs =
   | Host of name: string
   | Kernel of name: string
   | Json of path: string
+  | Define of symbol: string
   | Sweep of how: string
   | Search of how: string
   | Phase of phase: string
@@ -165,6 +168,7 @@ type StressArgs =
       | Host _ -> "the host the machine runs under (default machinedrum; also md)."
       | Kernel _ -> "the kernel to take from F# source defining several (by its Kernel.define name)."
       | Json _ -> "with F# source: the machine definition (the mds_pack.py JSON) instead of one made from the parameter fields."
+      | Define _ -> "with an F# kernel (.fs, .fsx): a conditional compilation symbol, as HAND_SHAPE for `#if HAND_SHAPE` (repeatable)."
       | Audition -> "listen while it sweeps: each case played through the default output, its cycles printed, new worst cases flagged."
       | Case_Seconds _ -> "with --audition: seconds per case (default 0.75)."
       | Max_Cases _ -> "at most this many cases per machine, evenly spread (default: all; 40 with --audition)."
@@ -184,6 +188,7 @@ type AuditionArgs =
   | Host of name: string
   | Kernel of name: string
   | Json of path: string
+  | Define of symbol: string
   | Settings of values: string
   | Trig_Every of blocks: int
   | Seconds of float
@@ -201,6 +206,7 @@ type AuditionArgs =
       | Host _ -> "the host the machine runs under (default machinedrum; also md)."
       | Kernel _ -> "the kernel to take from F# source defining several (by its Kernel.define name)."
       | Json _ -> "with F# source: the machine definition (the mds_pack.py JSON) instead of one made from the parameter fields."
+      | Define _ -> "with an F# kernel (.fs, .fsx): a conditional compilation symbol, as HAND_SHAPE for `#if HAND_SHAPE` (repeatable)."
       | Settings _ -> "front-panel settings, comma separated (default: the parameters' defaults)."
       | Trig_Every _ -> "retrigger every N blocks (default: once, at the start)."
       | Seconds _ -> "how long to play (default 4, or until Ctrl+C with --midi-in)."
@@ -210,6 +216,25 @@ type AuditionArgs =
       | Midi_List -> "list the MIDI inputs and outputs and stop."
       | Track _ -> "the Machinedrum track (1..16) whose MIDI note and CCs the machine answers (default 1)."
       | Base_Channel _ -> "the Machinedrum's MIDI base channel (1..13, default 1)."
+
+type GradeArgs =
+  | [<MainCommand; ExactlyOnce>] Input of path: string
+  | Kernel of name: string
+  | Json of path: string
+  | Define of symbol: string
+  | Calls of int
+  | Seed of int
+  | Listing of path: string
+  interface IArgParserTemplate with
+    member a.Usage =
+      match a with
+      | Input _ -> "an F# kernel: .fsproj, .fsx or .fs."
+      | Kernel _ -> "the kernel to take from F# source defining several (by its Kernel.define name)."
+      | Json _ -> "the machine definition (the mds_pack.py JSON) instead of one made from the parameter fields."
+      | Define _ -> "with a .fs or .fsx: a conditional compilation symbol, as HAND_SHAPE for `#if HAND_SHAPE` (repeatable)."
+      | Calls _ -> "argument sets each hand-written helper is called with on its own (default 1024)."
+      | Seed _ -> "seed of those arguments (default 1)."
+      | Listing _ -> "write the graded program as Motorola-syntax source, for asm, check and machinedrum pack."
 
 type Command =
   | [<CliPrefix(CliPrefix.None)>] Asm of ParseResults<AsmArgs>
@@ -221,6 +246,7 @@ type Command =
   | [<CliPrefix(CliPrefix.None)>] Run of ParseResults<RunArgs>
   | [<CliPrefix(CliPrefix.None)>] Stress of ParseResults<StressArgs>
   | [<CliPrefix(CliPrefix.None)>] Audition of ParseResults<AuditionArgs>
+  | [<CliPrefix(CliPrefix.None)>] Grade of ParseResults<GradeArgs>
   interface IArgParserTemplate with
     member a.Usage =
       match a with
@@ -233,3 +259,4 @@ type Command =
       | Run _ -> "run a machine on the emulator: output WAV and cycle report."
       | Stress _ -> "worst-case INIT, TRIG and RENDER cycles over many settings, as a table."
       | Audition _ -> "play a machine on the emulator live through the default audio output."
+      | Grade _ -> "an F# kernel on the emulator against the same F# run as .NET code, word for word, with its cycles; each hand-written helper too."

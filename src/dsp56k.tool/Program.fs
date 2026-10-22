@@ -20,6 +20,7 @@ let main argv =
     | Run a -> Commands.run a
     | Stress a -> Commands.stress a
     | Audition a -> Commands.audition a
+    | Grade a -> Commands.grade a
   with
   | :? ArguParseException as e ->
     eprintfn "%s" e.Message
