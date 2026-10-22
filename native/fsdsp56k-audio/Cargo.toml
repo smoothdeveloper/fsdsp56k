@@ -1,0 +1,19 @@
+[package]
+name = "fsdsp56k-audio"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+publish = false
+description = "C ABI over cpal: the default output device fed 32-sample blocks through a lock-free ring, for the F# tooling's audition"
+
+[lib]
+crate-type = ["cdylib"]
+
+# its own workspace: the emulator crate beside it keeps its pinned lock file
+[workspace]
+
+[dependencies]
+cpal = "=0.18.2"
+
+[profile.release]
+opt-level = 3

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Dsp56k.Audio</AssemblyName>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Output.fs" />
+  </ItemGroup>
+
+  <!-- the output built in native/fsdsp56k-audio (native/build.fsx), for the packages' users: runtimes/<rid>/native -->
+  <PropertyGroup>
+    <AudioLibraryFile Condition="$([MSBuild]::IsOSPlatform('OSX'))">libfsdsp56k_audio.dylib</AudioLibraryFile>
+    <AudioLibraryFile Condition="$([MSBuild]::IsOSPlatform('Linux'))">libfsdsp56k_audio.so</AudioLibraryFile>
+    <AudioLibraryFile Condition="$([MSBuild]::IsOSPlatform('Windows'))">fsdsp56k_audio.dll</AudioLibraryFile>
+    <AudioLibraryPath>$(MSBuildThisFileDirectory)../../native/target/release/$(AudioLibraryFile)</AudioLibraryPath>
+  </PropertyGroup>
+  <ItemGroup Condition="Exists('$(AudioLibraryPath)')">
+    <None Include="$(AudioLibraryPath)" Pack="true" PackagePath="runtimes/$(NETCoreSdkRuntimeIdentifier)/native/" Visible="false" />
+  </ItemGroup>
+  <Import Project="..\..\.paket\Paket.Restore.targets" />
+</Project>

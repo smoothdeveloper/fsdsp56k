@@ -2,6 +2,7 @@
   <Project Path="src/dsp56k/dsp56k.fsproj" />
   <Project Path="src/machinedrum/machinedrum.fsproj" />
   <Project Path="src/dsp56k.native/dsp56k.native.fsproj" />
+  <Project Path="src/dsp56k.audio/dsp56k.audio.fsproj" />
   <Project Path="tests/dsp56k.tests/dsp56k.tests.fsproj" />
   <Project Path="src/dsp56k.dsl/dsp56k.dsl.fsproj" />
   <Project Path="src/machinedrum.run/machinedrum.run.fsproj" />

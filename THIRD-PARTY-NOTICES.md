@@ -64,4 +64,5 @@ SOFTWARE.
 | What | Where | Licence | Use |
 |---|---|---|---|
 | mborgerson/dsp56300 | https://github.com/mborgerson/dsp56300 (rev 2f99039, through native/Cargo.toml) | MIT | The native emulator, assembler and disassembler the tests use as an oracle. |
+| cpal | https://github.com/RustAudio/cpal (0.18.2, through native/fsdsp56k-audio/Cargo.toml) | Apache-2.0 | The audio output `audition` plays through. |
 | dsp56300 interpreter (The Usual Suspects) | https://github.com/dsp56300/dsp56300 (the revision checked out, wasm/build.fsx) | GPL-3.0 | Built to WebAssembly for the explorer's Play; not in this repository. A published build must ship with its licence (copied as LICENSE.dsp56300.md), the corresponding source and wasm/build.fsx's adaptations. |
