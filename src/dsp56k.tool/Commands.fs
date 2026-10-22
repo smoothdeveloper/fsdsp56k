@@ -524,6 +524,10 @@ let grade (args: ParseResults<GradeArgs>) =
     let harness = dsp56k.kernel.Grade.mdsHarness machine
     let graded handOff = dsp56k.kernel.Grade.gradeAtWith handOff dsp56k.kernel.Optimize.Peephole harness k None scenario
     match graded Set.empty with
+    | Error e when e.Contains " threw " && not (args.Contains GradeArgs.Json) ->
+      // the machine made from the fields gives each a unipolar word; a kernel reading raw settings
+      // (128 x the front-panel value, as the TX6 ports do) indexes its tables past their ends
+      fail $"{e}\nthe machine here is one made from the parameter fields, each a unipolar control (a Q23 word up to 7fffff); a kernel that reads its parameters as other words needs its machine definition: --json"
     | Error e -> fail e
     | Ok report ->
       printfn "%s" (dsp56k.kernel.Grade.text report)

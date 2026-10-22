@@ -274,17 +274,30 @@ let runNet (h: Harness) (k: Kernel.Kernel) (scenario: Scenario) =
   Track.current <- 0                    // the harness plays track 0
   let host = Host.Instance(target, k)
   let outputs, states = ResizeArray(), ResizeArray()
+  let parameters = ref [||]
+  // an exception from the kernel's F# (a table read past its end, say) is the grade's error, with
+  // where it happened and the parameter words it was given
+  let guarded (entry: string) (f: unit -> 'a) =
+    try f ()
+    with
+    | Kernel.KernelError _ -> reraise ()
+    | e ->
+      let words = parameters.Value |> Array.map (sprintf "%06x") |> String.concat " "
+      raise (Kernel.KernelError $"{k.name}: {entry} threw {e.GetType().Name} ({e.Message}) after {outputs.Count} blocks, the parameter words {words}")
+  let set (words: int array) =
+    parameters.Value <- words
+    host.SetParameters words
   for step in scenario.steps do
     match step with
-    | Settings s -> host.SetParameters(h.settings s)
-    | Words w -> host.SetParameters w
+    | Settings s -> set (h.settings s)
+    | Words w -> set w
     | Mark _ -> ()
-    | Init -> host.Init()
-    | Trig -> host.Trig()
+    | Init -> guarded "INIT" host.Init
+    | Trig -> guarded "TRIG" host.Trig
     | Render n ->
       for _ in 1 .. n do
         beforeRender outputs.Count
-        let words = host.Render()
+        let words = guarded "RENDER" host.Render
         if words.Length <> target.blockWords then
           raise (Kernel.KernelError $"{k.name}: RENDER wrote {words.Length} words, the block is {target.blockText}")
         outputs.Add words

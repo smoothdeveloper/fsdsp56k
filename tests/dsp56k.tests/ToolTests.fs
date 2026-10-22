@@ -242,4 +242,45 @@ let tests =
       Expect.equal code 0 text
       Expect.stringContains text "sine: 3 cases" "the script's kernel, stressed"
     }
+
+    test "grade prints its report as text; a kernel throwing under the machine made from its fields is an error, not a crash" {
+      let dir = scratch ()
+      let source = dir </> "Raw.fs"
+      // TRIG reads a table at the front-panel value: the raw setting (128 x the value) >> 7
+      File.WriteAllLines(source, [|
+        "namespace probe"
+        ""
+        "open dsp56k.kernel"
+        ""
+        "module RawTables ="
+        "  let levels = Table.program \"levels\" [| for v in 0 .. 127 -> v <<< 16 |]"
+        ""
+        "[<ReflectedDefinition>]"
+        "module Raw ="
+        "  open RawTables"
+        ""
+        "  type Params = { level : Frac }"
+        "  type State  = { mutable gain : Frac }"
+        ""
+        "  let init (_: Params) (s: State) = s.gain <- Frac.zero"
+        "  let trig (p: Params) (s: State) = s.gain <- Table.read levels (Acc.hi (Acc.ofFrac p.level >>> 7))"
+        "  let render (_: Params) (s: State) (out: Output) ="
+        "    for _ in 0 .. 31 do"
+        "      out.Write s.gain"
+        ""
+        "  let kernel = Kernel.define \"raw-level\" <@ init @> <@ trig @> <@ render @>" |])
+      let code, text = tool [| "grade"; source |]
+      Expect.equal code 1 text
+      Expect.isFalse (text.Contains "Unhandled exception") text
+      Expect.stringContains text "raw-level: TRIG threw IndexOutOfRangeException" "where the kernel threw"
+      Expect.stringContains text "the parameter words 400000" "with the words it was given"
+      Expect.stringContains text "needs its machine definition: --json" "and what to pass"
+      let json = dir </> "raw.json"
+      File.WriteAllText(json, """{ "id": "org.fsdsp56k.raw", "short_label": "RAW", "max_track_cycles": 3951,
+  "params": [ { "name": "LEVL", "default": 64, "transform": "raw14" } ], "program": {} }""")
+      let code, text = tool [| "grade"; source; "--json"; json |]
+      Expect.equal code 0 text
+      Expect.stringContains text "kernel raw-level, scenario the defaults" "the report, as text"
+      Expect.stringContains text "correctness: the compiled program matches the .NET kernel, output and state" "graded"
+    }
   ]
