@@ -56,6 +56,14 @@ type Bank =
     step  : int
     origin: int }
 
+/// The layout with the track memory (import 6) clear of a program of `words`: X aliases P over the program, and
+/// the track memory is X and Y the same storage, so where it starts inside the program (the grade's map puts it at
+/// programBase) it moves to the first 1K boundary above it.
+let clearOfProgram (layout: Layout) (words: int) =
+  let top = layout.programBase + words
+  if layout.trackMemory >= layout.programBase && layout.trackMemory < top then { layout with trackMemory = (top + 0x3ff) &&& ~~~0x3ff }
+  else layout
+
 /// A setting (0..127, fractions for modulation) as the firmware converts it for the DSP.
 let convert (p: Mds.Param) (setting: float) =
   match p.transform with
@@ -105,6 +113,8 @@ type Track(package: Mds.Package, machine: Mds.Machine option, layout: Layout, ba
         | _ -> 0
       words[w] <- (words[w] + resourceBase) &&& 0xffffff
     emu.Load(Space.P, layout.programBase, words)
+    // X aliases P over the program (see defaultLayout): its tables, read with x: moves
+    emu.Load(Space.X, layout.programBase, words)
     let org, serviceWords = Assembler.image dsp56k.Space.P services
     emu.Load(Space.P, org, serviceWords)
     for KeyValue(bank, b) in banks do

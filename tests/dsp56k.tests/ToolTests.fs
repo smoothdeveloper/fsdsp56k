@@ -103,7 +103,7 @@ let tests =
       // cycles peaking at A=37, B=90: what a machine with a costly middle setting looks like
       let evaluate (s: float array) : dsp56k.tool.Stress.Case =
         let c = 20000L - int64 ((s[0] - 37.0) ** 2.0 + (s[1] - 90.0) ** 2.0)
-        { settings = s; init = 0L; trig = 0L; render = c; trigBlock = c }
+        { settings = s; init = 0L; trig = 0L; render = c; trigBlock = c; peak = 0.0; rms = 0.0; returned = true }
       let found = dsp56k.tool.Stress.anneal cs evaluate (dsp56k.tool.Stress.OnePhase dsp56k.tool.Stress.Render) 400 1
       Expect.equal found.best.settings [| 37.0; 90.0 |] "the peak"
       Expect.isLessThanOrEqual found.evaluations 400 "within the budget"

@@ -177,7 +177,7 @@ type StressArgs =
       | Wav _ -> "with --audition: write the whole session, as heard, to this 24-bit WAV."
       | Sweep _ -> "exhaustive (each control over its range, then pairwise; default) or random:N."
       | Search _ -> "anneal:N: search for the worst case within N measurements, instead of a sweep."
-      | Phase _ -> "what --search maximises: init, trig, render, trig+render or worst (default)."
+      | Phase _ -> "what --search maximises: init, trig, render, trig+render or worst (default) cycles; or the output, peak or rms."
       | Seed _ -> "seed of random:N and anneal:N (default 1)."
       | Blocks _ -> "RENDER blocks per case (default 16)."
       | Sample _ -> "WAV loaded as the internal and userwave sample banks."

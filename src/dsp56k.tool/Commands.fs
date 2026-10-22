@@ -240,7 +240,7 @@ let load (choice: Choice) (path: string) =
 /// A machine on the track harness with the grade's stand-ins (the sine ROM, the input and main
 /// rings) loaded, so machines that read them make their sound.
 let harnessTrack (pkg: Mds.Package) (machine: Mds.Machine) banks =
-  let track = new Track.Track(pkg, Some machine, dsp56k.kernel.Grade.layout, banks)
+  let track = new Track.Track(pkg, Some machine, Track.clearOfProgram dsp56k.kernel.Grade.layout pkg.programWords.Length, banks)
   dsp56k.kernel.Grade.loadResources track.Emulator
   track
 
@@ -311,11 +311,13 @@ let parseSweep (how: string) (seed: int) =
 let parsePhase (name: string) =
   match name.ToLowerInvariant() with
   | "worst"       -> Ok Stress.AnyPhase
+  | "peak"        -> Ok Stress.Peak
+  | "rms"         -> Ok Stress.Rms
   | "init"        -> Ok(Stress.OnePhase Stress.Init)
   | "trig"        -> Ok(Stress.OnePhase Stress.Trig)
   | "render"      -> Ok(Stress.OnePhase Stress.Render)
   | "trig+render" -> Ok(Stress.OnePhase Stress.TrigBlock)
-  | other         -> Error $"unknown phase '{other}': init, trig, render, trig+render or worst"
+  | other         -> Error $"unknown phase '{other}': init, trig, render, trig+render, worst, peak or rms"
 
 let parseSearch (how: string) =
   match how.Split ':' with
@@ -341,7 +343,9 @@ let stressMachine name (pkg: Mds.Package) (machine: Mds.Machine) (evaluate: floa
     | Error(budget, seed, objective) ->
       let found = Stress.anneal cs evaluate objective budget seed
       printfn "%s: anneal:%d, seed %d, maximising %s: %d measurements (the exhaustive sweep: %d; every setting: %A); %d RENDER blocks each" name budget seed (Stress.objectiveName objective) found.evaluations (Stress.exhaustiveSettings cs).Length (Stress.gridSize cs) blocks
-      printfn "worst found: %d cycles at %s" (Stress.score objective found.best) (Stress.settingsText cs found.best.settings)
+      match objective with
+      | Stress.Peak | Stress.Rms -> printfn "loudest found: peak %.4f, RMS %.4f at %s" found.best.peak found.best.rms (Stress.settingsText cs found.best.settings)
+      | _ -> printfn "worst found: %d cycles at %s" (Stress.score objective found.best) (Stress.settingsText cs found.best.settings)
       found.cases
   let lines, within = Stress.report cs pkg.maxCycles cases
   for l in lines do printfn "%s" l
@@ -414,11 +418,11 @@ let stress (args: ParseResults<StressArgs>) =
                 yield name, cs, cases, pkg.maxCycles, within ]
       if summaries.Length > 1 then
         printfn "\nsummary (limit %d; T+R judged against the declared figure and the limit)" Abi.trackCycleLimit
-        printfn "%-18s %5s %5s %5s %6s %6s %8s  %s" "machine" "cases" "INIT" "TRIG" "RENDER" "T+R" "declared" "settings at the worst T+R"
+        printfn "%-18s %5s %5s %5s %6s %6s %8s %7s  %s" "machine" "cases" "INIT" "TRIG" "RENDER" "T+R" "declared" "peak" "settings at the worst T+R"
         for name, cs, cases, declared, within in summaries do
           let worst phase = cases |> List.map (Stress.cycles phase) |> List.max
           let at = cases |> List.maxBy (Stress.cycles Stress.TrigBlock)
-          printfn "%-18s %5d %5d %5d %6d %6d %8d  %s%s" name cases.Length (worst Stress.Init) (worst Stress.Trig) (worst Stress.Render) (worst Stress.TrigBlock) declared (Stress.settingsText cs at.settings) (if within then "" else "  OVER")
+          printfn "%-18s %5d %5d %5d %6d %6d %8d %7.4f  %s%s" name cases.Length (worst Stress.Init) (worst Stress.Trig) (worst Stress.Render) (worst Stress.TrigBlock) declared (cases |> List.map _.peak |> List.max) (Stress.settingsText cs at.settings) (if within then "" else "  OVER")
       match args.TryGetResult StressArgs.Wav with
       | Some path when session.Count > 0 ->
         Wav.write path rate (session.ToArray() |> Array.map (fun x -> int (Math.Round(max -1.0 (min 1.0 x) * 8388607.0)) &&& 0xffffff))

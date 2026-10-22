@@ -53,7 +53,10 @@ type Case =
     init      : int64
     trig      : int64
     render    : int64      // the worst RENDER block
-    trigBlock : int64 }    // TRIG and the RENDER after it: the block a trig lands in
+    trigBlock : int64      // TRIG and the RENDER after it: the block a trig lands in
+    peak      : float      // the output's largest magnitude over the case, full scale 1
+    rms       : float      // its RMS over the case
+    returned  : bool }     // false: a call did not reach its RTS within the emulator's limit
 
 /// A case: the settings, INIT, TRIG, then `blocks` RENDER blocks, retriggered every `trigEvery`
 /// blocks if given, each block's words to `sink`.
@@ -61,23 +64,39 @@ type Case =
 // INIT does not reset (a delay line filled over seconds) needs longer runs or --trig-every.
 let measureWith (track: Track.Track) (blocks: int) (trigEvery: int option) (sink: int array -> unit) (settings: float array) =
   track.SetSettings settings
-  let init = track.Init 0
+  let mutable returned = true
+  // a call that never returns ends the case, which keeps what it measured: a sweep goes on
+  let call f = if not returned then 0L else (try f () with e when e.Message = "the routine did not return" -> returned <- false; 0L)
+  let init = call (fun () -> track.Init 0)
   let mutable trig = 0L
   let mutable render = 0L
   let mutable trigBlock = 0L
+  let mutable peak = 0.0
+  let mutable energy = 0.0
+  let mutable samples = 0
   for b in 0 .. max 1 blocks - 1 do
-    let triggered = b = 0 || (trigEvery |> Option.exists (fun n -> n > 0 && b % n = 0))
-    let t = if triggered then track.Trig 0 else 0L
-    let words, r = track.Render 0
-    sink words
-    trig <- max trig t
-    render <- max render r
-    if triggered then trigBlock <- max trigBlock (t + r)
+    if returned then
+      let triggered = b = 0 || (trigEvery |> Option.exists (fun n -> n > 0 && b % n = 0))
+      let t = if triggered then call (fun () -> track.Trig 0) else 0L
+      let mutable words = Array.empty
+      let r = call (fun () -> let w, c = track.Render 0 in words <- w; c)
+      sink words
+      for w in words do
+        let x = Track.toFloat w
+        peak <- max peak (abs x)
+        energy <- energy + x * x
+      samples <- samples + words.Length
+      trig <- max trig t
+      render <- max render r
+      if triggered then trigBlock <- max trigBlock (t + r)
   { settings  = settings
     init      = init
     trig      = trig
     render    = render
-    trigBlock = trigBlock }
+    trigBlock = trigBlock
+    peak      = peak
+    rms       = if samples = 0 then 0.0 else sqrt (energy / float samples)
+    returned  = returned }
 
 /// A case as `stress` measures it without listening: one TRIG, `blocks` RENDER blocks.
 let measure (track: Track.Track) (blocks: int) (settings: float array) = measureWith track blocks None ignore settings
@@ -131,7 +150,12 @@ let report (cs: Grade.Control array) (declared: int) (cases: Case list) =
         let w = worst phase
         let d, l = if judged phase then string declared, string Abi.trackCycleLimit else "-", "-"
         let flag = if judged phase && (cycles phase w > int64 declared || cycles phase w > int64 Abi.trackCycleLimit) then " OVER" else ""
-        $"{phaseName phase,-12} {cycles phase w,7} {mean phase,7:F0} {d,8} {l,6}  {settingsText cs w.settings}{flag}" ]
+        $"{phaseName phase,-12} {cycles phase w,7} {mean phase,7:F0} {d,8} {l,6}  {settingsText cs w.settings}{flag}"
+      let loud = cases |> List.maxBy _.peak
+      let dbfs x = if x <= 0.0 then "silent" else $"{20.0 * log10 x:F1} dBFS"
+      $"""{"output",-12} peak {loud.peak:F4} ({dbfs loud.peak}), RMS {loud.rms:F4} ({dbfs loud.rms}); {cases |> List.filter (fun c -> c.peak > 0.0) |> List.length} of {List.length cases} cases sound; loudest at {settingsText cs loud.settings}"""
+      let hung = cases |> List.filter (fun c -> not c.returned)
+      if not hung.IsEmpty then $"""{"no return",-12} {hung.Length} of {List.length cases} cases: a call did not return, first at {settingsText cs hung.Head.settings}""" ]
   let within =
     let w = cycles TrigBlock (worst TrigBlock)
     w <= int64 declared && w <= int64 Abi.trackCycleLimit
@@ -146,16 +170,22 @@ let report (cs: Grade.Control array) (declared: int) (cases: Case list) =
 type Objective =
   | OnePhase of Phase
   | AnyPhase
+  | Peak      // the loudest output peak: settings that make a machine sound
+  | Rms       // the loudest output RMS
 
 let objectiveName objective =
   match objective with
   | OnePhase phase -> phaseName phase
   | AnyPhase       -> "the worst phase"
+  | Peak           -> "the output peak"
+  | Rms            -> "the output RMS"
 
 let score objective (c: Case) =
   match objective with
   | OnePhase phase -> cycles phase c
   | AnyPhase       -> phases |> List.map (fun phase -> cycles phase c) |> List.max
+  | Peak           -> int64 (System.Math.Round(c.peak * 8388608.0))
+  | Rms            -> int64 (System.Math.Round(c.rms * 8388608.0))
 
 /// Where the search starts: the defaults, the range edges (every control low, high, mid), each
 /// control alone at its edges, and `random` random settings.
