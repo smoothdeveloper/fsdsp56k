@@ -155,12 +155,16 @@ type StressArgs =
       | Sample _ -> "WAV loaded as the internal and userwave sample banks."
 
 type AuditionArgs =
-  | [<MainCommand; ExactlyOnce>] Input of path: string
+  | [<MainCommand>] Input of path: string
   | Slot of int
   | Settings of values: string
   | Trig_Every of blocks: int
   | Seconds of float
   | Sample of wav: string
+  | Midi_In of port: string
+  | Midi_List
+  | Track of int
+  | Base_Channel of int
   interface IArgParserTemplate with
     member a.Usage =
       match a with
@@ -168,8 +172,12 @@ type AuditionArgs =
       | Slot _ -> "slot (1..16) to take from a .syx holding several machines."
       | Settings _ -> "front-panel settings, comma separated (default: the parameters' defaults)."
       | Trig_Every _ -> "retrigger every N blocks (default: once, at the start)."
-      | Seconds _ -> "how long to play (default 4; Ctrl+C stops sooner)."
+      | Seconds _ -> "how long to play (default 4, or until Ctrl+C with --midi-in)."
       | Sample _ -> "WAV loaded as the internal and userwave sample banks."
+      | Midi_In _ -> "play from a MIDI input (an index, part of its name, or virtual:NAME): the track's note triggers, its CCs set parameters."
+      | Midi_List -> "list the MIDI inputs and stop."
+      | Track _ -> "the Machinedrum track (1..16) whose MIDI note and CCs the machine answers (default 1)."
+      | Base_Channel _ -> "the Machinedrum's MIDI base channel (1..13, default 1)."
 
 type Command =
   | [<CliPrefix(CliPrefix.None)>] Asm of ParseResults<AsmArgs>

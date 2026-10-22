@@ -335,31 +335,57 @@ let stress (args: ParseResults<StressArgs>) =
 // ---------------------------------------------------------------------------------------------
 // Live output.
 
+let midiList () =
+  let inputs = dsp56k.audio.Midi.inputs ()
+  if inputs.Length = 0 then printfn "no MIDI inputs"
+  for i, name in Array.indexed inputs do printfn "%2d  %s" i name
+  0
+
 let audition (args: ParseResults<AuditionArgs>) =
-  match loadMachine (args.GetResult AuditionArgs.Input) (args.TryGetResult AuditionArgs.Slot) with
+  match args.Contains AuditionArgs.Midi_List, args.TryGetResult AuditionArgs.Input with
+  | true, _ -> midiList ()
+  | false, None -> fail "audition needs an .mds or .syx (or --midi-list)"
+  | false, Some input ->
+  match loadMachine input (args.TryGetResult AuditionArgs.Slot) with
   | Error e -> fail e
   | Ok(name, pkg, machine) ->
     let settings =
       match args.TryGetResult AuditionArgs.Settings with
       | Some s -> s.Split ',' |> Array.map float
       | None -> machine.parameters |> Array.map (fun p -> float p.defaultValue)
+    let trackNumber = args.GetResult(AuditionArgs.Track, 1)
+    let baseChannel = args.GetResult(AuditionArgs.Base_Channel, 1)
+    if trackNumber < 1 || trackNumber > 16 then failwith "--track is 1..16"
     use track = new Track.Track(pkg, Some machine, Track.defaultLayout, sampleBanks (args.TryGetResult AuditionArgs.Sample))
     track.SetSettings settings
     track.Init 0 |> ignore
+    let voice = Audition.ofTrack track machine
+    let midi =
+      match args.TryGetResult AuditionArgs.Midi_In with
+      | Some port -> Some(new dsp56k.audio.Midi.Input(port))
+      | None -> None
+    use _closeMidi = { new IDisposable with member _.Dispose() = midi |> Option.iter (fun m -> (m :> IDisposable).Dispose()) }
+    let between =
+      match midi with
+      | Some m -> fun () -> for msg in m.Poll() do Audition.respond voice baseChannel trackNumber msg |> ignore
+      | None -> ignore
     let rate = 44100
     // a quarter second of ring: latency against underruns
+    // TODO: with --midi-in a shorter ring (lower latency) would play better
     use player = new dsp56k.audio.Output.Player(rate, rate / 4)
     if player.SampleRate <> rate then
       // TODO: resample; until then the pitch is off by the ratio
       eprintfn "warning: the output plays at %d Hz, not %d: pitch off by %.3f" player.SampleRate rate (float player.SampleRate / float rate)
-    let seconds = args.GetResult(AuditionArgs.Seconds, 4.0)
-    let blocks = int (seconds * float rate / 32.0)
+    let seconds = args.TryGetResult AuditionArgs.Seconds |> Option.defaultValue (if midi.IsSome then infinity else 4.0)
+    let blocks = if Double.IsInfinity seconds then Int32.MaxValue else int (seconds * float rate / 32.0)
     let mutable stopped = false
     let onCancel = System.ConsoleCancelEventHandler(fun _ e -> e.Cancel <- true; stopped <- true)
     System.Console.CancelKeyPress.AddHandler onCancel
     try
-      printfn "%s: playing %.1f s at %d Hz, %d channel(s); Ctrl+C stops" name seconds player.SampleRate player.Channels
-      let played = Audition.play player.Write (Audition.ofTrack track machine) blocks (args.TryGetResult AuditionArgs.Trig_Every) ignore (fun () -> stopped)
+      let length = if Double.IsInfinity seconds then "until Ctrl+C" else $"{seconds:F1} s"
+      let listening = match args.TryGetResult AuditionArgs.Midi_In with Some p -> $"; MIDI from {p}, track {trackNumber} (note {Audition.MidiMap.note trackNumber}, channel {Audition.MidiMap.channel baseChannel trackNumber + 1})" | None -> ""
+      printfn "%s: playing %s at %d Hz, %d channel(s)%s; Ctrl+C stops" name length player.SampleRate player.Channels listening
+      let played = Audition.play player.Write voice blocks (args.TryGetResult AuditionArgs.Trig_Every) between (fun () -> stopped)
       player.Drain(System.TimeSpan.FromSeconds 1.0)
       printfn "played %d blocks, %d trigs, %d underrun frames" played.blocks played.trigs player.Underruns
       0

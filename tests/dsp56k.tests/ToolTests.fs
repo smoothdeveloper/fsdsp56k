@@ -125,6 +125,33 @@ let tests =
         Expect.isTrue (written |> Seq.exists (fun f -> f <> 0.0f)) "it makes a sound"
     }
 
+    test "audition --midi-in answers the Machinedrum's default map: the track's note and its CCs" {
+      let trigs = ResizeArray<unit>()
+      let set = ResizeArray<int * float>()
+      let voice : dsp56k.tool.Audition.Voice =
+        { trig = trigs.Add; render = (fun () -> Array.zeroCreate 32); parameter = fun i v -> set.Add((i, v)) }
+      let message status d1 d2 : dsp56k.audio.Midi.Message = { status = status; data1 = d1; data2 = d2 }
+      let respond = dsp56k.tool.Audition.respond voice 1
+      // track 1: channel 1, note 36, parameters at CC 16..23
+      Expect.isTrue (respond 1 (message 0x90 36 100)) "BD's note"
+      Expect.isFalse (respond 1 (message 0x90 36 0)) "a note-on of velocity 0 is a note-off"
+      Expect.isFalse (respond 1 (message 0x90 38 100)) "SD's note"
+      Expect.isTrue (respond 1 (message 0xb0 18 99)) "parameter 3"
+      Expect.isFalse (respond 1 (message 0xb0 24 99)) "a track effect, not the machine"
+      // track 7: channel 2 (base + 1), note 47, third of its group: CC 72..79
+      Expect.isTrue (respond 7 (message 0x91 47 1)) "RS's note on channel 2"
+      Expect.isFalse (respond 7 (message 0x90 47 1)) "the wrong channel"
+      Expect.isTrue (respond 7 (message 0xb1 79 5)) "parameter 8"
+      Expect.equal trigs.Count 2 "two trigs"
+      Expect.equal (List.ofSeq set) [ 2, 99.0; 7, 5.0 ] "two parameters"
+    }
+
+    test "audition --midi-list lists the MIDI inputs" {
+      needAudio ()
+      let code, text = tool [| "audition"; "--midi-list" |]
+      Expect.equal code 0 text
+    }
+
     test "stress cases: the defaults first, then each control swept and the pairwise rows" {
       let cs : dsp56k.kernel.Grade.Control array =
         [| { name = "A"; low = 0.0; high = 127.0; standard = 64.0 }

@@ -31,6 +31,9 @@ let needFixture name =
 let needNative () =
   if not (dsp56k.Native.load ()) then skipFor "native oracle missing: cargo build --release in native/ (or set FSDSP56K_NATIVE)"
 
+let needAudio () =
+  if not (dsp56k.audio.Output.load ()) then skipFor "audio and MIDI library missing: dotnet fsi native/build.fsx (or set FSDSP56K_AUDIO)"
+
 /// The skipped tests' prerequisites, one line each with how many tests they held back.
 let reportMissing () =
   if not missing.IsEmpty then

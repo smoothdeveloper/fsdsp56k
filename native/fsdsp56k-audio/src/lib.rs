@@ -1,7 +1,9 @@
 //! The default output device, fed by the F# tooling. One producer (the .NET thread rendering the
 //! track) pushes mono frames into a single-producer single-consumer ring; the device callback is
 //! the one consumer. Neither side locks or allocates once the player is open: an empty ring plays
-//! silence and counts an underrun.
+//! silence and counts an underrun. MIDI input for audition is in `midi`.
+
+pub mod midi;
 
 use std::cell::RefCell;
 use std::ffi::c_char;
@@ -70,9 +72,26 @@ thread_local! {
     static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
-fn fail(message: String) -> *mut Player {
+pub(crate) fn set_error(message: String) {
     LAST_ERROR.with(|e| *e.borrow_mut() = message);
+}
+
+fn fail(message: String) -> *mut Player {
+    set_error(message);
     std::ptr::null_mut()
+}
+
+/// `text` as UTF-8 into `buffer` (cut to fit, NUL-terminated); its full length.
+pub(crate) unsafe fn write_text(text: &str, buffer: *mut c_char, length: u32) -> u32 {
+    let bytes = text.as_bytes();
+    if !buffer.is_null() && length > 0 {
+        let n = bytes.len().min(length as usize - 1);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer as *mut u8, n);
+            *buffer.add(n) = 0;
+        }
+    }
+    bytes.len() as u32
 }
 
 fn open(sample_rate: u32, capacity: usize) -> Result<Player, String> {
@@ -131,21 +150,11 @@ pub extern "C" fn fsdsp56k_audio_open(sample_rate: u32, capacity_frames: u32) ->
     }
 }
 
-/// The reason the last open on this thread failed, as UTF-8 into `buffer`; its full length.
+/// The reason the last open (audio or MIDI) on this thread failed, as UTF-8 into `buffer`; its
+/// full length.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fsdsp56k_audio_last_error(buffer: *mut c_char, length: u32) -> u32 {
-    LAST_ERROR.with(|e| {
-        let e = e.borrow();
-        let bytes = e.as_bytes();
-        if !buffer.is_null() && length > 0 {
-            let n = bytes.len().min(length as usize - 1);
-            unsafe {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer as *mut u8, n);
-                *buffer.add(n) = 0;
-            }
-        }
-        bytes.len() as u32
-    })
+    LAST_ERROR.with(|e| unsafe { write_text(&e.borrow(), buffer, length) })
 }
 
 /// Push mono frames (-1..1); how many fitted. The caller waits and pushes the rest.

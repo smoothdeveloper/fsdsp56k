@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 publish = false
-description = "C ABI over cpal: the default output device fed 32-sample blocks through a lock-free ring, for the F# tooling's audition"
+description = "C ABI over cpal and midir: the default output device fed 32-sample blocks through a lock-free ring, and MIDI ports, for the F# tooling's audition"
 
 [lib]
 crate-type = ["cdylib"]
@@ -14,6 +14,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 cpal = "=0.18.2"
+midir = "=0.11.1"
 
 [profile.release]
 opt-level = 3
