@@ -10,3 +10,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 fable_library_rust = { path = "../out/portable/rust/fable_modules/fable-library-rust", default-features = false, features = ["enum_func", "enum_string"] }
+
+# The wasm goes to browsers: no symbol names, name section or debug info, and no unwinding.
+[profile.release]
+debug = false
+strip = true
+panic = "abort"
