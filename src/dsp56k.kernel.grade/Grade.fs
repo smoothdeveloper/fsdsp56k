@@ -714,11 +714,11 @@ let private runStatesCached (h: Harness) (p: Program) (stateWords: int) (xStateW
     key.Text("program", $"{p.name}\n{p.programWords}\n{p.xWorkset}\n{p.yWorkset}\n{p.declaredCycles}\n{stateWords}\n{xStateWords}")
     GradeCache.cached "dsp" $"{p.name} / {scenario.name}" key saveRun loadRun (fun () -> runStates h p stateWords xStateWords scenario)
 
-/// Compile for the harness's target with the optimizer at `level`, load, run and compare.
-/// `reference` is the program the kernel reproduces, when there is one.
-let gradeAt (level: Optimize.Level) (h: Harness) (k: Kernel.Kernel) (reference: Program option) (scenario: Scenario) =
+/// Compile for the harness's target with the optimizer at `level`, the [<HandWritten>] helpers of
+/// `handOff` (by key) from their F#, load, run and compare.
+let gradeAtWith (handOff: Set<string>) (level: Optimize.Level) (h: Harness) (k: Kernel.Kernel) (reference: Program option) (scenario: Scenario) =
   let target = h.target
-  Optimize.compile level target k
+  Optimize.compileHandOff handOff level target k
   |> Result.bind (fun compiled -> h.load compiled |> Result.map (fun p -> compiled, p))
   |> Result.bind (fun (compiled, program) ->
     try
@@ -742,6 +742,11 @@ let gradeAt (level: Optimize.Level) (h: Harness) (k: Kernel.Kernel) (reference: 
            reference = Option.map2 cost reference refRun
            shapes = shapes }
     with Kernel.KernelError m -> Error m)
+
+/// Compile for the harness's target with the optimizer at `level`, load, run and compare.
+/// `reference` is the program the kernel reproduces, when there is one.
+let gradeAt (level: Optimize.Level) (h: Harness) (k: Kernel.Kernel) (reference: Program option) (scenario: Scenario) =
+  gradeAtWith Set.empty level h k reference scenario
 
 /// The optimizer level FSDSP56K_PASSES asks for, for measuring passes through graders that call
 /// gradeWith: unset or "all" every pass; "none"; "unguarded"; or "-name,-name" those passes off.
