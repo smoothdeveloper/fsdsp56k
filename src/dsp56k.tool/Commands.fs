@@ -209,6 +209,20 @@ let mds (args: ParseResults<MdsArgs>) =
 // ---------------------------------------------------------------------------------------------
 // The track harness.
 
+/// A WAV as the internal and userwave sample banks, or none.
+let sampleBanks (wav: string option) =
+  match wav with
+  | Some wav ->
+    let words = fst (Wav.read wav) |> Array.truncate 0x18000
+    let bank : Track.Bank = { words = words; step = 0x10000; origin = 0x4000 }
+    Map.ofList [ 0, bank; 1, bank ]
+  | None -> Map.empty
+
+/// A machine from a .mds or .syx: its name, package and definition.
+let loadMachine (path: string) (slot: int option) =
+  onePackage path slot
+  |> Result.bind (fun (name, _, p) -> readPackage p |> Result.map (fun pkg -> name, pkg, Mds.machineOf pkg p))
+
 let run (args: ParseResults<RunArgs>) =
   match onePackage (args.GetResult RunArgs.Input) (args.TryGetResult RunArgs.Slot) |> Result.bind (fun (name, _, p) -> readPackage p |> Result.map (fun pkg -> name, p, pkg)) with
   | Error e -> fail e
@@ -218,13 +232,7 @@ let run (args: ParseResults<RunArgs>) =
       match args.TryGetResult RunArgs.Settings with
       | Some s -> s.Split ',' |> Array.map float
       | None -> machine.parameters |> Array.map (fun p -> float p.defaultValue)
-    let banks =
-      match args.TryGetResult RunArgs.Sample with
-      | Some wav ->
-        let words = fst (Wav.read wav) |> Array.truncate 0x18000
-        let bank : Track.Bank = { words = words; step = 0x10000; origin = 0x4000 }
-        Map.ofList [ 0, bank; 1, bank ]
-      | None -> Map.empty
+    let banks = sampleBanks (args.TryGetResult RunArgs.Sample)
     use track = new Track.Track(pkg, Some machine, Track.defaultLayout, banks)
     track.SetSettings settings
     let blocks = args.GetResult(RunArgs.Blocks, 1378)
@@ -264,3 +272,27 @@ let run (args: ParseResults<RunArgs>) =
       printfn "wrote %s" path
     | None -> ()
     0
+
+let parseSweep (how: string) (seed: int) =
+  match how.Split ':' with
+  | [| "exhaustive" |] -> Ok Stress.Exhaustive
+  | [| "random"; n |] ->
+    match System.Int32.TryParse n with
+    | true, n when n > 0 -> Ok(Stress.RandomCases(n, seed))
+    | _ -> Error $"random:N needs a positive count, not '{n}'"
+  | _ -> Error $"unknown sweep '{how}': exhaustive or random:N"
+
+let stress (args: ParseResults<StressArgs>) =
+  let sweep = parseSweep (args.GetResult(StressArgs.Sweep, "exhaustive")) (args.GetResult(StressArgs.Seed, 1))
+  match loadMachine (args.GetResult StressArgs.Input) (args.TryGetResult StressArgs.Slot), sweep with
+  | Error e, _ | _, Error e -> fail e
+  | Ok(name, pkg, machine), Ok sweep ->
+    let cs = Stress.controls machine
+    let blocks = args.GetResult(StressArgs.Blocks, 16)
+    use track = new Track.Track(pkg, Some machine, Track.defaultLayout, sampleBanks (args.TryGetResult StressArgs.Sample))
+    let cases = Stress.settingsOf cs sweep |> List.map (Stress.measure track blocks)
+    let how = match sweep with Stress.Exhaustive -> "exhaustive" | Stress.RandomCases(n, seed) -> $"random:{n}, seed {seed}"
+    printfn "%s: %d cases (%s), %d RENDER blocks each; cycles JSR to STOP, service stand-ins included" name cases.Length how blocks
+    let lines, within = Stress.report cs pkg.maxCycles cases
+    for l in lines do printfn "%s" l
+    if within then 0 else 1

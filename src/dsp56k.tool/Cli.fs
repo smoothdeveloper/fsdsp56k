@@ -133,6 +133,23 @@ type RunArgs =
       | Wav _ -> "write the rendered output as a 24-bit WAV."
       | Profile -> "single-step the first INIT, TRIG and RENDER and report hot addresses."
 
+type StressArgs =
+  | [<MainCommand; ExactlyOnce>] Input of path: string
+  | Slot of int
+  | Sweep of how: string
+  | Seed of int
+  | Blocks of int
+  | Sample of wav: string
+  interface IArgParserTemplate with
+    member a.Usage =
+      match a with
+      | Input _ -> ".mds package or .syx dump."
+      | Slot _ -> "slot (1..16) to take from a .syx holding several machines."
+      | Sweep _ -> "exhaustive (each control over its range, then pairwise; default) or random:N."
+      | Seed _ -> "seed of random:N (default 1)."
+      | Blocks _ -> "RENDER blocks per case (default 16)."
+      | Sample _ -> "WAV loaded as the internal and userwave sample banks."
+
 type Command =
   | [<CliPrefix(CliPrefix.None)>] Asm of ParseResults<AsmArgs>
   | [<CliPrefix(CliPrefix.None)>] Check of ParseResults<CheckArgs>
@@ -140,6 +157,7 @@ type Command =
   | [<CliPrefix(CliPrefix.None)>] Import of ParseResults<ImportArgs>
   | [<CliPrefix(CliPrefix.None)>] Mds of ParseResults<MdsArgs>
   | [<CliPrefix(CliPrefix.None)>] Run of ParseResults<RunArgs>
+  | [<CliPrefix(CliPrefix.None)>] Stress of ParseResults<StressArgs>
   interface IArgParserTemplate with
     member a.Usage =
       match a with
@@ -149,3 +167,4 @@ type Command =
       | Import _ -> "listing or package to F# DSL source."
       | Mds _ -> "MDS packages and SysEx dumps."
       | Run _ -> "run a machine on the emulator: output WAV and cycle report."
+      | Stress _ -> "worst-case INIT, TRIG and RENDER cycles over many settings, as a table."

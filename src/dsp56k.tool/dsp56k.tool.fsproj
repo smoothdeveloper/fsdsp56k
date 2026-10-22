@@ -8,6 +8,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="Cli.fs" />
+    <Compile Include="Stress.fs" />
     <Compile Include="Commands.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
@@ -17,6 +18,7 @@
     <ProjectReference Include="../dsp56k.native/dsp56k.native.fsproj" />
     <ProjectReference Include="../machinedrum/machinedrum.fsproj" />
     <ProjectReference Include="../machinedrum.run/machinedrum.run.fsproj" />
+    <ProjectReference Include="../dsp56k.kernel.grade/dsp56k.kernel.grade.fsproj" />
   </ItemGroup>
   <Import Project="..\..\.paket\Paket.Restore.targets" />
 </Project>

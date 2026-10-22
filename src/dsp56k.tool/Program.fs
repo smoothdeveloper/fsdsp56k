@@ -15,6 +15,7 @@ let main argv =
     | Import a -> Commands.import a
     | Mds a -> Commands.mds a
     | Run a -> Commands.run a
+    | Stress a -> Commands.stress a
   with
   | :? ArguParseException as e ->
     eprintfn "%s" e.Message

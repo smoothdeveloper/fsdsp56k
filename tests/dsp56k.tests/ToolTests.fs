@@ -57,4 +57,36 @@ let tests =
       Expect.equal code 0 text
       Expect.isGreaterThan (FileInfo(out </> "cp.wav").Length) (64L * 32L * 3L) "the WAV holds every block"
     }
+
+    test "stress sweeps a machine's settings and reports its worst cycles as a table" {
+      needFixture "kitbasher"
+      needNative ()
+      let code, text = tool [| "stress"; fixture "kitbasher" </> "mds" </> "tx6" </> "sd" </> "sd.syx"; "--blocks"; "4" |]
+      Expect.equal code 0 text
+      Expect.stringContains text "(exhaustive)" "the sweep is named"
+      for phase in [ "INIT"; "TRIG"; "RENDER"; "TRIG+RENDER" ] do
+        Expect.isTrue (text.Split('\n') |> Array.exists (fun l -> l.StartsWith(phase + " "))) $"a row for {phase}"
+      Expect.isFalse (text.Contains "{") "text, not JSON"
+    }
+
+    test "stress random:N is repeatable from its seed" {
+      needFixture "kitbasher"
+      needNative ()
+      let sd = fixture "kitbasher" </> "mds" </> "tx6" </> "sd" </> "sd.syx"
+      let once () = tool [| "stress"; sd; "--sweep"; "random:40"; "--seed"; "3"; "--blocks"; "4" |]
+      let code, first = once ()
+      Expect.equal code 0 first
+      Expect.equal (snd (once ())) first "the same seed, the same cases"
+    }
+
+    test "stress cases: the defaults first, then each control swept and the pairwise rows" {
+      let cs : dsp56k.kernel.Grade.Control array =
+        [| { name = "A"; low = 0.0; high = 127.0; standard = 64.0 }
+           { name = "B"; low = 0.0; high = 1.0; standard = 0.0 } |]
+      let settings = dsp56k.tool.Stress.exhaustiveSettings cs
+      Expect.equal settings.Head [| 64.0; 0.0 |] "the defaults first"
+      Expect.equal (List.distinct settings) settings "each case once"
+      Expect.contains settings [| 127.0; 1.0 |] "a pairwise corner"
+      Expect.contains settings [| 0.0; 0.0 |] "A at its low end"
+    }
   ]
