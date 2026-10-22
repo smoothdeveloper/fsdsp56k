@@ -137,6 +137,8 @@ type StressArgs =
   | [<MainCommand; ExactlyOnce>] Input of path: string
   | Slot of int
   | Sweep of how: string
+  | Search of how: string
+  | Phase of phase: string
   | Seed of int
   | Blocks of int
   | Sample of wav: string
@@ -146,7 +148,9 @@ type StressArgs =
       | Input _ -> ".mds package or .syx dump."
       | Slot _ -> "slot (1..16) to take from a .syx holding several machines."
       | Sweep _ -> "exhaustive (each control over its range, then pairwise; default) or random:N."
-      | Seed _ -> "seed of random:N (default 1)."
+      | Search _ -> "anneal:N: search for the worst case within N measurements, instead of a sweep."
+      | Phase _ -> "what --search maximises: init, trig, render, trig+render or worst (default)."
+      | Seed _ -> "seed of random:N and anneal:N (default 1)."
       | Blocks _ -> "RENDER blocks per case (default 16)."
       | Sample _ -> "WAV loaded as the internal and userwave sample banks."
 

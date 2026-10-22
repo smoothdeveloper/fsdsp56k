@@ -79,6 +79,36 @@ let tests =
       Expect.equal (snd (once ())) first "the same seed, the same cases"
     }
 
+    test "stress --search anneal finds the exhaustive sweep's worst case in fewer measurements" {
+      needFixture "kitbasher"
+      needNative ()
+      match dsp56k.tool.Commands.loadMachine (fixture "kitbasher" </> "mds" </> "tx6" </> "sd" </> "sd.syx") None with
+      | Error e -> failtest e
+      | Ok(_, pkg, machine) ->
+        use track = new machinedrum.run.Track.Track(pkg, Some machine, machinedrum.run.Track.defaultLayout, Map.empty)
+        let cs = dsp56k.tool.Stress.controls machine
+        let evaluate = dsp56k.tool.Stress.measure track 4
+        let objective = dsp56k.tool.Stress.AnyPhase
+        let sweep = dsp56k.tool.Stress.exhaustiveSettings cs |> List.map evaluate
+        let worst = sweep |> List.map (dsp56k.tool.Stress.score objective) |> List.max
+        let found = dsp56k.tool.Stress.anneal cs evaluate objective 30 1
+        Expect.isLessThan found.evaluations sweep.Length "fewer measurements than the sweep"
+        Expect.isGreaterThanOrEqual (dsp56k.tool.Stress.score objective found.best) worst "at least the sweep's worst"
+    }
+
+    test "stress anneal climbs to an inner peak no edge or sweep holds" {
+      let cs : dsp56k.kernel.Grade.Control array =
+        [| { name = "A"; low = 0.0; high = 127.0; standard = 64.0 }
+           { name = "B"; low = 0.0; high = 127.0; standard = 64.0 } |]
+      // cycles peaking at A=37, B=90: what a machine with a costly middle setting looks like
+      let evaluate (s: float array) : dsp56k.tool.Stress.Case =
+        let c = 20000L - int64 ((s[0] - 37.0) ** 2.0 + (s[1] - 90.0) ** 2.0)
+        { settings = s; init = 0L; trig = 0L; render = c; trigBlock = c }
+      let found = dsp56k.tool.Stress.anneal cs evaluate (dsp56k.tool.Stress.OnePhase dsp56k.tool.Stress.Render) 400 1
+      Expect.equal found.best.settings [| 37.0; 90.0 |] "the peak"
+      Expect.isLessThanOrEqual found.evaluations 400 "within the budget"
+    }
+
     test "stress cases: the defaults first, then each control swept and the pairwise rows" {
       let cs : dsp56k.kernel.Grade.Control array =
         [| { name = "A"; low = 0.0; high = 127.0; standard = 64.0 }

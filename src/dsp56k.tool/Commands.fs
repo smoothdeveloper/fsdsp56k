@@ -282,6 +282,35 @@ let parseSweep (how: string) (seed: int) =
     | _ -> Error $"random:N needs a positive count, not '{n}'"
   | _ -> Error $"unknown sweep '{how}': exhaustive or random:N"
 
+let parsePhase (name: string) =
+  match name.ToLowerInvariant() with
+  | "worst"       -> Ok Stress.AnyPhase
+  | "init"        -> Ok(Stress.OnePhase Stress.Init)
+  | "trig"        -> Ok(Stress.OnePhase Stress.Trig)
+  | "render"      -> Ok(Stress.OnePhase Stress.Render)
+  | "trig+render" -> Ok(Stress.OnePhase Stress.TrigBlock)
+  | other         -> Error $"unknown phase '{other}': init, trig, render, trig+render or worst"
+
+let parseSearch (how: string) =
+  match how.Split ':' with
+  | [| "anneal"; n |] ->
+    match System.Int32.TryParse n with
+    | true, n when n > 0 -> Ok n
+    | _ -> Error $"anneal:N needs a positive count, not '{n}'"
+  | _ -> Error $"unknown search '{how}': anneal:N"
+
+/// `stress --search anneal:N`: the annealed worst case, every case it measured as the table, and
+/// how many measurements that took against the sweep and the full grid.
+let stressSearch name (pkg: Mds.Package) (machine: Mds.Machine) (track: Track.Track) blocks (budget: int) seed objective =
+  let cs = Stress.controls machine
+  let found = Stress.anneal cs (Stress.measure track blocks) objective budget seed
+  let sweep = (Stress.exhaustiveSettings cs).Length
+  printfn "%s: anneal:%d, seed %d, maximising %s: %d measurements (the exhaustive sweep: %d; every setting: %A); %d RENDER blocks each" name budget seed (Stress.objectiveName objective) found.evaluations sweep (Stress.gridSize cs) blocks
+  printfn "worst found: %d cycles at %s" (Stress.score objective found.best) (Stress.settingsText cs found.best.settings)
+  let lines, within = Stress.report cs pkg.maxCycles found.cases
+  for l in lines do printfn "%s" l
+  if within then 0 else 1
+
 let stress (args: ParseResults<StressArgs>) =
   let sweep = parseSweep (args.GetResult(StressArgs.Sweep, "exhaustive")) (args.GetResult(StressArgs.Seed, 1))
   match loadMachine (args.GetResult StressArgs.Input) (args.TryGetResult StressArgs.Slot), sweep with
@@ -290,6 +319,12 @@ let stress (args: ParseResults<StressArgs>) =
     let cs = Stress.controls machine
     let blocks = args.GetResult(StressArgs.Blocks, 16)
     use track = new Track.Track(pkg, Some machine, Track.defaultLayout, sampleBanks (args.TryGetResult StressArgs.Sample))
+    match args.TryGetResult StressArgs.Search with
+    | Some how ->
+      match parseSearch how, parsePhase (args.GetResult(StressArgs.Phase, "worst")) with
+      | Error e, _ | _, Error e -> fail e
+      | Ok budget, Ok objective -> stressSearch name pkg machine track blocks budget (args.GetResult(StressArgs.Seed, 1)) objective
+    | None ->
     let cases = Stress.settingsOf cs sweep |> List.map (Stress.measure track blocks)
     let how = match sweep with Stress.Exhaustive -> "exhaustive" | Stress.RandomCases(n, seed) -> $"random:{n}, seed {seed}"
     printfn "%s: %d cases (%s), %d RENDER blocks each; cycles JSR to STOP, service stand-ins included" name cases.Length how blocks

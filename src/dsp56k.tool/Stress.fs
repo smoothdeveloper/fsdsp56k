@@ -113,3 +113,104 @@ let report (cs: Grade.Control array) (declared: int) (cases: Case list) =
     let w = cycles TrigBlock (worst TrigBlock)
     w <= int64 declared && w <= int64 Abi.trackCycleLimit
   lines, within
+
+// ---------------------------------------------------------------------------------------------
+// Worst-case search. Cycles are a step function of the settings, measured as a black box: no
+// gradient to follow, so the search is simulated annealing over whole-number settings, with
+// restarts from the best case found.
+
+/// What the search maximises: one phase, or the worst of all of them.
+type Objective =
+  | OnePhase of Phase
+  | AnyPhase
+
+let objectiveName objective =
+  match objective with
+  | OnePhase phase -> phaseName phase
+  | AnyPhase       -> "the worst phase"
+
+let score objective (c: Case) =
+  match objective with
+  | OnePhase phase -> cycles phase c
+  | AnyPhase       -> phases |> List.map (fun phase -> cycles phase c) |> List.max
+
+/// Where the search starts: the defaults, the range edges (every control low, high, mid), each
+/// control alone at its edges, and `random` random settings.
+let starts (cs: Grade.Control array) (rng: System.Random) (random: int) =
+  let mid (c: Grade.Control) = System.Math.Round((c.low + c.high) / 2.0)
+  [ yield cs |> Array.map _.standard
+    yield cs |> Array.map _.low
+    yield cs |> Array.map _.high
+    yield cs |> Array.map mid
+    for i, c in Array.indexed cs do
+      for edge in [ c.low; c.high ] do
+        yield cs |> Array.mapi (fun j d -> if i = j then edge else d.standard)
+    for _ in 1 .. random do
+      yield cs |> Array.map (fun c -> float (rng.Next(int c.low, int c.high + 1))) ]
+  |> List.distinct
+
+/// One control moved: by a small step, a large one (a quarter of its range), or to an edge.
+let neighbour (cs: Grade.Control array) (rng: System.Random) (settings: float array) =
+  let i = rng.Next cs.Length
+  let c = cs[i]
+  let range = c.high - c.low
+  let moved =
+    match rng.Next 6 with
+    | 0 -> settings[i] + 1.0
+    | 1 -> settings[i] - 1.0
+    | 2 -> settings[i] + max 1.0 (System.Math.Round(range / 4.0))
+    | 3 -> settings[i] - max 1.0 (System.Math.Round(range / 4.0))
+    | 4 -> c.low
+    | _ -> c.high
+  settings |> Array.mapi (fun j v -> if i = j then max c.low (min c.high moved) else v)
+
+/// Every whole-number setting of every control: the grid the search stands in for.
+let gridSize (cs: Grade.Control array) =
+  cs |> Array.fold (fun n c -> n * bigint (int (c.high - c.low) + 1)) 1I
+
+type Found =
+  { best        : Case
+    cases       : Case list    // every distinct case measured
+    evaluations : int }
+
+/// Simulated annealing for the case that maximises `objective`, within `budget` distinct
+/// measurements. A move that costs fewer cycles is still taken with a chance that shrinks as the
+/// temperature falls; after `patience` moves without a new best, it restarts from the best.
+// TODO: the temperature schedule and the move mix are first guesses, tuned on the TX6 fixtures
+// only; a machine with narrow peaks (one setting of one control) may need more random starts.
+let anneal (cs: Grade.Control array) (evaluate: float array -> Case) objective (budget: int) (seed: int) =
+  let rng = System.Random seed
+  let seen = System.Collections.Generic.Dictionary<string, Case>()
+  let order = ResizeArray<Case>()
+  let measureOnce (settings: float array) =
+    let key = settings |> Array.map string |> String.concat ","
+    match seen.TryGetValue key with
+    | true, c -> c
+    | _ ->
+      let c = evaluate settings
+      seen[key] <- c
+      order.Add c
+      c
+  let budget = max 1 budget
+  let initial = starts cs rng (max 1 (budget / 20)) |> List.truncate budget |> List.map measureOnce
+  let mutable best = initial |> List.maxBy (score objective)
+  let mutable current = best
+  let mutable stale = 0
+  let patience = max 8 (budget / 10)
+  let mutable moves = 0
+  // a small space runs out of new settings before the budget does: bounded moves
+  while order.Count < budget && moves < 20 * budget do
+    moves <- moves + 1
+    let temperature = max 0.5 (0.05 * float (score objective best) * (1.0 - float order.Count / float budget))
+    let next = measureOnce (neighbour cs rng current.settings)
+    let delta = float (score objective next - score objective current)
+    if delta >= 0.0 || rng.NextDouble() < exp (delta / temperature) then current <- next
+    if score objective next > score objective best then
+      best <- next
+      stale <- 0
+    else
+      stale <- stale + 1
+      if stale >= patience then
+        current <- best
+        stale <- 0
+  { best = best; cases = List.ofSeq order; evaluations = order.Count }
