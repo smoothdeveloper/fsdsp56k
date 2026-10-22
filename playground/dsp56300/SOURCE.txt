@@ -1,0 +1,2 @@
+dsp56300.wasm and dsp56300.mjs are built from https://github.com/dsp56300/dsp56300 7d84319a0fae912d614feb8713bce2101b903eb8,
+with the adaptations of wasm/build.fsx and the wrapper wasm/runtime.cpp of fsdsp56k. Licence: GPL-3.0 (LICENSE.dsp56300.md).

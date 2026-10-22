@@ -1,0 +1,106 @@
+// fsdsp56k playground: real fsdsp56k sessions, as the command line printed them. Written by
+// `dotnet fsi build.fsx terminal-capture`; do not edit. The format is in README.md (the terminal panel).
+fsdsp56kTerminal.transcripts({
+  version: 1,
+  tool: "fsdsp56k", toolchain: "49f3085", captured: "2026-10-22",
+  sessions: [
+    { id: "tx6-bd", title: "TX6 BD, from a SysEx dump", kernel: "tx6-bd", steps: [
+      { command: "fsdsp56k md info fixtures/kitbasher/mds/tx6/bd/bd.syx", exit: 0, ms: 563, lines: [
+        { t: 520, s: "out", text: "bd-slot1: 3908 bytes, CRCs and content ID verify" },
+        { t: 539, s: "out", text: "  TX6 BASS DRUM (org.kitbasher.tx6.bd), category TX6, max 3920 cycles per track" },
+        { t: 539, s: "out", text: "    param 1: TUNE Raw14 default 75 range 0..127" },
+        { t: 539, s: "out", text: "    param 2: DEC  Raw14 default 102 range 0..127" },
+        { t: 539, s: "out", text: "    param 3: TRAN Raw14 default 51 range 0..127" },
+        { t: 539, s: "out", text: "    param 4: HEAT Raw14 default 0 range 0..127" },
+        { t: 539, s: "out", text: "    param 5: XL   Raw14 default 0 range 0..127" },
+        { t: 539, s: "out", text: "    param 6: CLIK Raw14 default 127 range 0..127" },
+        { t: 551, s: "out", text: "  program 1119 words, INIT $0000 TRIG $000c RENDER $0088, workset X 26 Y 7" },
+        { t: 551, s: "out", text: "  relocations $0006 $001e $0023 $002d $0033 $003c $0042 $004c $0052 $0062 $0081 $008d $00c0 $00d7 $00e8 $00fa $0113 $011c" },
+        { t: 552, s: "out", text: "  import $00bc kind 3 symbol 7" },
+        { t: 552, s: "out", text: "  import $00d3 kind 3 symbol 7" },
+        { t: 552, s: "out", text: "  import $00e6 kind 4 symbol 8" },
+        { t: 552, s: "out", text: "  import $00f3 kind 4 symbol 8" },
+        { t: 552, s: "out", text: "  import $010f kind 3 symbol 7" },
+        { t: 552, s: "out", text: "  import $0111 kind 4 symbol 8" } ] },
+      { command: "fsdsp56k md unsyx fixtures/kitbasher/mds/tx6/bd/bd.syx -o out/capture", exit: 0, ms: 544, lines: [
+        { t: 538, s: "out", text: "out/capture/bd-slot1.mds" } ] },
+      { command: "fsdsp56k run out/capture/bd-slot1.mds --trig-every 344 --wav out/capture/bd.wav", exit: 0, ms: 833, lines: [
+        { t: 812, s: "out", text: "bd-slot1: 1378 blocks, TRIG+RENDER cycles mean 1203, worst 1447 (declared 3920, limit 3951; service stand-ins included)" },
+        { t: 815, s: "out", text: "peak 0.429" },
+        { t: 821, s: "out", text: "wrote out/capture/bd.wav" } ] },
+      { command: "fsdsp56k stress fixtures/kitbasher/mds/tx6/bd/bd.syx", exit: 0, ms: 939, lines: [
+        { t: 620, s: "out", text: "" },
+        { t: 620, s: "out", text: "== bd-slot1: TX6 BASS DRUM (org.kitbasher.tx6.bd), declared 3920 cycles, limit 3951" },
+        { t: 880, s: "out", text: "bd-slot1: 56 cases (exhaustive), 16 RENDER blocks each; cycles JSR to STOP, service stand-ins included" },
+        { t: 929, s: "out", text: "phase          worst    mean declared  limit  settings at worst" },
+        { t: 929, s: "out", text: "INIT              57      57        -      -  TUNE=75 DEC=102 TRAN=51 HEAT=0 XL=0 CLIK=127" },
+        { t: 929, s: "out", text: "TRIG             252     247        -      -  TUNE=75 DEC=102 TRAN=51 HEAT=0 XL=0 CLIK=0" },
+        { t: 929, s: "out", text: "RENDER          1202    1202     3920   3951  TUNE=75 DEC=102 TRAN=51 HEAT=0 XL=0 CLIK=127" },
+        { t: 929, s: "out", text: "TRIG+RENDER     1454    1449     3920   3951  TUNE=75 DEC=102 TRAN=51 HEAT=0 XL=0 CLIK=0" } ] },
+      { command: "fsdsp56k stress fixtures/kitbasher/mds/tx6/bd/bd.syx --search anneal:200", exit: 0, ms: 1010, lines: [
+        { t: 668, s: "out", text: "" },
+        { t: 669, s: "out", text: "== bd-slot1: TX6 BASS DRUM (org.kitbasher.tx6.bd), declared 3920 cycles, limit 3951" },
+        { t: 986, s: "out", text: "bd-slot1: anneal:200, seed 1, maximising the worst phase: 200 measurements (the exhaustive sweep: 56; every setting: 4398046511104); 16 RENDER blocks each" },
+        { t: 994, s: "out", text: "worst found: 1454 cycles at TUNE=0 DEC=0 TRAN=0 HEAT=0 XL=0 CLIK=0" },
+        { t: 997, s: "out", text: "phase          worst    mean declared  limit  settings at worst" },
+        { t: 997, s: "out", text: "INIT              57      57        -      -  TUNE=75 DEC=102 TRAN=51 HEAT=0 XL=0 CLIK=127" },
+        { t: 997, s: "out", text: "TRIG             252     250        -      -  TUNE=0 DEC=0 TRAN=0 HEAT=0 XL=0 CLIK=0" },
+        { t: 997, s: "out", text: "RENDER          1202    1202     3920   3951  TUNE=75 DEC=102 TRAN=51 HEAT=0 XL=0 CLIK=127" },
+        { t: 997, s: "out", text: "TRIG+RENDER     1454    1452     3920   3951  TUNE=0 DEC=0 TRAN=0 HEAT=0 XL=0 CLIK=0" } ] },
+      { command: "fsdsp56k md syx out/capture/bd-slot1.mds --slot 5 -o out/capture/bd-slot5.syx", exit: 0, ms: 733, lines: [
+ ] } ] },
+    { id: "tx6-sd", title: "TX6 SD, from a SysEx dump", kernel: "tx6-sd", steps: [
+      { command: "fsdsp56k md info fixtures/kitbasher/mds/tx6/sd/sd.syx", exit: 0, ms: 590, lines: [
+        { t: 546, s: "out", text: "sd-slot2: 4140 bytes, CRCs and content ID verify" },
+        { t: 568, s: "out", text: "  TX6 SD INSPIRED (org.kitbasher.tx6.sd-inspired), category TX6, max 3908 cycles per track" },
+        { t: 568, s: "out", text: "    param 1: TUNE Raw14 default 64 range 0..127" },
+        { t: 568, s: "out", text: "    param 2: DEC  Raw14 default 102 range 0..127" },
+        { t: 568, s: "out", text: "    param 3: SNAP Raw14 default 95 range 0..127" },
+        { t: 568, s: "out", text: "    param 4: COLR Raw14 default 64 range 0..127" },
+        { t: 568, s: "out", text: "    param 5: BODY Raw14 default 127 range 0..127" },
+        { t: 579, s: "out", text: "  program 1192 words, INIT $0000 TRIG $000c RENDER $007b, workset X 26 Y 6" },
+        { t: 580, s: "out", text: "  relocations $0006 $001e $0023 $002e $0034 $003f $0045 $004f $0055 $0074 $0080 $0086 $0088 $008c $00b5 $00d0 $00e7 $011b $0125" },
+        { t: 581, s: "out", text: "  import $00b3 kind 4 symbol 8" },
+        { t: 581, s: "out", text: "  import $00c0 kind 3 symbol 7" },
+        { t: 581, s: "out", text: "  import $00cc kind 3 symbol 7" },
+        { t: 581, s: "out", text: "  import $00ce kind 4 symbol 8" },
+        { t: 581, s: "out", text: "  import $00e1 kind 3 symbol 7" },
+        { t: 581, s: "out", text: "  import $0117 kind 3 symbol 7" },
+        { t: 581, s: "out", text: "  import $0119 kind 4 symbol 8" } ] },
+      { command: "fsdsp56k stress fixtures/kitbasher/mds/tx6/sd/sd.syx", exit: 0, ms: 874, lines: [
+        { t: 627, s: "out", text: "" },
+        { t: 627, s: "out", text: "== sd-slot2: TX6 SD INSPIRED (org.kitbasher.tx6.sd-inspired), declared 3908 cycles, limit 3951" },
+        { t: 807, s: "out", text: "sd-slot2: 49 cases (exhaustive), 16 RENDER blocks each; cycles JSR to STOP, service stand-ins included" },
+        { t: 864, s: "out", text: "phase          worst    mean declared  limit  settings at worst" },
+        { t: 864, s: "out", text: "INIT              57      57        -      -  TUNE=64 DEC=102 SNAP=95 COLR=64 BODY=127" },
+        { t: 864, s: "out", text: "TRIG             244     244        -      -  TUNE=64 DEC=102 SNAP=95 COLR=64 BODY=127" },
+        { t: 864, s: "out", text: "RENDER          1276    1260     3908   3951  TUNE=64 DEC=0 SNAP=95 COLR=64 BODY=127" },
+        { t: 864, s: "out", text: "TRIG+RENDER     1520    1504     3908   3951  TUNE=64 DEC=0 SNAP=95 COLR=64 BODY=127" } ] } ] },
+    { id: "tx6-ch", title: "TX6 CH, from a SysEx dump", kernel: "tx6-ch", steps: [
+      { command: "fsdsp56k md info fixtures/kitbasher/mds/tx6/ch/ch.syx", exit: 0, ms: 517, lines: [
+        { t: 487, s: "out", text: "ch-slot5: 4468 bytes, CRCs and content ID verify" },
+        { t: 502, s: "out", text: "  TX6 CLOSED HAT (org.kitbasher.tx6.ch), category TX6, max 3944 cycles per track" },
+        { t: 502, s: "out", text: "    param 1: TUNE Raw14 default 64 range 0..127" },
+        { t: 502, s: "out", text: "    param 2: DEC  Raw14 default 89 range 0..127" },
+        { t: 502, s: "out", text: "    param 3: METL Raw14 default 64 range 0..127" },
+        { t: 509, s: "out", text: "  program 1295 words, INIT $0000 TRIG $000c RENDER $0050, workset X 26 Y 4" },
+        { t: 510, s: "out", text: "  relocations $0006 $001d $0022 $002d $0033 $0047 $0055 $00b2 $00cf $00e6 $00f3 $0102 $010c" },
+        { t: 511, s: "out", text: "  import $00a9 kind 4 symbol 8" },
+        { t: 511, s: "out", text: "  import $00bd kind 3 symbol 7" },
+        { t: 511, s: "out", text: "  import $00c9 kind 3 symbol 7" },
+        { t: 511, s: "out", text: "  import $00cb kind 4 symbol 8" },
+        { t: 511, s: "out", text: "  import $00e1 kind 3 symbol 7" },
+        { t: 511, s: "out", text: "  import $00ee kind 3 symbol 7" },
+        { t: 511, s: "out", text: "  import $00fe kind 3 symbol 7" },
+        { t: 511, s: "out", text: "  import $0100 kind 4 symbol 8" } ] },
+      { command: "fsdsp56k stress fixtures/kitbasher/mds/tx6/ch/ch.syx", exit: 0, ms: 791, lines: [
+        { t: 550, s: "out", text: "" },
+        { t: 551, s: "out", text: "== ch-slot5: TX6 CLOSED HAT (org.kitbasher.tx6.ch), declared 3944 cycles, limit 3951" },
+        { t: 742, s: "out", text: "ch-slot5: 31 cases (exhaustive), 16 RENDER blocks each; cycles JSR to STOP, service stand-ins included" },
+        { t: 782, s: "out", text: "phase          worst    mean declared  limit  settings at worst" },
+        { t: 782, s: "out", text: "INIT              57      57        -      -  TUNE=64 DEC=89 METL=64" },
+        { t: 782, s: "out", text: "TRIG             206     206        -      -  TUNE=64 DEC=89 METL=64" },
+        { t: 782, s: "out", text: "RENDER          1312    1312     3944   3951  TUNE=64 DEC=89 METL=64" },
+        { t: 782, s: "out", text: "TRIG+RENDER     1518    1518     3944   3951  TUNE=64 DEC=89 METL=64" } ] } ] }
+  ]
+});

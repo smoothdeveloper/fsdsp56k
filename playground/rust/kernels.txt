@@ -1,0 +1,10 @@
+sine
+pluck
+tx6-bd
+tx6-sd
+tx6-cp
+tx6-lt
+tx6-ht
+tx6-ch
+tx6-oh
+tx6-cy

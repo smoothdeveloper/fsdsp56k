@@ -1,0 +1,546 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fsdsp56k · README</title>
+<script>
+  // the theme before the first paint: stored choice, else the system's
+  (function () {
+    var t = null; try { t = localStorage.getItem('fsdsp56k.theme'); } catch (e) { }
+    var q = new URLSearchParams(location.search).get('theme');
+    if (q === 'dark' || q === 'light') t = q;
+    if (t !== 'dark' && t !== 'light') t = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+    document.documentElement.dataset.theme = t;
+  })();
+</script>
+<script src="assets/js/fonts.js"></script>
+<link rel="stylesheet" href="fonts.css">
+<link rel="stylesheet" href="assets/css/theme.css">
+<link rel="stylesheet" href="assets/css/readme.css">
+<link rel="icon" href="assets/logo/house-rest.png">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="in">
+    <a class="brand" href="index.html"><img src="assets/logo/house-rest.svg" alt=""><span class="wordmark"><span class="fs">fs</span><span class="dot">·</span>dsp<span class="dot">·</span>56k</span><span class="sub">README</span></a>
+    <div class="right">
+      <button type="button" class="chip toc-toggle" id="toc-toggle" aria-expanded="false" aria-controls="toc">☰ Contents</button>
+      <div class="dock-slot" data-type-dock></div>
+      <div class="chips" role="group" aria-label="Theme">
+        <button type="button" class="chip" data-theme-pick="dark">◐ dark</button>
+        <button type="button" class="chip" data-theme-pick="light">◑ light</button>
+      </div>
+      <a class="hide-sm" href="index.html">Home</a>
+      <a class="hide-sm" href="https://github.com/smoothdeveloper/fsdsp56k">GitHub</a>
+    </div>
+  </div>
+</header>
+
+<div class="layout">
+<aside class="toc" id="toc" aria-label="Contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#overview">Overview</a>
+      <ol>
+        <li><a href="#what-you-get">What you get</a></li>
+        <li><a href="#assembly-as-fsharp">Assembly as F#</a></li>
+      </ol>
+    </li>
+    <li><a href="#getting-started">Getting started</a></li>
+    <li><a href="#commands">Commands</a>
+      <ol>
+        <li><a href="#cmd-asm">asm</a></li>
+        <li><a href="#cmd-check">check</a></li>
+        <li><a href="#cmd-disasm">disasm</a></li>
+        <li><a href="#cmd-import">import</a></li>
+        <li><a href="#cmd-md-info">md info</a></li>
+        <li><a href="#cmd-md-pack">md pack</a></li>
+        <li><a href="#cmd-md-syx">md syx</a></li>
+        <li><a href="#cmd-md-unsyx">md unsyx</a></li>
+        <li><a href="#cmd-run">run</a></li>
+        <li><a href="#cmd-stress">stress</a></li>
+        <li><a href="#cmd-audition">audition</a></li>
+        <li><a href="#cmd-audition-midi">audition --midi-in</a></li>
+      </ol>
+    </li>
+    <li><a href="#kernels">Kernels</a>
+      <ol>
+        <li><a href="#pipeline">From F# to a running machine</a></li>
+        <li><a href="#portable">The prototype beyond .NET</a></li>
+        <li><a href="#declares">What a kernel declares</a></li>
+        <li><a href="#minimal-kernel">A minimal kernel</a></li>
+        <li><a href="#can-use">What kernels can use</a></li>
+        <li><a href="#fixtures">The fixture machines</a></li>
+        <li><a href="#grade-output">What a grade writes</a></li>
+      </ol>
+    </li>
+    <li><a href="#layers">Layers</a></li>
+    <li><a href="#dsl">The DSL</a></li>
+    <li><a href="#credits">Credits</a></li>
+    <li><a href="#licence">Licence</a></li>
+  </ol>
+  <div class="toc-meta">
+    <h2>Theme</h2>
+    <div class="chips" role="group" aria-label="Theme">
+      <button type="button" class="chip" data-theme-pick="dark">◐ dark</button>
+      <button type="button" class="chip" data-theme-pick="light">◑ light</button>
+    </div>
+  </div>
+</aside>
+
+<article class="doc">
+
+<div class="doc-hero" id="overview">
+  <img class="banner px" src="assets/lettering/banner-fsdsp56k@2x.png" width="1536" height="288" alt="fsdsp56k">
+  <p class="lead">F# tooling for the Motorola DSP56300 family, and on top of it, a workflow for writing Machinedrum machines: MDS packages for X.20, the MDX custom firmware.</p>
+  <div class="badges">
+    <span class="badge"><b>F#</b> .NET</span>
+    <span class="badge"><b>Fable</b> JavaScript · Rust</span>
+    <span class="badge"><b>DSP56300</b> assembler · disassembler · oracle</span>
+    <span class="badge"><b>MDS</b> packages · SysEx</span>
+    <span class="badge"><b>AGPL</b>-3.0-or-later</span>
+  </div>
+</div>
+
+<p>Writing a machine for the Machinedrum's DSP usually starts and ends in hand-written assembly: you write it, assemble it with Motorola's <code>asm56300</code>, pack it with the MDS tools, send it over SysEx, and listen. The MDS standard asks you to measure each machine's worst-case cycles before you declare them. That is a long way to go before you hear whether an idea is any good.</p>
+<p>fsdsp56k shortens that loop. You can prototype a machine in F# and run it as ordinary code: test it, step through it in a debugger, and save the words it renders as a WAV with one call (<code>Audio.writeWav</code>), with no emulator and no hardware. The prototype runs natively on .NET, and <a href="https://fable.io">Fable</a> compiles the same functions to JavaScript and to Rust (native or WebAssembly, down to a browser AudioWorklet); we have used both. When the idea is worth it, the same code compiles to DSP56300 assembly, and fsdsp56k allows you to audition and render your kernels, checked word for word against the prototype. Only then do you need to spend effort on hand optimisation and on the real machine.</p>
+
+<p>Some questions, if this kind of DSP work interests you:</p>
+<ul class="questions">
+  <li>Ready to write 100% hand assembly from day one, or would you rather hear an idea before you count cycles?</li>
+  <li>Would you like to know that your optimised version still produces the same words as the version you understood?</li>
+  <li>Want to see, line by line, which F# turned into which instruction, and where the cycles go?</li>
+  <li>Would a set of real, shipped machines as a regression suite make you braver about changing things?</li>
+</ul>
+
+<h3 id="what-you-get">What you get<a class="anchor" href="#what-you-get">#</a></h3>
+<p>If some of these are yes, this is what fsdsp56k gives you:</p>
+<ul class="features">
+  <li><strong>An F# prototype.</strong> A machine is a module of three functions (<code>init</code>, <code>trig</code>, <code>render</code>) over fixed-point types that behave like the DSP's own arithmetic.</li>
+  <li><strong>A prototype that runs where you work.</strong> The same functions run natively on .NET (<code>Host.Instance</code>), the meaning the compiled program is held to, and through Fable as JavaScript and Rust, checked word for word against it.</li>
+  <li><strong>Audition, render, grade.</strong> The compiled program runs on the DSP56300 emulator with an MDS-style workset; its output and state are compared word for word with the prototype and, for ported machines, with the shipped original. Every call's cycles are measured against the per-track limit.</li>
+  <li><strong>An optimiser.</strong> The compiler's passes trim reloads and spills, keep hot values in registers and pack parallel moves. On the fixture machines, the compiled code takes about 1.4 to 2.8 times the RENDER cycles of the hand-written originals, with a lot of room to improve.</li>
+  <li><strong>MDS packages.</strong> The compiled program becomes an MDS package with its relocations and imports. For hand-written machines, the command line assembles, checks against the dsp56300 oracle, packs, converts to and from SysEx, disassembles, and renders with a WAV and a cycle report.</li>
+  <li><strong>A real test suite.</strong> All eight drums of kitbasher's TX6 kit and Justin Mammarella's four MDS examples are ported and graded on every test run, each identical, word for word, to the machine it was ported from.</li>
+</ul>
+
+<h3 id="assembly-as-fsharp">Assembly as F#<a class="anchor" href="#assembly-as-fsharp">#</a></h3>
+<p>You can also skip the kernel layer and write the assembly yourself, in F#. Plain assembly shares code through <code>include</code>, <code>equ</code>, <code>define</code> and conditional assembly, and it does that well: in the MDS sample-playback examples, four machines are each a few <code>equ</code> lines over one shared <code>sample_player.inc</code>. The DSL writes DSP56300 programs as F# arrays of instructions, so the same ideas become ordinary F#: a routine is a function of its labels, offsets and counts, a <code>for</code> loop unrolls it, and an <code>if</code> chooses its shape when the program is built.</p>
+<div class="code-head"><span class="dots"><i></i><i></i><i></i></span>ClearY.fsx</div>
+<pre class="code" data-lang="fsharp"><code>open dsp56k.dsl
+open dsp56k.dsl.Asm
+
+/// Clear `count` Y words from (r6+first): unrolled when short, a DO loop when long.
+let clearY name first count = [|
+  label name
+  clr a
+  if count &lt;= 4 then
+    for i in 0 .. count - 1 do
+      move a (ym (disp r6 (first + i)))
+  else
+    move r6 r0
+    move (imm first) n0
+    update (incN r0)
+    doTo (imm count) $"{name}_end"
+    move a (ym (inc r0))
+    label $"{name}_end"
+  rts |]
+
+let program = Array.concat [ clearY "INIT" 9 19; clearY "TRIG" 12 3 ]
+let listing = Program.source program   // INIT as a DO loop, TRIG as three moves
+let words   = Program.words program    // 13 P words</code></pre>
+<p>The assembler, disassembler and emulator work on any DSP56300 code, whether it was written this way or by hand.</p>
+
+<h2 id="getting-started">Getting started<a class="anchor" href="#getting-started">#</a></h2>
+<p>You need the .NET SDK and a Rust toolchain: <code>native/</code> builds the DSP56300 oracle and emulator.</p>
+<div class="code-head"><span class="dots"><i></i><i></i><i></i></span>build</div>
+<pre class="code" data-lang="shell"><code>$ git clone https://github.com/smoothdeveloper/fsdsp56k
+$ cd fsdsp56k
+$ dotnet tool restore &amp;&amp; dotnet paket install
+$ (cd native &amp;&amp; cargo build --release)      # oracle, emulator, import, run</code></pre>
+<p>Then render a kernel to a WAV, with its cycle report:</p>
+<div class="code-head"><span class="dots"><i></i><i></i><i></i></span>first render</div>
+<pre class="code" data-lang="shell"><code>$ dotnet run --project src/dsp56k.tool -- run tests/dsp56k.tests/Kernels/Sine.fs --wav sine.wav</code></pre>
+<p>And the tests, which grade every fixture machine (fetch the shipped machines they compare against first, with <code>scripts/fetch-fixtures</code>):</p>
+<div class="code-head"><span class="dots"><i></i><i></i><i></i></span>test</div>
+<pre class="code" data-lang="shell"><code>$ dotnet run --project tests/dsp56k.tests</code></pre>
+<div class="todo"><b>TODO</b>Check the first-render line against the released CLI (kernel path and flags), and add a packaged install (<code>dotnet tool install</code>) once it is published.</div>
+
+<h2 id="commands">Commands<a class="anchor" href="#commands">#</a></h2>
+<img class="rule-img px" src="assets/lettering/heading-commands@2x.png" width="1536" height="192" alt="">
+<p>DSP56300 commands work on any code for the chip; a host's commands live under its name (today the Machinedrum: <code>machinedrum</code>, or <code>md</code>). <code>run</code>, <code>stress</code> and <code>audition</code> take a machine for a host (<code>--host</code>, default <code>machinedrum</code>): an MDS package or SysEx dump, or an F# kernel as a project, a script or one file (<code>--kernel</code> picks one when it defines several). <code>fsdsp56k &lt;command&gt; --help</code> lists every flag.</p>
+<div class="table-wrap">
+<table class="cmds">
+  <thead><tr><th></th><th>Command</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td class="card"><a href="#cmd-asm"><img src="assets/cards/cmd-asm.svg" alt="asm"></a></td><td class="name"><a href="#cmd-asm">asm</a></td><td>Assemble a Motorola-syntax source to a listing and P-memory hex.</td></tr>
+    <tr><td class="card"><a href="#cmd-check"><img src="assets/cards/cmd-check.svg" alt="check"></a></td><td class="name"><a href="#cmd-check">check</a></td><td>Assemble, then confirm every instruction against the dsp56300 oracle.</td></tr>
+    <tr><td class="card"><a href="#cmd-disasm"><img src="assets/cards/cmd-disasm.svg" alt="disasm"></a></td><td class="name"><a href="#cmd-disasm">disasm</a></td><td>Recover a package's program (from a .mds or .syx) as Motorola-syntax source.</td></tr>
+    <tr><td class="card"><a href="#cmd-import"><img src="assets/cards/cmd-import.svg" alt="import"></a></td><td class="name"><a href="#cmd-import">import</a></td><td>Turn a listing or a package into F# DSL source.</td></tr>
+    <tr><td class="card"><a href="#cmd-md-info"><img src="assets/cards/cmd-machinedrum-info.svg" alt="md info"></a></td><td class="name"><a href="#cmd-md-info">machinedrum info</a></td><td>Show a package's header, parameters, patches and checks.</td></tr>
+    <tr><td class="card"><a href="#cmd-md-pack"><img src="assets/cards/cmd-machinedrum-pack.svg" alt="md pack"></a></td><td class="name"><a href="#cmd-md-pack">machinedrum pack</a></td><td>Assemble a program and pack it with its MDS definition (and an optional sprite).</td></tr>
+    <tr><td class="card"><a href="#cmd-md-syx"><img src="assets/cards/cmd-machinedrum-syx.svg" alt="md syx"></a></td><td class="name"><a href="#cmd-md-syx">machinedrum syx</a></td><td>Turn a package into a SysEx dump for a slot.</td></tr>
+    <tr><td class="card"><a href="#cmd-md-unsyx"><img src="assets/cards/cmd-machinedrum-unsyx.svg" alt="md unsyx"></a></td><td class="name"><a href="#cmd-md-unsyx">machinedrum unsyx</a></td><td>Split a SysEx dump back into packages.</td></tr>
+    <tr><td class="card"><a href="#cmd-run"><img src="assets/cards/cmd-run.svg" alt="run"></a></td><td class="name"><a href="#cmd-run">run</a></td><td>Render a machine: a 24-bit WAV, per-call cycles against the limit, and <code>--profile</code> hot spots.</td></tr>
+    <tr><td class="card"><a href="#cmd-stress"><img src="assets/cards/cmd-stress.svg" alt="stress (sketch)"></a></td><td class="name"><a href="#cmd-stress">stress</a><span class="sketch-tag">sketch</span></td><td>Sweep the parameters or search for the worst case, and report the worst INIT, TRIG and RENDER cycles with the settings that cause them.</td></tr>
+    <tr><td class="card"><a href="#cmd-audition"><img src="assets/cards/cmd-audition.svg" alt="audition (sketch)"></a></td><td class="name"><a href="#cmd-audition">audition</a><span class="sketch-tag">sketch</span></td><td>Play a machine live through the sound card, retriggered with <code>--trig-every</code>.</td></tr>
+    <tr><td class="card"><a href="#cmd-audition-midi"><img src="assets/cards/cmd-midi.svg" alt="audition --midi-in (sketch)"></a></td><td class="name"><a href="#cmd-audition-midi">audition --midi-in</a><span class="sketch-tag">sketch</span></td><td>Trigger it and turn its parameters from a MIDI controller; <code>--midi-out</code> mirrors it to a real Machinedrum or other gear.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<section class="cmd-section" id="cmd-asm">
+  <header><img src="assets/cards/cmd-asm.svg" alt=""><h3>asm</h3></header>
+  <p>Assemble a Motorola-syntax source to a listing and P-memory hex, with <code>asm56300</code>'s sizing rule and its <code>include</code>, <code>define</code>, <code>macro</code> and <code>if</code>.</p>
+  <div class="synopsis"><pre class="code" data-lang="shell"><code>fsdsp56k asm src.asm [-I dir] [-D NAME=VALUE] [-l out.lst] [--hex out.hex]</code></pre></div>
+  <h4>Options</h4><div class="todo"><b>TODO</b>Every flag, its default and an example.</div>
+  <h4>Workflows</h4><div class="todo"><b>TODO</b>Assembling a machine split over includes; comparing the listing with <code>asm56300</code>'s.</div>
+</section>
+<section class="cmd-section" id="cmd-check">
+  <header><img src="assets/cards/cmd-check.svg" alt=""><h3>check</h3></header>
+  <p>Assemble, then confirm every instruction against the dsp56300 oracle: the encoding and the printed text must agree.</p>
+  <div class="synopsis"><pre class="code" data-lang="shell"><code>fsdsp56k check src.asm [-I dir] [-D NAME=VALUE]</code></pre></div>
+  <h4>Options</h4><div class="todo"><b>TODO</b>Every flag; what a mismatch report looks like.</div>
+  <h4>Workflows</h4><div class="todo"><b>TODO</b>Using <code>check</code> before packing a hand-written machine.</div>
+</section>
+<section class="cmd-section" id="cmd-disasm">
+  <header><img src="assets/cards/cmd-disasm.svg" alt=""><h3>disasm</h3></header>
+  <p>Recover a package's program, from a <code>.mds</code> or a <code>.syx</code>, as Motorola-syntax source with labels, entry points and patch markers.</p>
+  <div class="synopsis"><pre class="code" data-lang="shell"><code>fsdsp56k disasm machine.mds|machine.syx [--slot n]</code></pre></div>
+  <h4>Options</h4><div class="todo"><b>TODO</b>Every flag, and how slots are numbered in a dump.</div>
+  <h4>Workflows</h4><div class="todo"><b>TODO</b>Studying one of your own packages; reassembling the result with <code>asm</code>.</div>
+</section>
+<section class="cmd-section" id="cmd-import">
+  <header><img src="assets/cards/cmd-import.svg" alt=""><h3>import</h3></header>
+  <p>Turn a listing or a package into F# DSL source, ready to parameterise and share between machines.</p>
+  <div class="synopsis"><pre class="code" data-lang="shell"><code>fsdsp56k import src.asm|machine.mds|machine.syx [-m Module] [-o out.fs]</code></pre></div>
+  <h4>Options</h4><div class="todo"><b>TODO</b>Every flag; naming of the generated module and labels.</div>
+  <h4>Workflows</h4><div class="todo"><b>TODO</b>From a hand-written machine to an F# DSL program that rebuilds it word for word.</div>
+</section>
+<section class="cmd-section" id="cmd-md-info">
+  <header><img src="assets/cards/cmd-machinedrum-info.svg" alt=""><h3><span class="grp">machinedrum</span> info</h3></header>
+  <p>Show a package's header, parameters, patches and checks. <code>md</code> is short for <code>machinedrum</code>.</p>
+  <div class="synopsis"><pre class="code" data-lang="shell"><code>fsdsp56k md info machine.mds</code></pre></div>
+  <h4>Options</h4><div class="todo"><b>TODO</b>Every flag; what each check means.</div>
+  <h4>Workflows</h4><div class="todo"><b>TODO</b>Checking a package before sending it.</div>
+</section>
+<section class="cmd-section" id="cmd-md-pack">
+  <header><img src="assets/cards/cmd-machinedrum-pack.svg" alt=""><h3><span class="grp">machinedrum</span> pack</h3></header>
+  <p>Assemble a program and pack it with its MDS definition, the same one <code>mds_pack.py</code> reads, and an optional sprite.</p>
+  <div class="synopsis"><pre class="code" data-lang="shell"><code>fsdsp56k md pack …</code></pre></div>
+  <h4>Options</h4><div class="todo"><b>TODO</b>The synopsis, every flag, the sprite format.</div>
+  <h4>Workflows</h4><div class="todo"><b>TODO</b>A hand-written machine from source to package; a compiled kernel to package.</div>
+</section>
+<section class="cmd-section" id="cmd-md-syx">
+  <header><img src="assets/cards/cmd-machinedrum-syx.svg" alt=""><h3><span class="grp">machinedrum</span> syx</h3></header>
+  <p>Turn a package into a SysEx dump for a slot.</p>
+  <div class="synopsis"><pre class="code" data-lang="shell"><code>fsdsp56k md syx machine.mds …</code></pre></div>
+  <h4>Options</h4><div class="todo"><b>TODO</b>The synopsis, slots, every flag.</div>
+  <h4>Workflows</h4><div class="todo"><b>TODO</b>Sending the dump to a Machinedrum running X.20.</div>
+</section>
+<section class="cmd-section" id="cmd-md-unsyx">
+  <header><img src="assets/cards/cmd-machinedrum-unsyx.svg" alt=""><h3><span class="grp">machinedrum</span> unsyx</h3></header>
+  <p>Split a SysEx dump back into packages.</p>
+  <div class="synopsis"><pre class="code" data-lang="shell"><code>fsdsp56k md unsyx dump.syx …</code></pre></div>
+  <h4>Options</h4><div class="todo"><b>TODO</b>The synopsis, where the packages are written, every flag.</div>
+  <h4>Workflows</h4><div class="todo"><b>TODO</b>Round-tripping a dump through <code>syx</code> and <code>unsyx</code>.</div>
+</section>
+<section class="cmd-section" id="cmd-run">
+  <header><img src="assets/cards/cmd-run.svg" alt=""><h3>run</h3></header>
+  <p>Render a machine: a 24-bit WAV, per-call cycles against the limit, and <code>--profile</code> hot spots. Takes an MDS package or SysEx dump, or an F# kernel as a project, a script or one file.</p>
+  <div class="synopsis"><pre class="code" data-lang="shell"><code>fsdsp56k run machine.mds|machine.syx|Kernel.fs [--host machinedrum] [--kernel name]
+             [--settings 64,1,…] [--blocks n] [--trig-every n] [--sample in.wav]
+             [--wav out.wav] [--profile]</code></pre></div>
+  <h4>Options</h4><div class="todo"><b>TODO</b>Every flag and its default; the cycle report's columns.</div>
+  <h4>Workflows</h4><div class="todo"><b>TODO</b>Rendering a kernel to a WAV; finding a hot spot with <code>--profile</code>; feeding a sample with <code>--sample</code>.</div>
+</section>
+<section class="cmd-section" id="cmd-stress">
+  <header><img src="assets/cards/cmd-stress.svg" alt=""><h3>stress <span class="sketch-tag">sketch</span></h3></header>
+  <p>Sweep the parameters (<code>--sweep exhaustive</code>, <code>random:N</code>) or search for the worst case (<code>--search anneal:N</code>), and report the worst INIT, TRIG and RENDER cycles with the settings that cause them; <code>--audition</code> plays each case as it goes.</p>
+  <div class="synopsis"><pre class="code" data-lang="shell"><code>fsdsp56k stress Kernel.fs [--sweep exhaustive|random:N] [--search anneal:N] [--audition]</code></pre></div>
+  <h4>Options</h4><div class="todo"><b>TODO</b>Every flag once the command leaves the sketch stage.</div>
+  <h4>Workflows</h4><div class="todo"><b>TODO</b>Finding the worst-case cycles to declare for a machine.</div>
+</section>
+<section class="cmd-section" id="cmd-audition">
+  <header><img src="assets/cards/cmd-audition.svg" alt=""><h3>audition <span class="sketch-tag">sketch</span></h3></header>
+  <p>Play a machine live through the sound card, retriggered with <code>--trig-every</code>.</p>
+  <div class="synopsis"><pre class="code" data-lang="shell"><code>fsdsp56k audition Kernel.fs [--trig-every n]</code></pre></div>
+  <h4>Options</h4><div class="todo"><b>TODO</b>Every flag; choosing the audio device.</div>
+  <h4>Workflows</h4><div class="todo"><b>TODO</b>Editing a kernel while it plays.</div>
+</section>
+<section class="cmd-section" id="cmd-audition-midi">
+  <header><img src="assets/cards/cmd-midi.svg" alt=""><h3>audition --midi-in <span class="sketch-tag">sketch</span></h3></header>
+  <p>Trigger it and turn its parameters from a MIDI controller, in the Machinedrum's default map; <code>--midi-out</code> mirrors it to a real Machinedrum or other gear.</p>
+  <div class="synopsis"><pre class="code" data-lang="shell"><code>fsdsp56k audition Kernel.fs --midi-in &lt;port&gt; [--midi-out &lt;port&gt;]</code></pre></div>
+  <h4>Options</h4><div class="todo"><b>TODO</b>Every flag; listing the MIDI ports; the controller map.</div>
+  <h4>Workflows</h4><div class="todo"><b>TODO</b>Playing a kernel from a controller next to the real machine.</div>
+</section>
+
+<h2 id="kernels">Kernels<a class="anchor" href="#kernels">#</a></h2>
+<img class="rule-img px" src="assets/lettering/heading-kernels@2x.png" width="1536" height="192" alt="">
+<p>A kernel is a Machinedrum machine written as ordinary F# over fixed-point types (<code>Frac</code>, <code>Acc</code>, <code>Long</code>). The same code runs as a prototype, to hear and test it, and compiled to DSP56300 code that the Machinedrum runs. The grade checks that both give the same words.</p>
+
+<h3 id="pipeline">From F# to a running machine<a class="anchor" href="#pipeline">#</a></h3>
+<div class="pipeline" role="img" aria-label="The F# kernel goes through the front end, the IR, the code generator and the optimiser to DSP56300 items and an MDS package, to audition and render; the same F# runs on .NET as the prototype, and the grade compares both.">
+  <div class="lane">
+    <div class="lane-label">compile</div>
+    <div class="node src"><b>F# kernel</b><span>Params, State, init / trig / render</span></div><div class="arrow">→</div>
+    <div class="node"><b>Front end</b><span>the F# compiler's typed tree</span></div><div class="arrow">→</div>
+    <div class="node"><b>IrKernel</b><span>Ir.fs</span></div><div class="arrow">→</div>
+    <div class="node"><b>Code generator</b><span>+ optimiser passes</span></div><div class="arrow">→</div>
+    <div class="node"><b>DSP56300</b><span>listing + P words</span></div><div class="arrow">→</div>
+    <div class="node out"><b>MDS package</b><span>audition, render</span></div>
+  </div>
+  <div class="lane">
+    <div class="lane-label">prototype</div>
+    <div class="node src"><b>F# kernel</b><span>the same functions</span></div><div class="arrow">→</div>
+    <div class="node"><b>.NET</b><span>Host.Instance</span></div><div class="arrow">→</div>
+    <div class="node grade"><b>Grade</b><span>same output and state, word for word?</span></div>
+    <div class="arrow dashed">⇢</div>
+    <div class="node"><b>Fable</b><span>JavaScript, Rust: same words as .NET</span></div>
+  </div>
+</div>
+<ol>
+  <li><strong>Source.</strong> You write a module with a parameter record, a state record and three functions.</li>
+  <li><strong>Front end.</strong> The F# compiler reads the three functions from the source text, and the front end turns them into the compiler's own tree, the <code>IrKernel</code>.</li>
+  <li><strong>Code generator and optimiser.</strong> The generator turns the tree into DSP56300 items. The optimiser passes then shorten it (fewer reloads and spills, registers for hot locals, parallel moves). A kernel too big for an MDS package is refused.</li>
+  <li><strong>Assembly and package.</strong> The items assemble to P words with three entry symbols, <code>INIT</code>, <code>TRIG</code> and <code>RENDER</code>, and are packed as an MDS package with the machine's name and controls.</li>
+  <li><strong>Audition and grade.</strong> fsdsp56k allows you to audition and render your kernels on the DSP56300 emulator, with an MDS-style workset. The grade runs a scenario there, runs the same F# prototype on .NET, and compares output and state word for word, and against the shipped machine when there is one.</li>
+</ol>
+
+<h3 id="portable">The prototype beyond .NET<a class="anchor" href="#portable">#</a></h3>
+<p>The kernel functions are plain F#, so <a href="https://fable.io/docs/">Fable</a> can compile them too. <code>portable/</code> builds the same <code>init</code>, <code>trig</code> and <code>render</code> with Fable to JavaScript and, with Fable's Rust backend, to Rust as WebAssembly and as a native library, and checks each one's output and state after every block against the .NET run, the run the emulator is graded against. SINE, PLUCK and INPUT-THRU pass on every target; the suite is opt-in and not part of the default test run. <code>wasm/</code> plays the Rust/WebAssembly build in a browser AudioWorklet.</p>
+
+<h3 id="declares">What a kernel declares<a class="anchor" href="#declares">#</a></h3>
+<img class="rule-img px" src="assets/lettering/rule-what-a-kernel-declares@2x.png" width="1536" height="108" alt="">
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Part</th><th>In the F#</th><th>On the Machinedrum</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Entry points</strong></td><td><code>init</code>, <code>trig</code> and <code>render</code>, three functions of the kernel's module</td><td><code>INIT</code> to set up, <code>TRIG</code> on each trig, <code>RENDER</code> once per 32-frame block</td></tr>
+    <tr><td><strong>Parameters</strong></td><td>a record of up to 8 <code>Frac</code> fields</td><td>Y:(r6+1) to Y:(r6+8), written by the host from the controls</td></tr>
+    <tr><td><strong>Controls</strong></td><td>not in the kernel: the machine definition names them (<code>PTCH</code>, <code>AMP</code>)</td><td>the front-panel knobs, 0 to 127, converted to the parameter words</td></tr>
+    <tr><td><strong>State</strong></td><td>a record of <code>Frac</code>, <code>Long</code>, <code>Acc</code> and <code>[&lt;Length n&gt;] Frac array</code> fields; <code>[&lt;XMemory&gt;]</code> puts a field in X</td><td>Y:(r6+9) on; X fields from X:(r6+0)</td></tr>
+    <tr><td><strong>Output</strong></td><td><code>out.Write</code> in <code>render</code></td><td>32 mono words at Y:(r7)+</td></tr>
+    <tr><td><strong>Host</strong></td><td>not in the kernel: <code>Kernel.hosts</code> (today the Machinedrum)</td><td>where the words above sit and how the routines are called</td></tr>
+  </tbody>
+</table>
+</div>
+<div class="workset" role="img" aria-label="The host calls INIT, TRIG and RENDER with r6 pointing at the track's 64-word workset; RENDER writes 32 words at Y:(r7)+.">
+  <div class="ws-box"><h5>Host, track t</h5><p>calls <code>INIT</code>, <code>TRIG</code>, <code>RENDER</code> with r6 = the track's workset</p></div>
+  <div class="ws-box"><h5>The workset · 64 words, r6-relative</h5>
+    <div class="memmap">
+      <div class="p"><span>Y+1 … Y+8</span><em>parameters</em></div>
+      <div class="s"><span>Y+9 … Y+63</span><em>state</em></div>
+      <div class="x"><span>X+0 … X+63</span><em>XMemory fields, then locals and spills</em></div>
+    </div>
+  </div>
+  <div class="ws-box"><h5>RENDER writes</h5><p>32 output words at <code>Y:(r7)+</code></p></div>
+</div>
+<p>Each track's workset is 64-word aligned on the Machinedrum. That is why a ring over state (modulo addressing) is allowed there.</p>
+
+<h3 id="minimal-kernel">A minimal kernel<a class="anchor" href="#minimal-kernel">#</a></h3>
+<p>The sine generator from Justin Mammarella's MDS examples, from <code>tests/dsp56k.tests/Kernels/Sine.fs</code>:</p>
+<div class="code-head"><span class="dots"><i></i><i></i><i></i></span>tests/dsp56k.tests/Kernels/Sine.fs</div>
+<pre class="code" data-lang="fsharp"><code>module samples.kernels.Sine
+
+open dsp56k.kernel
+open dsp56k.kernel.Units
+
+type Params =
+  { pitch : Frac&lt;Hz&gt;      // the host's pitch increment
+    amp   : Frac&lt;ratio&gt; } // unsigned Q23
+
+type State =
+  { mutable phase   : Long    // Y+9..10: table index . fraction
+    mutable ampPrev : Frac }  // Y+11: the amplitude the last block ended on
+
+let init (_: Params) (s: State) =
+  s.phase &lt;- Long.zero
+  s.ampPrev &lt;- Frac.one
+
+let trig (_: Params) (s: State) =
+  s.phase &lt;- Long.zero
+
+let render (p: Params) (s: State) (out: Output) =
+  let step = Acc.ofFrac (plain p.pitch) &gt;&gt;&gt; 6                        // P / 64 table words per frame
+  let ramp = (Acc.ofFrac (plain p.amp) - Acc.ofFrac s.ampPrev) &gt;&gt;&gt; 5  // the gain reaches AMP over the block
+  let mutable gain = Acc.ofFrac s.ampPrev
+  let mutable phase = Acc.ofLong s.phase
+  for _ in 0 .. 31 do
+    gain &lt;- gain + ramp
+    let v = Table.read Rom.sine (Acc.hi phase)
+    out.Write(Acc.sat ((v * Acc.hi gain) &gt;&gt;&gt; 2))
+    phase &lt;- Acc.andHi 0x7fff (phase + step)
+  s.phase &lt;- Long.ofAcc phase
+  s.ampPrev &lt;- plain p.amp</code></pre>
+
+<h3 id="can-use">What kernels can use<a class="anchor" href="#can-use">#</a></h3>
+<ul>
+  <li><strong>Arithmetic:</strong> <code>Frac</code>, <code>Acc</code> and <code>Long</code> with the DSP's own rounding and saturation, MPYR/MACR, and an LFSR step. Each operation has an F# meaning that the tests check against the emulator.</li>
+  <li><strong>State:</strong> <code>Frac</code>, <code>Long</code> (two words), <code>Acc</code> (three words, exact) and fixed-length <code>Frac</code> arrays, indexed by a constant, the loop index (<code>s.h[i + 1]</code>), or a run-time word (<code>s.h[Frac.index k]</code>). In the prototype an index outside the array fails; on the DSP it reaches another word.</li>
+  <li><strong>Cursors:</strong> an address register walking a state array or a region, linear (<code>Cursor.linearIn s.h start step</code>) or as a ring (<code>Cursor.ringIn</code>, modulo addressing). A ring must start on a multiple of the power of two at or above its length; the compiler says so otherwise.</li>
+  <li><strong>The Machinedrum's resources:</strong> the sine table, the input and main-output rings and their position words, the shared temporary memory, and tables placed in program memory.</li>
+  <li><strong>Helpers:</strong> ordinary functions, inlined, which may take the parameter and state records. Where argument effects could interact they run left to right, as in the prototype. <code>[&lt;Subroutine&gt;]</code> makes one a called routine instead.</li>
+</ul>
+<p>A voice record read when compiling picks the code: the TX6 toms and hats are one engine each, and LT's glide (<code>if voice.glide</code>) or CY's bell layer (<code>match voice.layer with ...</code>) is decided at compile time, so each kernel holds only its own code.</p>
+
+<h3 id="fixtures">The fixture machines<a class="anchor" href="#fixtures">#</a></h3>
+<p>The TX6 kit's eight drums, by Matthew Fecher (AnalogMatthew) and Fadedlimes, published under the MIT licence in <a href="https://github.com/etcetc000/kitbasher">etcetc000/kitbasher</a>, are the most comprehensive suite of real machines the compiler is held to: glides, layered metal, noise and tables, each reproduced word for word. They are what made the compiler robust; many thanks to their authors.</p>
+<p><code>tests/dsp56k.tests/Kernels</code> ports twelve machines: Justin Mammarella's four MDS examples and all eight drums of kitbasher's TX6 kit (BD, LT, HT, CH, OH, CY, SD, CP, in five kernel files). The tests grade each against the machine it was ported from:</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Kernel</th><th>Ported from</th><th>RENDER cycles</th></tr></thead>
+  <tbody>
+    <tr><td><code>Sine.fs</code></td><td>jmamma/MDS examples/sine</td><td class="ratio">×2.78</td></tr>
+    <tr><td><code>InputThru.fs</code></td><td>jmamma/MDS examples/imports/input_thru</td><td class="ratio">×1.43</td></tr>
+    <tr><td><code>MainTap.fs</code></td><td>jmamma/MDS examples/imports/main_tap</td><td class="ratio">×1.77</td></tr>
+    <tr><td><code>Pluck.fs</code></td><td>jmamma/MDS examples/imports/pluck</td><td class="ratio">×1.55</td></tr>
+    <tr><td><code>Tx6Bd.fs</code></td><td>kitbasher mds/tx6/bd (MIT)</td><td class="ratio">×2.11</td></tr>
+    <tr><td><code>Tx6Tom.fs</code> (LT, HT)</td><td>kitbasher mds/tx6/lt, ht (MIT)</td><td class="ratio">×2.05, ×2.07</td></tr>
+    <tr><td><code>Tx6Metal.fs</code> (CH, OH, CY)</td><td>kitbasher mds/tx6/ch, oh, cy (MIT)</td><td class="ratio">×2.03 each</td></tr>
+    <tr><td><code>Tx6Sd.fs</code></td><td>kitbasher mds/tx6/sd (MIT)</td><td class="ratio">×1.84</td></tr>
+    <tr><td><code>Tx6Cp.fs</code></td><td>kitbasher mds/tx6/cp (MIT)</td><td class="ratio">×1.95</td></tr>
+  </tbody>
+</table>
+</div>
+<p>Each is word for word identical to the shipped machine on the emulator, and to the same F# run as .NET code.</p>
+
+<h3 id="grade-output">What a grade writes<a class="anchor" href="#grade-output">#</a></h3>
+<p>Everything goes under <code>out/kernels/</code> (untracked, and cleared by the run that regenerates it):</p>
+<ul>
+  <li><code>report.html</code>: per kernel, the verdicts, the output against the reference (SVG), the cycles of every call against the track limit, the costs, and three listings side by side: the F#, the generated assembly (hovering a line highlights the F# it came from) and the ported source, each entry point aligned with the reference's disassembly.</li>
+  <li>One folder per machine, grouped by origin (<code>kitbasher/tx6/bd/</code>, <code>jmamma-mds/examples/sine/</code>, …): the compiled kernel's and the reference's output as WAV, the scenario script, an Audacity label track (File &gt; Import &gt; Labels…) and the compiled listing. The tests keep theirs in <code>out/kernels/tests/</code>.</li>
+</ul>
+<p>A scenario plays two bars at 120 BPM as a sequencer would (trigs, parameter locks), then sweeps each control from its default and covers every pair of controls at low, default and high values.</p>
+
+<h2 id="layers">Layers<a class="anchor" href="#layers">#</a></h2>
+<p>The DSP56300 libraries know nothing about the Machinedrum; the Machinedrum libraries build on them; the kernel compiler, the samples and the command-line tool sit on top.</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Path</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td colspan="2"><strong>Pure DSP56300</strong></td></tr>
+    <tr><td><code>src/dsp56k</code></td><td>Typed ISA, encoder, Motorola-syntax printer and parser, two-pass assembler (<code>include</code>, <code>define</code>, <code>macro</code>, <code>if</code>) with asm56300's sizing rule</td></tr>
+    <tr><td><code>src/dsp56k.dsl</code></td><td>The F# DSL: instruction helpers, workset layouts, table generation, optional lowering passes (parallel-move packing, AGU hazards), listing import</td></tr>
+    <tr><td><code>src/dsp56k.native</code>, <code>native</code></td><td>The oracle assembler and disassembler and the JIT emulator, over mborgerson/dsp56300 (MIT)</td></tr>
+    <tr><td colspan="2"><strong>Machinedrum MDS</strong></td></tr>
+    <tr><td><code>src/machinedrum</code></td><td>MDS v1 packages (definitions, byte-exact writer, reader, verification), the machine ABI as DSL helpers, SysEx dumps</td></tr>
+    <tr><td><code>src/machinedrum.run</code></td><td>Runs a package on the DSP56300 emulator with an MDS-style workset: loader relocation and imports, parameter conversion, cycle budgets, WAV I/O</td></tr>
+    <tr><td colspan="2"><strong>Kernels in F#</strong></td></tr>
+    <tr><td><code>src/dsp56k.kernel.intrinsics</code></td><td><code>Frac</code>, <code>Acc</code>, <code>Long</code>, <code>Table</code>, <code>Output</code>: DSP56300 arithmetic as .NET code</td></tr>
+    <tr><td><code>src/dsp56k.kernel</code>, <code>src/dsp56k.kernel.typedtree</code></td><td>The compiler: the front end over the F# compiler's typed tree, the IR, the code generator and the optimiser; a .NET host running the same kernel</td></tr>
+    <tr><td><code>src/dsp56k.kernel.grade</code></td><td>Runs a scenario three ways (.NET kernel, compiled program, reference) and reports correctness, fidelity, cost and listing alignment</td></tr>
+    <tr><td><code>portable</code></td><td>Opt-in direct F# execution: .NET, Fable JavaScript, Fable Rust/WASM; exact sample checks and render timing</td></tr>
+    <tr><td colspan="2"><strong>On top</strong></td></tr>
+    <tr><td><code>src/dsp56k.tool</code></td><td>The <code>fsdsp56k</code> command line</td></tr>
+    <tr><td><code>tests/dsp56k.tests</code></td><td>Expecto tests</td></tr>
+  </tbody>
+</table>
+</div>
+<div class="todo"><b>TODO</b>Re-check this table against the released tree (<code>dsp56k.audio</code>, the samples folder, the host modules).</div>
+
+<h2 id="dsl">The DSL<a class="anchor" href="#dsl">#</a></h2>
+<p>A program is an array of items written with F# functions, so loops, tables and variants are ordinary F# code:</p>
+<div class="code-head"><span class="dots"><i></i><i></i><i></i></span>ClearWorkset.fsx</div>
+<pre class="code" data-lang="fsharp"><code>open dsp56k.dsl
+open dsp56k.dsl.Asm
+
+let clearWorkset = [|
+  label "init"
+  move r6 r0
+  move (imm 9) n0
+  update (incN r0)
+  clr a
+  doTo (imm 19) "init_end"
+  move a (ym (inc r0))
+  label "init_end"
+  rts |]
+
+let words = Program.words clearWorkset        // assembled with the same encoder as listings
+let listing = Program.source clearWorkset     // Motorola syntax, for asm56300 or review</code></pre>
+
+<h2 id="credits">Credits<a class="anchor" href="#credits">#</a></h2>
+<img class="rule-img px" src="assets/lettering/heading-credits@2x.png" width="1536" height="192" alt="">
+<p>fsdsp56k stands on other people's work, and we are grateful for all of it.</p>
+<ul class="credits-list">
+  <li><strong>Motorola</strong>The house of the 68000, for the DSP56000 family (1986), designed to stay close enough to Motorola's microprocessors to be easy to learn, and its DSP56300 generation; and for <code>asm56300</code> and its CLD/LOD tooling, whose dialect and sizing rules our assembler follows. The line passed to Freescale in 2004 and to NXP in 2015, whose Symphony Studio still supports DSP56300 development.</li>
+  <li><strong>Elektron</strong>For the Machinedrum and its original firmware. MDS follows that firmware's machine design, and MDX extends it by patching, which is what lets a Machinedrum run MDS machines today.</li>
+  <li><strong>Justin Mammarella and Yatao Li</strong>For <a href="https://github.com/jmamma/MDX">MDX</a>, the custom Machinedrum firmware. X.20, its 2.0 preview, adds user machines.</li>
+  <li><strong>Justin Mammarella</strong>For <a href="https://github.com/jmamma/MDS">MDS</a>: the machine standard, its tools and its example machines. <code>fsdsp56k machinedrum pack</code> reads the same definitions as <code>mds_pack.py</code>, and four of the examples are part of our test suite.</li>
+  <li><strong>The Usual Suspects</strong>For <a href="https://github.com/dsp56300/dsp56300">dsp56300</a> (GPL-3.0), their DSP56300 emulator, public since 2021 and grown from code first written in 2011. Years of patient work went into it. The optional WebAssembly build compiles their dsp56300 interpreter for playback in the browser. <a href="https://dsp56300.com">dsp56300.com</a></li>
+  <li><strong>Matt Borgerson</strong>For <a href="https://github.com/mborgerson/dsp56300">dsp56300</a> (MIT), a separate DSP56300 toolkit in Rust: an assembler, a disassembler and a JIT emulator, which also runs the DSP cores of the original Xbox's audio processor in <a href="https://xemu.app">xemu</a>, and is checked against real hardware. fsdsp56k uses it natively as the instruction oracle, as the assembler and disassembler its own are checked against, and as the emulator behind <code>run</code>, <code>stress</code>, <code>audition</code> and every grade.</li>
+  <li><strong>The TX6 authors</strong>Matthew Fecher (AnalogMatthew) and Fadedlimes, for the TX6 drum kit in <a href="https://github.com/etcetc000/kitbasher">kitbasher</a>. Its DSP sources are MIT-licensed, and all eight drums are ported and graded here.</li>
+</ul>
+
+<h2 id="licence">Licence<a class="anchor" href="#licence">#</a></h2>
+<p>fsdsp56k is free software under the GNU Affero General Public License, version 3 or (at your option) any later version (AGPL-3.0-or-later); the full text is in <code>LICENSE</code>. The crates in <code>native/</code> and <code>portable/</code> carry the same licence. The ported machines credit their authors and keep their terms (<code>THIRD-PARTY-NOTICES.md</code>); dependencies keep theirs (mborgerson/dsp56300: MIT; the dsp56300 interpreter the WebAssembly build compiles: GPL-3.0, not in this repository).</p>
+
+<p class="doc-foot">An independent project, not affiliated with or endorsed by Elektron. Machinedrum is a trademark of its owner. · <a href="index.html">Home</a> · <a href="#overview">Top ↑</a></p>
+</article>
+</div>
+
+<script src="assets/js/highlight.js"></script>
+<script>
+(() => {
+  // the theme chips
+  const root = document.documentElement;
+  const picks = document.querySelectorAll('[data-theme-pick]');
+  const sync = () => picks.forEach(b => b.setAttribute('aria-pressed', String(b.dataset.themePick === root.dataset.theme)));
+  picks.forEach(b => b.addEventListener('click', () => {
+    root.dataset.theme = b.dataset.themePick;
+    try { localStorage.setItem('fsdsp56k.theme', b.dataset.themePick); } catch (e) { }
+    sync();
+  }));
+  sync();
+
+  // the contents on small screens
+  const toc = document.getElementById('toc'), toggle = document.getElementById('toc-toggle');
+  toggle.addEventListener('click', () => { const open = toc.classList.toggle('open'); toggle.setAttribute('aria-expanded', String(open)); });
+  toc.addEventListener('click', e => { if (e.target.closest('a')) { toc.classList.remove('open'); toggle.setAttribute('aria-expanded', 'false'); } });
+
+  // the contents follow the reading position: the active entry is the last heading above the reading line (a
+  // quarter down the window, under the top bar); its section's entry is marked as the one it sits in. At the end of
+  // the page the last heading on screen wins, so the final short sections can be reached. The list itself scrolls to
+  // keep the entry in view (never the window).
+  const links = new Map([...toc.querySelectorAll('a[href^="#"]')].map(a => [a.getAttribute('href').slice(1), a]));
+  const targets = [...links.keys()].map(id => document.getElementById(id)).filter(Boolean);
+  let current = null, clicked = null;
+  const mark = id => {
+    if (id === current) return; current = id;
+    links.forEach(a => a.classList.remove('active', 'within'));
+    const a = links.get(id); if (!a) return;
+    a.classList.add('active');
+    const parent = a.closest('ol').closest('li');
+    if (parent) parent.querySelector(':scope > a').classList.add('within');
+    if (getComputedStyle(toc).position === 'sticky') {
+      const t = toc.getBoundingClientRect(), r = a.getBoundingClientRect();
+      if (r.top < t.top + 40) toc.scrollTop -= (t.top + 40 - r.top);
+      else if (r.bottom > t.bottom - 40) toc.scrollTop += (r.bottom - t.bottom + 40);
+    }
+  };
+  const onScroll = () => {
+    if (clicked) return;
+    const line = 58 + Math.min(160, innerHeight * 0.25);
+    let best = targets[0];
+    for (const t of targets) if (t.getBoundingClientRect().top <= line) best = t;
+    if (innerHeight + scrollY >= document.documentElement.scrollHeight - 4) {
+      for (const t of targets) { const top = t.getBoundingClientRect().top; if (top < innerHeight - 40 && top > line) best = t; }
+    }
+    if (best) mark(best.id);
+  };
+  // a click in the contents marks its entry at once, whatever the scroll lands on
+  toc.addEventListener('click', e => {
+    const a = e.target.closest('a[href^="#"]'); if (!a) return;
+    mark(a.getAttribute('href').slice(1)); clicked = true;
+    clearTimeout(onScroll.t); onScroll.t = setTimeout(() => { clicked = null; }, 900);
+  });
+  addEventListener('scroll', () => { if (clicked) { clearTimeout(onScroll.t); onScroll.t = setTimeout(() => { clicked = null; }, 160); } else onScroll(); }, { passive: true });
+  addEventListener('hashchange', () => { const id = location.hash.slice(1); if (links.has(id)) mark(id); });
+  if (links.has(location.hash.slice(1))) mark(location.hash.slice(1)); else onScroll();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-playground="playground/">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fsdsp56k · write DSP56300 kernels in F#</title>
+<meta name="description" content="F# tooling for the Motorola DSP56300. Prototype a kernel in F#, audition and render it, compile it to DSP56300 and MDS packages, graded word for word.">
+<script src="assets/js/fonts.js"></script>
+<link rel="stylesheet" href="fonts.css">
+<link rel="stylesheet" href="assets/css/theme.css">
+<link rel="stylesheet" href="assets/css/splash.css">
+<link rel="stylesheet" href="assets/css/playground.css">
+<link rel="icon" href="assets/logo/house-rest.png">
+</head>
+<body id="top">
+
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href="#top" aria-label="fsdsp56k, top of the page">
+      <img class="icon" src="assets/logo/house-rest.svg" alt="">
+      <span class="wordmark"><span class="fs">fs</span><span class="dot">·</span>dsp<span class="dot">·</span>56k</span>
+      <img class="px px-wordmark" src="assets/lettering/wordmark-dots@2x.png" width="138" height="26" alt="">
+    </a>
+    <nav aria-label="Main">
+      <a href="#why">Why</a>
+      <a href="#playground">Playground</a>
+      <a href="#commands">Commands</a>
+      <a href="#start">Get started</a>
+      <a class="keep" href="readme.html">README</a>
+      <a class="gh" href="https://github.com/smoothdeveloper/fsdsp56k"><svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="wrap">
+    <div class="hero-copy">
+      <p class="kicker pxable"><b>v1</b> F# → DSP56300 · for MDS authors</p>
+      <h1 class="headline pxable"><span class="l1">Write DSP in F#.</span> <span class="l2">Hear it before you count cycles.</span></h1>
+      <p class="lede">Prototype a Machinedrum machine as ordinary F#, <strong>audition and render it</strong>, then compile the same code to DSP56300 assembly and an MDS package, checked <strong>word for word</strong> against the prototype.</p>
+      <ul class="taglines">
+        <li>Prototype on .NET. Compile to DSP56300.</li>
+        <li>Audition, render and stress-test your kernels.</li>
+        <li>Hand-optimise later, and only where it matters.</li>
+      </ul>
+      <div class="cta">
+        <a class="btn primary" href="#start">Get started <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 10h11M11 5l5 5-5 5"/></svg></a>
+        <a class="btn" href="readme.html">Read the README</a>
+        <a class="btn" href="https://github.com/smoothdeveloper/fsdsp56k"><svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+      </div>
+      <p class="meta">Free software · AGPL-3.0-or-later · .NET, with Fable to JavaScript and Rust</p>
+    </div>
+    <div class="hero-visual">
+      <div class="stage-frame">
+<div id="stage" role="img" aria-label="The fsdsp56k logo"><img class="logo-still" src="assets/logo/house-rest.svg" width="512" height="512" alt=""></div>
+        <div class="scan" aria-hidden="true"></div>
+      </div>
+      <div class="hero-controls" role="group" aria-label="Logo rendering">
+        <div class="chips">
+          <button type="button" class="chip" data-hero-mode="smooth" aria-pressed="false">smooth</button>
+          <button type="button" class="chip" data-hero-mode="auto" aria-pressed="true">auto</button>
+          <button type="button" class="chip" data-hero-mode="pixel" aria-pressed="false">pixel</button>
+          <button type="button" class="chip" id="fx-play" aria-pressed="false">▶ fx</button>
+        </div>
+        <span class="fx">fx · <b id="fx-label">vector</b></span>
+      </div>
+      <div class="hint">hover the chip · click a pin</div>
+    </div>
+  </div>
+</section>
+
+<div class="scroller-band" aria-hidden="true">
+  <canvas id="scroller" class="px" data-text="fs·dsp·56k  ···  write DSP in F#  ···  audition · render · stress  ···  same words on .NET, JavaScript, Rust and the DSP56300  ···  24-bit fixed point  ···  for MDS authors  ···  credits next  ···  "
+          data-credits="credits|Motorola · the DSP56300|Elektron · the Machinedrum|Justin Mammarella & Yatao Li · MDX|Justin Mammarella · MDS|The Usual Suspects · dsp56300|Matt Borgerson · dsp56300 in Rust|Matthew Fecher & Fadedlimes · TX6|fs·dsp·56k"></canvas>
+</div>
+
+<section class="block" id="why">
+  <div class="wrap">
+    <p class="eyebrow pxable">Why fsdsp56k</p>
+    <h2 class="title">Hear the idea first. Count the cycles later.</h2>
+    <p class="section-lede">Writing a machine for the Machinedrum's DSP usually starts and ends in hand-written assembly: write it, assemble it with <code>asm56300</code>, pack it, send it over SysEx, and listen. The MDS standard asks you to measure each machine's worst-case cycles before you declare them. fsdsp56k shortens that loop.</p>
+
+    <div class="pillars">
+      <article class="pillar" style="--c:#56e0fe">
+        <div class="n">01 · PROTOTYPE</div>
+        <h3>A kernel is three F# functions</h3>
+        <p><code>init</code>, <code>trig</code> and <code>render</code> over <code>Frac</code>, <code>Acc</code> and <code>Long</code>: fixed-point types with the DSP's own rounding and saturation. Test it, step through it in a debugger, write a WAV in one call.</p>
+      </article>
+      <article class="pillar" style="--c:#fff3a0">
+        <div class="n">02 · AUDITION</div>
+        <h3>Listen, render, stress</h3>
+        <p>fsdsp56k allows you to audition and render your kernels: play them live, retrigger them, sweep their parameters, and see every call's cycles against the per-track limit.</p>
+      </article>
+      <article class="pillar" style="--c:#ffb020">
+        <div class="n">03 · SHIP</div>
+        <h3>DSP56300 code and an MDS package</h3>
+        <p>The same functions compile to DSP56300 assembly, packed as an MDS package for X.20, the MDX custom firmware. Output and state are graded word for word against the prototype.</p>
+      </article>
+      <article class="pillar" style="--c:#30b9db">
+        <div class="n">04 · OPTIMISE</div>
+        <h3>An optimiser, and the listing</h3>
+        <p>Passes trim reloads and spills, keep hot values in registers and pack parallel moves. See line by line which F# became which instruction, and where the cycles go.</p>
+      </article>
+      <article class="pillar" style="--c:#df9b68">
+        <div class="n">05 · PORTABLE</div>
+        <h3>The prototype runs where you work</h3>
+        <p>Natively on .NET, and through <a href="https://fable.io">Fable</a> as JavaScript and Rust, native or WebAssembly, down to a browser AudioWorklet. We have used both, checked word for word.</p>
+      </article>
+      <article class="pillar" style="--c:#5ee6a0">
+        <div class="n">06 · HAND-WRITTEN</div>
+        <h3>Assembly as F#, when you want it</h3>
+        <p>A DSL writes DSP56300 programs as F# values: a routine is a function you can parameterise, unroll with a loop and share between machines. It prints as Motorola syntax.</p>
+      </article>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="v">12</div><div class="k">shipped machines ported and graded on every test run, word for word</div></div>
+      <div class="stat"><div class="v">3<small>runtimes</small></div><div class="k">for one prototype: .NET, JavaScript and Rust</div></div>
+      <div class="stat"><div class="v">24<small>bit</small></div><div class="k">fixed point that behaves like the DSP's own arithmetic</div></div>
+      <div class="stat"><div class="v">1.4–2.8<small>×</small></div><div class="k">the hand-written RENDER cycles today, with plenty of room to improve</div></div>
+    </div>
+  </div>
+</section>
+
+<section class="block" id="kernel">
+  <div class="wrap">
+    <p class="eyebrow pxable">A minimal kernel</p>
+    <h2 class="title">Plain F#, the DSP's arithmetic.</h2>
+    <p class="section-lede">The sine generator from Justin Mammarella's MDS examples (<a href="https://github.com/jmamma/MDS/blob/c446179d6d73a82b117ee20eb2216af78734a795/machines/examples/sine/sine.asm56k">jmamma/MDS, sine.asm56k</a>), ported. It runs as .NET code, and compiled it gives the same words as the original package.</p>
+    <div class="showcase">
+      <div>
+        <div class="code-head"><span class="dots"><i></i><i></i><i></i></span>Sine.fs</div>
+<pre class="code" data-lang="fsharp"><code>module samples.kernels.Sine
+
+open dsp56k.kernel
+open dsp56k.kernel.Units
+
+type Params =
+  { pitch : Frac&lt;Hz&gt;      // the host's pitch increment
+    amp   : Frac&lt;ratio&gt; } // unsigned Q23
+
+type State =
+  { mutable phase   : Long    // table index . fraction
+    mutable ampPrev : Frac }  // the amplitude the last block ended on
+
+let init (_: Params) (s: State) =
+  s.phase &lt;- Long.zero
+  s.ampPrev &lt;- Frac.one
+
+let trig (_: Params) (s: State) =
+  s.phase &lt;- Long.zero
+
+let render (p: Params) (s: State) (out: Output) =
+  let step = Acc.ofFrac (plain p.pitch) &gt;&gt;&gt; 6
+  let ramp = (Acc.ofFrac (plain p.amp) - Acc.ofFrac s.ampPrev) &gt;&gt;&gt; 5
+  let mutable gain = Acc.ofFrac s.ampPrev
+  let mutable phase = Acc.ofLong s.phase
+  for _ in 0 .. 31 do
+    gain &lt;- gain + ramp
+    let v = Table.read Rom.sine (Acc.hi phase)
+    out.Write(Acc.sat ((v * Acc.hi gain) &gt;&gt;&gt; 2))
+    phase &lt;- Acc.andHi 0x7fff (phase + step)
+  s.phase &lt;- Long.ofAcc phase
+  s.ampPrev &lt;- plain p.amp</code></pre>
+      </div>
+      <div class="notes">
+        <div class="note"><h4><span class="tag">INIT</span> <span class="tag">TRIG</span> <span class="tag">RENDER</span></h4><p>Three functions become the three entry points. <code>render</code> writes one 32-frame block.</p></div>
+        <div class="note"><h4>Parameters and state</h4><p>Records of fixed-point fields, laid out in the track's workset. <code>[&lt;XMemory&gt;]</code> puts a field in X.</p></div>
+        <div class="note"><h4>Compile-time choices</h4><p>A voice record read when compiling picks the code, so one engine yields several kernels, each holding only its own code.</p></div>
+        <div class="note verdict"><h4><span class="tag">GRADE</span> same words</h4><p>Output and state compared word for word with the .NET run and with the shipped machine, with every call's cycles against the limit.</p></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="block" id="playground">
+  <div class="wrap">
+    <p class="eyebrow pxable">Playground</p>
+    <h2 class="title">Hear it here, in four runtimes.</h2>
+    <p class="section-lede">Pick a kernel and a runtime, then audition it live or render its phrase. The same F# runs as JavaScript and as Rust compiled to wasm; the DSP56300 runtime is The Usual Suspects' dsp56300 emulator, built for the browser, running the compiled kernel's program. Each runtime is checked block by block against the .NET reference.</p>
+    <div class="pg-serve" id="pg-serve" hidden>
+      <b>Opened from disk.</b> The .NET reference plays from its WAVs; the three live runtimes and the word-for-word checks need the page served over http.
+      In this folder: <code>dotnet fsi build.fsx serve</code>, then open <a href="http://localhost:8056/#playground">localhost:8056</a>.
+    </div>
+    <div class="pg">
+      <div class="pg-rack">
+        <div class="pg-group">
+          <span class="pg-label">Kernel</span>
+          <div class="chips" id="pg-kernels" role="group" aria-label="Kernel"></div>
+          <p class="pg-meta" id="pg-kmeta"></p>
+        </div>
+        <div class="pg-group">
+          <span class="pg-label">Runtime</span>
+          <!-- the runtime picker: the built-in chips (playground.js), or any component that fires `auditionmode` here (data-picker="external") -->
+          <div class="pg-runtimes" id="pg-runtimes" role="group" aria-label="Runtime" data-picker="builtin">
+          </div>
+        </div>
+        <div class="pg-transport">
+          <button type="button" class="btn primary" id="pg-audition" aria-pressed="false"><span class="pg-dot"></span><span>Audition</span></button>
+          <button type="button" class="btn" id="pg-render">Render the phrase</button>
+          <button type="button" class="pg-pad" id="pg-pad" aria-label="Trigger">TRIG</button>
+        </div>
+        <p class="pg-hint">Pad, <kbd>space</kbd> or <kbd>T</kbd>, or a MIDI note triggers the kernel.</p>
+        <div class="pg-group">
+          <span class="pg-label">Parameters <small id="pg-law"></small></span>
+          <div class="pg-params" id="pg-params"></div>
+        </div>
+        <div class="pg-group pg-midi">
+          <span class="pg-label">MIDI in <small>Machinedrum map</small></span>
+          <div class="pg-midi-row">
+            <button type="button" class="chip" id="pg-midi" aria-pressed="false"><span class="led"></span>Web MIDI</button>
+            <span class="stepper"><button type="button" class="chip" data-step="ch" data-d="-1" aria-label="Base channel down">−</button><span>base ch <b id="pg-ch">1</b></span><button type="button" class="chip" data-step="ch" data-d="1" aria-label="Base channel up">+</button></span>
+            <span class="stepper"><button type="button" class="chip" data-step="track" data-d="-1" aria-label="Track down">−</button><span>track <b id="pg-track">1</b></span><button type="button" class="chip" data-step="track" data-d="1" aria-label="Track up">+</button></span>
+            <button type="button" class="chip" id="pg-anynote" aria-pressed="false">any note</button>
+          </div>
+          <p class="pg-meta" id="pg-midimap"></p>
+        </div>
+      </div>
+      <div class="pg-scope">
+        <div class="pg-screen">
+          <canvas id="pg-wave" class="px"></canvas>
+          <div class="pg-screen-label"><img class="pg-logo" src="assets/icons/fsdsp56k.png" width="16" height="16" alt=""><span id="pg-now">idle</span><span id="pg-load"></span></div>
+        </div>
+        <div class="pg-match">
+          <div class="pg-match-head"><span class="pg-label">Word for word <small>the phrase, against .NET</small></span><button type="button" class="chip" id="pg-check">Check all</button></div>
+          <div class="pg-rows" id="pg-rows"></div>
+        </div>
+        <div class="pg-drop" id="pg-drop">
+          <div class="pg-drop-head">
+            <span class="pg-label">Your machine <small>a .mds package or a .syx dump</small></span>
+            <label class="chip pg-open"><input type="file" id="pg-file" accept=".mds,.syx,.sysex" hidden>Open a file…</label>
+          </div>
+          <p class="pg-drop-hint" id="pg-drop-hint">Drop a <code>.mds</code> or a <code>.syx</code> anywhere on the playground. It is read here, in your browser, and never uploaded.</p>
+          <div class="pg-file-info" id="pg-file-info" hidden></div>
+        </div>
+      </div>
+    </div>
+    <div class="pg-term">
+      <span class="pg-label">At the prompt <small>real sessions, as fsdsp56k printed them</small></span>
+      <!-- the terminal: terminal.js draws it (data-terminal="builtin"), or any component given the transcripts (data-terminal="external") -->
+      <div class="term" id="pg-terminal" data-terminal="builtin"><p class="term-foot">No captured sessions in this copy: <code>dotnet fsi build.fsx terminal-capture</code>.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="block" id="commands">
+  <div class="wrap">
+    <p class="eyebrow pxable">The command line</p>
+    <h2 class="title">One tool, from source to SysEx.</h2>
+    <p class="section-lede">DSP56300 commands work on any code for the chip. The Machinedrum's live under <code>machinedrum</code>, or <code>md</code>. <code>run</code>, <code>stress</code> and <code>audition</code> take an MDS package, a SysEx dump, or an F# kernel as a project, a script or one file.</p>
+    <div class="cmd-groups">
+      <div class="cmd-group">
+        <h3>Write &amp; check</h3>
+        <div class="cmd-list">
+          <a class="cmd" href="readme.html#cmd-asm"><div class="cmd-top"><span class="cmd-name">asm</span></div><div class="cmd-flow" data-in="file-asm" data-hub="dsp56300" data-out="file-lst file-hex"></div><div class="cmd-desc">Assemble Motorola-syntax source to a listing and P-memory hex.</div></a>
+          <a class="cmd" href="readme.html#cmd-check"><div class="cmd-top"><span class="cmd-name">check</span></div><div class="cmd-flow" data-in="file-asm" data-hub="dsp56300" data-out="oracle"></div><div class="cmd-desc">Assemble, then confirm every instruction against the dsp56300 oracle.</div></a>
+          <a class="cmd" href="readme.html#cmd-disasm"><div class="cmd-top"><span class="cmd-name">disasm</span></div><div class="cmd-flow" data-in="file-mds" data-hub="dsp56300" data-out="file-asm"></div><div class="cmd-desc">Recover a package's program as Motorola-syntax source.</div></a>
+          <a class="cmd" href="readme.html#cmd-import"><div class="cmd-top"><span class="cmd-name">import</span></div><div class="cmd-flow" data-in="file-asm file-mds" data-hub="dsp56300" data-out="file-fs"></div><div class="cmd-desc">Turn a listing or a package into F# DSL source.</div></a>
+        </div>
+      </div>
+      <div class="cmd-group">
+        <h3>Package for MDS</h3>
+        <div class="cmd-list">
+          <a class="cmd" href="readme.html#cmd-md-info"><div class="cmd-top"><span class="cmd-name"><span class="grp">md</span> info</span></div><div class="cmd-flow" data-in="file-mds" data-hub="machinedrum" data-out="report"></div><div class="cmd-desc">Show a package's header, parameters, patches and checks.</div></a>
+          <a class="cmd" href="readme.html#cmd-md-pack"><div class="cmd-top"><span class="cmd-name"><span class="grp">md</span> pack</span></div><div class="cmd-flow" data-in="file-asm file-json" data-hub="machinedrum" data-out="file-mds"></div><div class="cmd-desc">Assemble a program and pack it with its MDS definition and an optional sprite.</div></a>
+          <a class="cmd" href="readme.html#cmd-md-syx"><div class="cmd-top"><span class="cmd-name"><span class="grp">md</span> syx</span></div><div class="cmd-flow" data-in="file-mds" data-hub="machinedrum" data-out="file-syx"></div><div class="cmd-desc">Turn a package into a SysEx dump for a slot.</div></a>
+          <a class="cmd" href="readme.html#cmd-md-unsyx"><div class="cmd-top"><span class="cmd-name"><span class="grp">md</span> unsyx</span></div><div class="cmd-flow" data-in="file-syx" data-hub="machinedrum" data-out="files-mds"></div><div class="cmd-desc">Split a SysEx dump back into packages.</div></a>
+        </div>
+      </div>
+      <div class="cmd-group">
+        <h3>Hear &amp; measure</h3>
+        <div class="cmd-list">
+          <a class="cmd" href="readme.html#cmd-run"><div class="cmd-top"><span class="cmd-name">run</span></div><div class="cmd-flow" data-in="kernel file-mds" data-hub="dsp56300" data-out="file-wav cycles"></div><div class="cmd-desc">Render a kernel: a 24-bit WAV, per-call cycles against the limit, <code>--profile</code> hot spots.</div></a>
+          <a class="cmd sketch" href="readme.html#cmd-audition"><div class="cmd-top"><span class="cmd-name">audition</span><span class="cmd-badge">sketch</span></div><div class="cmd-flow" data-in="kernel file-mds" data-hub="dsp56300" data-out="audio"></div><div class="cmd-desc">Play a kernel live through the sound card, retriggered with <code>--trig-every</code>.</div></a>
+          <a class="cmd sketch" href="readme.html#cmd-audition-midi"><div class="cmd-top"><span class="cmd-name">audition --midi-in</span><span class="cmd-badge">sketch</span></div><div class="cmd-flow" data-in="midi kernel" data-hub="dsp56300" data-out="audio"></div><div class="cmd-desc">Trigger it and turn its parameters from a MIDI controller.</div></a>
+          <a class="cmd sketch" href="readme.html#cmd-stress"><div class="cmd-top"><span class="cmd-name">stress</span><span class="cmd-badge">sketch</span></div><div class="cmd-flow" data-in="kernel file-mds" data-hub="dsp56300" data-out="cycles"></div><div class="cmd-desc">Sweep or search the parameters for the worst INIT, TRIG and RENDER cycles.</div></a>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="block" id="start">
+  <div class="wrap">
+    <p class="eyebrow pxable">Get started</p>
+    <h2 class="title">From clone to a WAV in five lines.</h2>
+    <p class="section-lede">You need the .NET SDK and a Rust toolchain (for the native DSP56300 oracle and emulator).</p>
+    <div class="start">
+      <div>
+        <div class="code-head"><span class="dots"><i></i><i></i><i></i></span>terminal</div>
+<pre class="code" data-lang="shell"><code>$ git clone https://github.com/smoothdeveloper/fsdsp56k
+$ cd fsdsp56k
+$ dotnet tool restore &amp;&amp; dotnet paket install
+$ (cd native &amp;&amp; cargo build --release)
+$ dotnet run --project src/dsp56k.tool -- run tests/dsp56k.tests/Kernels/Sine.fs --wav sine.wav</code></pre>
+      </div>
+      <div class="next">
+        <a class="next-card" href="readme.html#kernels"><span class="ic"><canvas class="px next-glyph" data-glyph="kernel"></canvas></span><span><b>Write your first kernel</b><span>What a kernel declares, and what it can use</span></span></a>
+        <a class="next-card" href="readme.html#commands"><span class="ic"><canvas class="px next-glyph" data-glyph="dsp56300"></canvas></span><span><b>Every command</b><span>Inputs, outputs and the flags that matter</span></span></a>
+        <a class="next-card" href="https://github.com/smoothdeveloper/fsdsp56k"><span class="ic"><canvas class="px next-glyph" data-glyph="file-fsproj"></canvas></span><span><b>The repository</b><span>Source, tests, issues</span></span></a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="block" id="credits">
+  <div class="wrap">
+    <p class="eyebrow pxable">Credits</p>
+    <h2 class="title">Standing on other people's work.</h2>
+    <div class="credits">
+      <div class="credit"><b>Motorola</b><span>For the DSP56000 family and its DSP56300 generation, and for <code>asm56300</code>, whose dialect our assembler follows.</span></div>
+      <div class="credit"><b>Elektron</b><span>For the Machinedrum and its original firmware, whose machine design MDS follows.</span></div>
+      <div class="credit"><b>Justin Mammarella and Yatao Li</b><span>For <a href="https://github.com/jmamma/MDX">MDX</a>, the custom Machinedrum firmware; X.20 adds user machines.</span></div>
+      <div class="credit"><b>Justin Mammarella</b><span>For <a href="https://github.com/jmamma/MDS">MDS</a>: the machine standard, its tools and its examples.</span></div>
+      <div class="credit"><b>The Usual Suspects</b><span>For <a href="https://github.com/dsp56300/dsp56300">dsp56300</a>, their DSP56300 emulator. <a href="https://dsp56300.com">dsp56300.com</a></span></div>
+      <div class="credit"><b>Matt Borgerson</b><span>For <a href="https://github.com/mborgerson/dsp56300">dsp56300</a> in Rust: the oracle, and the emulator behind <code>run</code> and every grade.</span></div>
+      <div class="credit"><b>The TX6 authors</b><span>Matthew Fecher (AnalogMatthew) and Fadedlimes, for the TX6 kit in <a href="https://github.com/etcetc000/kitbasher">kitbasher</a>.</span></div>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer class="foot">
+  <div class="wrap">
+    <div>
+      <p><span class="wordmark"><span class="fs">fs</span><span class="dot">·</span>dsp<span class="dot">·</span>56k</span> is free software under the GNU Affero General Public License, version 3 or later.</p>
+      <p>An independent project, not affiliated with or endorsed by Elektron. Machinedrum is a trademark of its owner.</p>
+    </div>
+    <div class="links"><a href="readme.html">README</a><a href="https://github.com/smoothdeveloper/fsdsp56k">GitHub</a><a href="#top">Top ↑</a></div>
+  </div>
+</footer>
+
+<script src="assets/pixel/fsdsp56k-pixel-font.js"></script>
+<script type="module" src="assets/logo/fsdsp56k-logo.mjs"></script>
+<script src="assets/icons/fsdsp56k-icon-pixels.js"></script>
+<script src="assets/icons/fsdsp56k-command-icons.js"></script>
+<script src="assets/js/hero.js"></script>
+<script src="assets/js/scroller.js"></script>
+<script src="assets/js/cards.js"></script>
+<script src="assets/js/highlight.js"></script>
+<script src="assets/js/terminal.js"></script>
+<script src="assets/js/playground/package.js"></script>
+<script src="assets/js/playground/playground.js"></script>
+<script>
+  // the small glyphs in the "next" cards
+  (() => {
+    const icons = window.fsdsp56kCommandIcons, base = window.fsdsp56kIcon;
+    if (!icons || !base) return;
+    const pal = Object.assign({}, base.palette, icons.palette);
+    document.querySelectorAll('canvas.next-glyph').forEach(c => {
+      const rows = (icons.icons[c.dataset.glyph] || '').trim().split('\n');
+      c.width = rows[0].length; c.height = rows.length; c.style.width = '32px'; c.style.height = '32px';
+      const g = c.getContext('2d');
+      rows.forEach((r, y) => [...r].forEach((ch, x) => { if (pal[ch]) { g.fillStyle = pal[ch]; g.fillRect(x, y, 1, 1); } }));
+    });
+  })();
+</script>
+</body>
+</html>
