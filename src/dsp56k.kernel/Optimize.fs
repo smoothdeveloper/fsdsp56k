@@ -1240,9 +1240,56 @@ let staticCost (items: (Item * int) array) =
     | _ -> ()
   weighted, count
 
+/// Hand-written code ([<HandWritten>]) is not the passes' to change. Each stretch between its
+/// `hand:` comments is taken out before the passes, a `bsr` to a stub (an rts after the program)
+/// standing in for it, and put back after them: the passes take that call as they take any, as a
+/// routine that may read and write any register.
+let handStub (k: int) = $"SUB_K_HAND_{k}"
+
+let freezeHand (items: (Item * int) array) =
+  let out = ResizeArray<Item * int>()
+  let regions = ResizeArray<(Item * int) array>()
+  let mutable i = 0
+  while i < items.Length do
+    match fst items[i] with
+    | Comment t when t.StartsWith "hand: " && t <> "hand: end" ->
+      let j = [ i .. items.Length - 1 ] |> List.find (fun j -> fst items[j] = Comment "hand: end")
+      out.Add(bsr (handStub regions.Count), snd items[i])
+      regions.Add items[i .. j]
+      i <- j + 1
+    | _ ->
+      out.Add items[i]
+      i <- i + 1
+  for k in 0 .. regions.Count - 1 do
+    out.Add(Label(handStub k), 0)
+    out.Add(Op Rts, 0)
+  out.ToArray(), regions.ToArray()
+
+/// The hand-written stretches back where their stubs' calls are, each exactly once, the stubs gone.
+let thawHand (regions: (Item * int) array array) (items: (Item * int) array) =
+  if regions.Length = 0 then items
+  else
+    let stubs = Set.ofList [ for k in 0 .. regions.Length - 1 -> handStub k ]
+    let seen = HashSet<string>()
+    let out = ResizeArray<Item * int>()
+    let mutable i = 0
+    while i < items.Length do
+      match fst items[i] with
+      | Label l when stubs.Contains l -> i <- i + 2
+      | Op(Branch(Bsr, { expr = Sym s })) when stubs.Contains s ->
+        if not (seen.Add s) then Kernel.fail $"an optimizer pass copied hand-written code ({s})"
+        out.AddRange regions[int (s.Substring "SUB_K_HAND_".Length)]
+        i <- i + 1
+      | _ ->
+        out.Add items[i]
+        i <- i + 1
+    if seen.Count <> regions.Length then Kernel.fail "an optimizer pass dropped hand-written code"
+    out.ToArray()
+
 /// The passes of `p`; the compiler's temporaries are X words `first` up to `temps`.
 let runWith (p: Passes) (first: int) (temps: int) (items: Item array) (lines: int array) =
-  let mutable cur = Array.zip items lines
+  let frozen, regions = freezeHand (Array.zip items lines)
+  let mutable cur = frozen
   // a pass's rewrite, kept when it is no worse (when the passes are guarded)
   let step (on: bool) (pass: (Item * int) array -> (Item * int) array) =
     if on then
@@ -1266,6 +1313,7 @@ let runWith (p: Passes) (first: int) (temps: int) (items: Item array) (lines: in
   step p.hoist hoist
   step p.pack pack
   step p.rotate (rotate >> (if p.pack then pack else id))
+  cur <- thawHand regions cur
   cur <- fixLoops cur
   Array.map fst cur, Array.map snd cur
 
@@ -1312,7 +1360,7 @@ let subroutineCandidates (policy: Subroutines) (ik: Ir.IrKernel) =
   |> List.groupBy (fun u -> u.helper.Key)
   |> List.choose (fun (key, uses) ->
     let h = uses.Head.helper
-    if policy = Off || uses.Length < 2 || h.Marks.Contains "Subroutine" || h.Marks.Contains "Inline" || not (returns h.ReturnType) then None
+    if policy = Off || uses.Length < 2 || h.Marks.Contains "Subroutine" || h.Marks.Contains "Inline" || h.Marks.Contains "Hand" || not (returns h.ReturnType) then None
     else
       let entryOnly = uses |> List.forall (fun u -> u.entry = "INIT" || u.entry = "TRIG")
       let coldRender = uses |> List.forall (fun u -> not (u.entry = "RENDER" && u.inLoop))
@@ -1328,10 +1376,10 @@ let subroutineCandidates (policy: Subroutines) (ik: Ir.IrKernel) =
 /// `limit` words: when it is larger, the loops whose unswitching added the most are kept whole
 /// (tested on each pass), the largest first, until it fits or none is unswitched; then, unless the
 /// policy is Off, helpers RENDER calls are made subroutines too. None: no limit.
-let compileChoosing (policy: Subroutines) (limit: int option) (level: Level) (target: Kernel.Target) (k: Kernel.Kernel) =
+let compileChoosingWith (handOff: Set<string>) (policy: Subroutines) (limit: int option) (level: Level) (target: Kernel.Target) (k: Kernel.Kernel) =
   let ik = FromQuotation.kernel k
   let attempt (chosen: Set<string>) (unswitchMax: int option) =
-    Compile.generateIrChoosing chosen unswitchMax target ik
+    Compile.generateIrWith handOff chosen unswitchMax target ik
     |> Result.map (fun (c, costs) ->
       let items, lines = runFrom level c.layout.xWorkset c.xWorkset c.items c.lines
       { c with items = items; lines = lines }, costs)
@@ -1374,6 +1422,10 @@ let compileChoosing (policy: Subroutines) (limit: int option) (level: Level) (ta
         Ok(snd (choose Size unswitchMax (chosen, c')))
       | r -> r
 
+/// `compileChoosingWith`, every hand routine used.
+let compileChoosing (policy: Subroutines) (limit: int option) (level: Level) (target: Kernel.Target) (k: Kernel.Kernel) =
+  compileChoosingWith Set.empty policy limit level target k
+
 /// `compileChoosing` with the policy of FSDSP56K_SUBROUTINES.
 let compileWithin (limit: int option) (level: Level) (target: Kernel.Target) (k: Kernel.Kernel) =
   compileChoosing (subroutinesPolicy ()) limit level target k
@@ -1382,4 +1434,9 @@ let compileWithin (limit: int option) (level: Level) (target: Kernel.Target) (k:
 /// than the target's machine holds (Kernel.programLimit), after keeping loops whole if that helps.
 let compile (level: Level) (target: Kernel.Target) (k: Kernel.Kernel) =
   compileWithin (Kernel.programLimit target |> Option.map fst) level target k
+  |> Result.bind Compile.checkSize
+
+/// `compile`, the [<HandWritten>] helpers of `handOff` (by key) compiled from their F# reference.
+let compileHandOff (handOff: Set<string>) (level: Level) (target: Kernel.Target) (k: Kernel.Kernel) =
+  compileChoosingWith handOff (subroutinesPolicy ()) (Kernel.programLimit target |> Option.map fst) level target k
   |> Result.bind Compile.checkSize

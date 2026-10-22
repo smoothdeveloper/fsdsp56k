@@ -54,11 +54,12 @@ let private members = ConcurrentDictionary<MemberInfo, Ir.Member>()
 
 let varOf (v: Var) : Ir.Var = vars.GetOrAdd(v, fun v -> Ir.Var(v.Name, tyOf v.Type, v.IsMutable, v.Type.MetadataToken))
 
-/// The marks the generator reads: [<Subroutine>] and [<Inline>] on the method, [<NoUnswitch>] and [<Unroll>] on the method or its module.
+/// The marks the generator reads: [<Subroutine>], [<Inline>] and [<HandWritten>] on the method, [<NoUnswitch>] and [<Unroll>] on the method or its module.
 let private marksOf (m: MemberInfo) =
   let on (attr: Type) = not (isNull (m.GetCustomAttribute attr)) || (match m.DeclaringType with null -> false | t -> not (isNull (t.GetCustomAttribute attr)))
   Set.ofList [ if not (isNull (m.GetCustomAttribute typeof<SubroutineAttribute>)) then "Subroutine"
                if not (isNull (m.GetCustomAttribute typeof<InlineAttribute>)) then "Inline"
+               if not (isNull (m.GetCustomAttribute typeof<HandWrittenAttribute>)) then "Hand"
                if on typeof<NoUnswitchAttribute> then "NoUnswitch"
                if on typeof<UnrollAttribute> then "Unroll" ]
 
@@ -117,6 +118,12 @@ and memberOf (m: MemberInfo) : Ir.Member =
           Ir.Definition = lazy (Expr.TryGetReflectedDefinition mi |> Option.map convert)
           Ir.Invoke = invoke
           Ir.Get = fun _ -> fail $"{mi.Name} is a method" }
+      // a helper written by hand too: its routine, read when first compiled
+      match mi.GetCustomAttribute<HandWrittenAttribute>() with
+      | null -> ()
+      | a ->
+        let home = match mi.DeclaringType with null -> typeof<HandWrittenAttribute> | t -> t
+        Hand.register r.Key mi.Name a.Routine (fun () -> Hand.resolve home mi.Name a.Routine)
       r
     | :? PropertyInfo as p ->
       let r: Ir.Member =

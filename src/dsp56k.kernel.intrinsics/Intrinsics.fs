@@ -54,6 +54,22 @@ type SubroutineAttribute() =
 type InlineAttribute() =
   inherit Attribute()
 
+/// A helper written twice: its F# body is the reference (what the .NET prototype runs, what the
+/// grade holds the program to), and the DSP program runs `routine`, a module value of DSL items
+/// (`Item array`) written by hand: `[<HandWritten "workshop.hand.shape">] let shape (x: Frac) = ...`.
+/// The name is the value's full name, or its bare name in the helper's own module. The routine
+/// follows the [<Subroutine>] convention: up to four Frac arguments in X0, Y0, X1, Y1 and two Acc
+/// or Long arguments in A, B, the records through r6 (and the output through r7)+, the result in
+/// X0 (Frac) or A (Acc, Long). It may change the data registers, A, B, the condition codes, r0,
+/// n0, and the address registers no cursor holds at its calls; not r6, nor r7 except by writing
+/// output through (r7)+, nor the compiler's locals in the workset. It is written into the code at
+/// each call (its labels made unique), or called with bsr when the helper is also [<Subroutine>].
+/// Put the attribute under `#if HAND_<NAME>` to choose the hand version per function when building.
+[<AttributeUsage(AttributeTargets.Method, AllowMultiple = false)>]
+type HandWrittenAttribute(routine: string) =
+  inherit Attribute()
+  member _.Routine = routine
+
 /// Loops in this function (or every function of this module) are not unswitched: a condition
 /// the loop does not change is tested on each pass rather than splitting the loop into a copy
 /// for each outcome (smaller code, a test and a branch more per pass).

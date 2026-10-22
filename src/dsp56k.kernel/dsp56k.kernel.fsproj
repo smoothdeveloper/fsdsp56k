@@ -8,6 +8,7 @@
   <ItemGroup>
     <Compile Include="Ir.fs" />
     <Compile Include="Kernel.fs" />
+    <Compile Include="Hand.fs" />
     <Compile Include="FromQuotation.fs" />
     <Compile Include="Compile.fs" />
     <Compile Include="Optimize.fs" />

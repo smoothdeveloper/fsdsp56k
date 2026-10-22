@@ -172,6 +172,7 @@ type Ctx =
     unswitchMax : int option                 // unswitch a loop only when its copy takes at most these words
     unswitchCosts : ResizeArray<int>         // the words each unswitched loop's copy took
     bindings : ResizeArray<Binding>          // the locals and where they live, for the step view
+    handOff  : Set<string>                   // hand-written helpers (by key) compiled from their F# instead
     mutable inSub  : Sub option       // the subroutine being compiled
     mutable depth  : int              // system stack levels taken here: two a DO loop
     mutable deepest : int }           // the most, in the entry or subroutine being compiled
@@ -568,10 +569,17 @@ let inlined (mi: Member) (args: Expr list) =
 let isSubroutine (mi: Member) =
   mi.Marks.Contains "Subroutine" && (reflected mi).IsSome
 
+/// The routine a [<HandWritten>] helper runs here, unless its F# reference is compiled instead
+/// (`handOff`, for measuring one against the other).
+let handOf (ctx: Ctx) (mi: Member) =
+  if mi.Marks.Contains "Hand" && not (ctx.handOff.Contains mi.Key) && (reflected mi).IsSome then Hand.find mi.Key
+  else None
+
 /// A helper called as a subroutine here: marked [<Subroutine>], or chosen (Optimize) and not
-/// marked [<Inline>].
+/// marked [<Inline>]; or written by hand, its routine put at the call under the same convention.
 let isSub (ctx: Ctx) (mi: Member) =
-  (isSubroutine mi || (ctx.chosen.Contains mi.Key && not (mi.Marks.Contains "Inline"))) && (reflected mi).IsSome
+  ((isSubroutine mi || (ctx.chosen.Contains mi.Key && not (mi.Marks.Contains "Inline"))) && (reflected mi).IsSome)
+  || (handOf ctx mi).IsSome
 
 /// A helper's parameters and body.
 let parametersOf (def: Expr) =
@@ -2528,6 +2536,10 @@ and callSub (ctx: Ctx) (mi: Member) (args: Expr list) =
   if ctx.bHeld then raise BTaken
   let def = (reflected mi).Value
   let ps, _ = parametersOf def
+  // a hand-written helper not marked [<Subroutine>]: its routine written here, after the same
+  // argument moves a call makes
+  let hand = handOf ctx mi
+  let atCall = hand.IsSome && not (mi.Marks.Contains "Subroutine")
   let sub =
     match ctx.subs.TryGetValue mi with
     | true, s -> s
@@ -2535,7 +2547,7 @@ and callSub (ctx: Ctx) (mi: Member) (args: Expr list) =
       let name = String(mi.Name |> Seq.map (fun c -> if Char.IsLetterOrDigit c then Char.ToUpperInvariant c else '_') |> Array.ofSeq)
       let s = { label = $"SUB_{name}_{ctx.subs.Count + 1}"; mi = mi; records = Dictionary(); sites = ResizeArray()
                 compiled = false; start = 0; deepest = 0 }
-      ctx.subs[mi] <- s
+      if not atCall then ctx.subs[mi] <- s
       s
   let rec calling (s: Sub option) = match s with Some s when s.mi = mi -> true | Some s -> false | None -> false
   if calling ctx.inSub then fail $"{mi.Name}: a [<Subroutine>] cannot call itself"
@@ -2619,13 +2631,38 @@ and callSub (ctx: Ctx) (mi: Member) (args: Expr list) =
       emitAll ctx (loadWord w fracArgs[nf])
       nf <- nf + 1
     | Choice2Of2 _ -> ()
-  sub.sites.Add { next = frame; freeRegs = ctx.freeRegs; depth = ctx.depth; caller = ctx.inSub }
-  emit ctx (bsr sub.label)
+  match hand with
+  | Some r when atCall -> handAtCall ctx mi r
+  | _ ->
+    sub.sites.Add { next = frame; freeRegs = ctx.freeRegs; depth = ctx.depth; caller = ctx.inSub }
+    emit ctx (bsr sub.label)
   for r, t in saved do emit ctx (move (at t 0) r)
+
+/// A hand routine written at a call, its arguments in their registers: checked against what the
+/// code around it keeps, its labels made unique, between the `hand:` comments the optimizer leaves
+/// alone.
+and handAtCall (ctx: Ctx) (mi: Member) (r: Hand.Routine) =
+  let items = Hand.items r
+  Hand.check mi.Name r items ctx.freeRegs ctx.layout true
+  let levels = Hand.depth items
+  if ctx.inSub.IsNone && ctx.depth + levels > stackLevels then
+    fail $"{mi.Name} (hand-written, {r.name}) takes {ctx.depth + levels} system stack levels here (a DO loop two, a call one), a machine may take {stackLevels}"
+  ctx.deepest <- max ctx.deepest (ctx.depth + levels)
+  ctx.labels <- ctx.labels + 1
+  let n = ctx.labels
+  emit ctx (Comment $"hand: {r.name}")
+  emitAll ctx (Hand.relocated $"HAND_H{n}" (Hand.relabel (fun l -> $"{l}_H{n}") (Hand.withoutRts items)))
+  emit ctx (Comment "hand: end")
 
 /// A subroutine's code, after the entries: its words above every call's locals, its arguments
 /// stored from their registers into them, its body, rts.
 and compileSub (ctx: Ctx) (sub: Sub) =
+  match handOf ctx sub.mi with
+  | Some r -> handSub ctx sub r
+  | None -> compileFSharpSub ctx sub
+
+/// A subroutine compiled from its F#.
+and compileFSharpSub (ctx: Ctx) (sub: Sub) =
   sub.compiled <- true
   let ps, body = parametersOf (reflected sub.mi).Value
   ctx.vars <- Map.empty; ctx.consts <- Map.empty; ctx.cursors <- Map.empty
@@ -2670,6 +2707,22 @@ and compileSub (ctx: Ctx) (sub: Sub) =
   emit ctx rts
   sub.deepest <- ctx.deepest
   ctx.inSub <- None
+
+/// A hand-written [<Subroutine>]: its routine after the label, checked against what every call
+/// keeps, then rts.
+and handSub (ctx: Ctx) (sub: Sub) (r: Hand.Routine) =
+  sub.compiled <- true
+  let items = Hand.items r
+  let free = sub.sites |> Seq.map (fun s -> Set.ofList s.freeRegs) |> Set.intersectMany |> Set.toList
+  Hand.check sub.mi.Name r items free ctx.layout false
+  sub.start <- max (sub.sites |> Seq.map _.next |> Seq.max) (defaultArg (ctx.floors.TryFind (subKey sub.mi)) 0)
+  sub.deepest <- Hand.depth items
+  ctx.line <- 0; ctx.sourceLine <- 0
+  emit ctx (Label sub.label)
+  emit ctx (Comment $"hand: {r.name}")
+  emitAll ctx (Hand.relocated $"HAND_{sub.label}" (Hand.relabel (fun l -> $"{l}_{sub.label}") (Hand.withoutRts items)))
+  emit ctx (Comment "hand: end")
+  emit ctx rts
 
 /// Branch to `target` when the comparison is false.
 and bitTest (ctx: Ctx) (n: Expr) (f: Expr) =
@@ -2947,7 +3000,7 @@ let helperUses (k: IrKernel) =
 /// words from at least the given word.
 exception Refloor of Map<string, int>
 
-let rec generateWith (chosen: Set<string>) (floors: Map<string, int>) (unswitchMax: int option) (target: Target) (ik: IrKernel) : Result<Compiled * int list, string> =
+let rec generateWith (handOff: Set<string>) (chosen: Set<string>) (floors: Map<string, int>) (unswitchMax: int option) (target: Target) (ik: IrKernel) : Result<Compiled * int list, string> =
   try
     let layout = layoutOf target ik.name ik.parameters (defaultArg ik.state [||])
     let ctx =
@@ -2956,7 +3009,7 @@ let rec generateWith (chosen: Set<string>) (floors: Map<string, int>) (unswitchM
         cursors = Map.empty; freeRegs = [ 1; 2; 3; 4; 5 ]; tables = ResizeArray(); conts = []; released = Collections.Generic.HashSet(); trackHome = None
         indexed = Map.empty; counters = Map.empty; inductions = Map.empty; affineAt = Dictionary(HashIdentity.Reference); taps = Dictionary(); freeData = [ X1; Y1 ]; scores = Dictionary(); deadLocals = HashSet()
         unswitched = HashSet(); bHeld = false; bWrite = false
-        subs = Dictionary(); chosen = chosen; inSub = None; depth = 0; deepest = 0; floors = floors
+        subs = Dictionary(); chosen = chosen; handOff = handOff; inSub = None; depth = 0; deepest = 0; floors = floors
         kept = keptLoops ik; unrolled = unrolledLoops ik; pending = []; unswitchMax = unswitchMax; unswitchCosts = ResizeArray()
         bindings = ResizeArray() }
     entry ctx "INIT" ik.init
@@ -3004,20 +3057,21 @@ let rec generateWith (chosen: Set<string>) (floors: Map<string, int>) (unswitchM
          bindings = ctx.bindings.ToArray() }, List.ofSeq ctx.unswitchCosts)
   with
   | KernelError m -> Error m
-  | Refloor floors' when floors'.Count <= 64 && floors' <> floors -> generateWith chosen floors' unswitchMax target ik
+  | Refloor floors' when floors'.Count <= 64 && floors' <> floors -> generateWith handOff chosen floors' unswitchMax target ik
 
 /// The compiled kernel, its size not checked, each loop unswitched only when its copy takes at
 /// most `unswitchMax` words (None: any); and what each unswitched loop's copy took.
 /// Code generation recurses once per nested let and statement: a long kernel nests thousands, more
 /// than a thread pool thread's stack holds. It runs on its own thread with a 256 MB stack.
-/// `chosen`: helpers (by key) called as subroutines besides the [<Subroutine>] ones.
-let generateIrChoosing (chosen: Set<string>) (unswitchMax: int option) (target: Target) (k: IrKernel) =
+/// `chosen`: helpers (by key) called as subroutines besides the [<Subroutine>] ones; `handOff`:
+/// [<HandWritten>] helpers (by key) compiled from their F# reference instead of their routine.
+let generateIrWith (handOff: Set<string>) (chosen: Set<string>) (unswitchMax: int option) (target: Target) (k: IrKernel) =
   let mutable result = Unchecked.defaultof<Result<Compiled * int list, string>>
   let mutable failure : System.Runtime.ExceptionServices.ExceptionDispatchInfo option = None
   let t =
     System.Threading.Thread(
       (fun () ->
-        try result <- generateWith chosen Map.empty unswitchMax target k
+        try result <- generateWith handOff chosen Map.empty unswitchMax target k
         with e -> failure <- Some(System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture e)),
       256 * 1024 * 1024)
   t.Start()
@@ -3025,6 +3079,10 @@ let generateIrChoosing (chosen: Set<string>) (unswitchMax: int option) (target: 
   // what it raised, as raised (callers catch KernelError)
   failure |> Option.iter (fun f -> f.Throw())
   result
+
+/// As generateIrWith, every hand routine used.
+let generateIrChoosing (chosen: Set<string>) (unswitchMax: int option) (target: Target) (k: IrKernel) =
+  generateIrWith Set.empty chosen unswitchMax target k
 
 /// The compiled kernel, its size not checked, only the [<Subroutine>] helpers called.
 let generateIrUnswitching (unswitchMax: int option) (target: Target) (k: IrKernel) = generateIrChoosing Set.empty unswitchMax target k
