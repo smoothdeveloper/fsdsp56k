@@ -82,3 +82,30 @@ let respond (voice: Voice) (baseChannel: int) (track: int) (m: dsp56k.audio.Midi
       | None -> false
     | _ -> false
   else false
+
+/// The voice, mirrored to a MIDI output as the Machinedrum's default map spells it: each trig a
+/// note-on of the track's note on its channel (the previous note ended first), each parameter
+/// change the parameter's CC. A real Machinedrum on that output, with the same machine on that
+/// track, then plays along with the emulator; other gear hears notes and CCs.
+// TODO: velocity is fixed (100) and notes end at the next trig; the Machinedrum's own MIDI
+// machines (NOTE, N2, N3, LEN, VEL, CCs) could be mirrored from a sequence the same way; no
+// clock is sent.
+let mirror (out: dsp56k.audio.Midi.Output) (baseChannel: int) (track: int) (voice: Voice) =
+  let channel = MidiMap.channel baseChannel track
+  let note = MidiMap.note track
+  let mutable sounding = false
+  let finish () =
+    if sounding then
+      out.NoteOff(channel, note)
+      sounding <- false
+  let mirrored =
+    { trig      = fun () ->
+        finish ()
+        out.NoteOn(channel, note, 100)
+        sounding <- true
+        voice.trig ()
+      render    = voice.render
+      parameter = fun i setting ->
+        if i >= 0 && i < 8 then out.Control(channel, MidiMap.parameterBase[(track - 1) % 4] + i, int (max 0.0 (min 127.0 setting)))
+        voice.parameter i setting }
+  mirrored, finish

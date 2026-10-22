@@ -162,6 +162,7 @@ type AuditionArgs =
   | Seconds of float
   | Sample of wav: string
   | Midi_In of port: string
+  | Midi_Out of port: string
   | Midi_List
   | Track of int
   | Base_Channel of int
@@ -175,7 +176,8 @@ type AuditionArgs =
       | Seconds _ -> "how long to play (default 4, or until Ctrl+C with --midi-in)."
       | Sample _ -> "WAV loaded as the internal and userwave sample banks."
       | Midi_In _ -> "play from a MIDI input (an index, part of its name, or virtual:NAME): the track's note triggers, its CCs set parameters."
-      | Midi_List -> "list the MIDI inputs and stop."
+      | Midi_Out _ -> "mirror the track to a MIDI output (an index, part of its name, or virtual:NAME): trigs as its note, parameters as its CCs."
+      | Midi_List -> "list the MIDI inputs and outputs and stop."
       | Track _ -> "the Machinedrum track (1..16) whose MIDI note and CCs the machine answers (default 1)."
       | Base_Channel _ -> "the Machinedrum's MIDI base channel (1..13, default 1)."
 

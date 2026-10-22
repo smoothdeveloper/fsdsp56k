@@ -336,9 +336,9 @@ let stress (args: ParseResults<StressArgs>) =
 // Live output.
 
 let midiList () =
-  let inputs = dsp56k.audio.Midi.inputs ()
-  if inputs.Length = 0 then printfn "no MIDI inputs"
-  for i, name in Array.indexed inputs do printfn "%2d  %s" i name
+  for what, ports in [ "inputs", dsp56k.audio.Midi.inputs (); "outputs", dsp56k.audio.Midi.outputs () ] do
+    printfn "MIDI %s:%s" what (if Array.isEmpty ports then " none" else "")
+    for i, name in Array.indexed ports do printfn "%4d  %s" i name
   0
 
 let audition (args: ParseResults<AuditionArgs>) =
@@ -359,7 +359,19 @@ let audition (args: ParseResults<AuditionArgs>) =
     use track = new Track.Track(pkg, Some machine, Track.defaultLayout, sampleBanks (args.TryGetResult AuditionArgs.Sample))
     track.SetSettings settings
     track.Init 0 |> ignore
-    let voice = Audition.ofTrack track machine
+    let midiOut =
+      match args.TryGetResult AuditionArgs.Midi_Out with
+      | Some port -> Some(new dsp56k.audio.Midi.Output(port))
+      | None -> None
+    let voice, finish =
+      match midiOut with
+      | Some out ->
+        let mirrored, finish = Audition.mirror out baseChannel trackNumber (Audition.ofTrack track machine)
+        // the settings it starts from, as CCs
+        settings |> Array.iteri (fun i s -> if i < 8 then mirrored.parameter i s)
+        mirrored, finish
+      | None -> Audition.ofTrack track machine, ignore
+    use _closeMidiOut = { new IDisposable with member _.Dispose() = finish (); midiOut |> Option.iter (fun m -> (m :> IDisposable).Dispose()) }
     let midi =
       match args.TryGetResult AuditionArgs.Midi_In with
       | Some port -> Some(new dsp56k.audio.Midi.Input(port))
@@ -382,7 +394,7 @@ let audition (args: ParseResults<AuditionArgs>) =
     let onCancel = System.ConsoleCancelEventHandler(fun _ e -> e.Cancel <- true; stopped <- true)
     System.Console.CancelKeyPress.AddHandler onCancel
     try
-      let length = if Double.IsInfinity seconds then "until Ctrl+C" else $"{seconds:F1} s"
+      let length = if Double.IsInfinity seconds then "until Ctrl+C" else sprintf "%.1f s" seconds
       let listening = match args.TryGetResult AuditionArgs.Midi_In with Some p -> $"; MIDI from {p}, track {trackNumber} (note {Audition.MidiMap.note trackNumber}, channel {Audition.MidiMap.channel baseChannel trackNumber + 1})" | None -> ""
       printfn "%s: playing %s at %d Hz, %d channel(s)%s; Ctrl+C stops" name length player.SampleRate player.Channels listening
       let played = Audition.play player.Write voice blocks (args.TryGetResult AuditionArgs.Trig_Every) between (fun () -> stopped)

@@ -1,12 +1,13 @@
-//! MIDI input through midir: a port's channel messages queued for the F# tooling to poll between
-//! blocks. The queue is filled on midir's thread and drained on the caller's; it locks, which is
-//! fine here (neither side is the audio callback).
+//! MIDI through midir. Input: a port's channel messages queued for the F# tooling to poll between
+//! blocks; the queue is filled on midir's thread and drained on the caller's, and it locks, which
+//! is fine here (neither side is the audio callback). Output: messages sent as the caller makes
+//! them.
 
 use std::collections::VecDeque;
 use std::ffi::{CStr, c_char};
 use std::sync::{Arc, Mutex};
 
-use midir::{Ignore, MidiInput, MidiInputConnection};
+use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 
 use crate::{set_error, write_text};
 
@@ -126,6 +127,96 @@ pub unsafe extern "C" fn fsdsp56k_midi_in_poll(input: *mut MidiIn, out: *mut u32
 pub unsafe extern "C" fn fsdsp56k_midi_in_close(input: *mut MidiIn) {
     if !input.is_null() {
         drop(unsafe { Box::from_raw(input) });
+    }
+}
+
+/// An open output.
+pub struct MidiOut {
+    connection: MidiOutputConnection,
+}
+
+/// The output ports' names.
+pub fn output_names() -> Result<Vec<String>, String> {
+    let m = MidiOutput::new(CLIENT).map_err(|e| e.to_string())?;
+    m.ports().iter().map(|p| m.port_name(p).map_err(|e| e.to_string())).collect()
+}
+
+fn open_output(port: &str) -> Result<MidiOut, String> {
+    let m = MidiOutput::new(CLIENT).map_err(|e| e.to_string())?;
+    if let Some(name) = port.strip_prefix("virtual:") {
+        #[cfg(unix)]
+        {
+            use midir::os::unix::VirtualOutput;
+            let connection = m.create_virtual(name).map_err(|e| e.to_string())?;
+            return Ok(MidiOut { connection });
+        }
+        #[cfg(not(unix))]
+        return Err(format!("virtual port {name}: not on this system"));
+    }
+    let ports = m.ports();
+    let names: Vec<String> = ports.iter().map(|p| m.port_name(p).unwrap_or_default()).collect();
+    let index = match port.parse::<usize>() {
+        Ok(i) if i < ports.len() => i,
+        _ => names
+            .iter()
+            .position(|n| n.to_lowercase().contains(&port.to_lowercase()))
+            .ok_or_else(|| format!("no MIDI output '{port}' (have: {})", names.join(", ")))?,
+    };
+    let connection = m.connect(&ports[index], "fsdsp56k-out").map_err(|e| e.to_string())?;
+    Ok(MidiOut { connection })
+}
+
+/// The output ports' names, one per line, as UTF-8 into `buffer`; the full length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fsdsp56k_midi_outputs(buffer: *mut c_char, length: u32) -> u32 {
+    match output_names() {
+        Ok(names) => unsafe { write_text(&names.join("\n"), buffer, length) },
+        Err(e) => {
+            set_error(e);
+            u32::MAX
+        }
+    }
+}
+
+/// Open an output: an index, part of a port's name, or `virtual:NAME` for a port of our own other
+/// programs read from (macOS and Linux). Null on failure (`fsdsp56k_audio_last_error`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fsdsp56k_midi_out_open(port: *const c_char) -> *mut MidiOut {
+    if port.is_null() {
+        set_error("no port".into());
+        return std::ptr::null_mut();
+    }
+    let port = unsafe { CStr::from_ptr(port) }.to_string_lossy().into_owned();
+    match open_output(&port) {
+        Ok(m) => Box::into_raw(Box::new(m)),
+        Err(e) => {
+            set_error(e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Send one message of `length` bytes; 0 when sent.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fsdsp56k_midi_out_send(output: *mut MidiOut, bytes: *const u8, length: u32) -> i32 {
+    if output.is_null() || bytes.is_null() {
+        return -1;
+    }
+    let output = unsafe { &mut *output };
+    let message = unsafe { std::slice::from_raw_parts(bytes, length as usize) };
+    match output.connection.send(message) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(e.to_string());
+            -1
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fsdsp56k_midi_out_close(output: *mut MidiOut) {
+    if !output.is_null() {
+        drop(unsafe { Box::from_raw(output) });
     }
 }
 

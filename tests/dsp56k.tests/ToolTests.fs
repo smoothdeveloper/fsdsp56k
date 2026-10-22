@@ -146,6 +146,23 @@ let tests =
       Expect.equal (List.ofSeq set) [ 2, 99.0; 7, 5.0 ] "two parameters"
     }
 
+    test "MIDI loops back through a virtual port: what the output sends, the input reads" {
+      needAudio ()
+      if OperatingSystem.IsWindows() then skiptest "no virtual MIDI ports on Windows"
+      let name = $"fsdsp56k-loop-{Guid.NewGuid():N}"
+      use out = new dsp56k.audio.Midi.Output($"virtual:{name}")
+      Expect.contains (dsp56k.audio.Midi.inputs ()) name "the virtual output is an input to others"
+      use input = new dsp56k.audio.Midi.Input(name)
+      out.NoteOn(0, 36, 100)
+      out.Control(0, 18, 99)
+      let received = ResizeArray<dsp56k.audio.Midi.Message>()
+      let until = DateTime.UtcNow.AddSeconds 2.0
+      while received.Count < 2 && DateTime.UtcNow < until do
+        received.AddRange(input.Poll())
+        Threading.Thread.Sleep 5
+      Expect.equal (List.ofSeq received) [ { status = 0x90; data1 = 36; data2 = 100 }; { status = 0xb0; data1 = 18; data2 = 99 } ] "the note and the CC"
+    }
+
     test "audition --midi-list lists the MIDI inputs" {
       needAudio ()
       let code, text = tool [| "audition"; "--midi-list" |]

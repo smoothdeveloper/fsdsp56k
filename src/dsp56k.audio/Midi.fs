@@ -1,5 +1,5 @@
-/// MIDI ports through native/fsdsp56k-audio (midir): the input ports' names, and an input whose
-/// channel messages the caller polls between blocks.
+/// MIDI ports through native/fsdsp56k-audio (midir): the ports' names, an input whose channel
+/// messages the caller polls between blocks, and an output.
 module dsp56k.audio.Midi
 
 open System
@@ -18,6 +18,18 @@ module Raw =
 
   [<DllImport(Output.Lib)>]
   extern void fsdsp56k_midi_in_close(nativeint input)
+
+  [<DllImport(Output.Lib)>]
+  extern uint32 fsdsp56k_midi_outputs(byte[] buffer, uint32 length)
+
+  [<DllImport(Output.Lib)>]
+  extern nativeint fsdsp56k_midi_out_open(byte[] port)
+
+  [<DllImport(Output.Lib)>]
+  extern int fsdsp56k_midi_out_send(nativeint output, byte[] bytes, uint32 length)
+
+  [<DllImport(Output.Lib)>]
+  extern void fsdsp56k_midi_out_close(nativeint output)
 
 let private need () =
   if not (Output.load ()) then failwith "MIDI missing: dotnet fsi native/build.fsx (or set FSDSP56K_AUDIO)"
@@ -39,6 +51,9 @@ let private names (call: byte array -> uint32) =
 
 /// The input ports, in the order an index picks them.
 let inputs () = names (fun b -> Raw.fsdsp56k_midi_inputs(b, uint32 b.Length))
+
+/// The output ports, in the order an index picks them.
+let outputs () = names (fun b -> Raw.fsdsp56k_midi_outputs(b, uint32 b.Length))
 
 /// A channel message: status (kind and channel 0..15) and two data bytes.
 type Message =
@@ -76,3 +91,26 @@ type Input(port: string) =
       if not closed then
         closed <- true
         Raw.fsdsp56k_midi_in_close handle
+
+/// An open output: an index, part of a port's name, or `virtual:NAME` (a port of our own other
+/// programs read from; macOS and Linux).
+type Output(port: string) =
+  do need ()
+  let handle =
+    match Raw.fsdsp56k_midi_out_open(Encoding.UTF8.GetBytes(port + "\000")) with
+    | 0n -> failwith $"MIDI output: {lastError ()}"
+    | h -> h
+  let mutable closed = false
+
+  member _.Send(bytes: byte array) =
+    if Raw.fsdsp56k_midi_out_send(handle, bytes, uint32 bytes.Length) <> 0 then failwith $"MIDI send: {lastError ()}"
+
+  member this.NoteOn(channel: int, note: int, velocity: int) = this.Send [| byte (0x90 ||| channel); byte note; byte velocity |]
+  member this.NoteOff(channel: int, note: int) = this.Send [| byte (0x80 ||| channel); byte note; 0uy |]
+  member this.Control(channel: int, cc: int, value: int) = this.Send [| byte (0xb0 ||| channel); byte cc; byte value |]
+
+  interface IDisposable with
+    member _.Dispose() =
+      if not closed then
+        closed <- true
+        Raw.fsdsp56k_midi_out_close handle
