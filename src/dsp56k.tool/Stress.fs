@@ -96,8 +96,10 @@ let settingsText (cs: Grade.Control array) (settings: float array) =
 
 /// The worst case per phase, as a text table; and whether the trig block stays within the
 /// declared cycles and the track limit.
-// TODO: which calls the declared figure covers is read here as `run` reads it (TRIG+RENDER);
-// INIT is shown, not judged.
+// The declared figure covers TRIG plus RENDER for a block in which the track is triggered (the
+// MDS standard, "Per-track cycle budget"); INIT is shown, not judged.
+// TODO: the standard's figure also includes the firmware's fixed dispatch overhead per track,
+// which the harness does not model: a margin under the declared figure is needed, not shown.
 let report (cs: Grade.Control array) (declared: int) (cases: Case list) =
   let worst phase = cases |> List.maxBy (cycles phase)
   let mean phase = cases |> List.averageBy (cycles phase >> float)
