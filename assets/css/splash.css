@@ -16,11 +16,7 @@ body::before { /* the board: a faint grid of traces */
 .nav .wrap { display: flex; align-items: center; gap: 24px; height: 62px; }
 .brand { display: inline-flex; align-items: center; gap: 10px; color: var(--fg); text-decoration: none !important; }
 .brand img.icon { width: 30px; height: 30px; border-radius: 6px; }
-.wordmark { font: 600 calc(17px * var(--mono-scale) / .92)/1 var(--f-mono); letter-spacing: .04em; color: #e2e8f0; }
-.wordmark .fs { color: var(--cyan-2); } .wordmark .dot { color: var(--orange); }
-.brand .px-wordmark { display: none; height: 26px; width: auto; }
-:root.px-mode .brand .wordmark { display: none; }
-:root.px-mode .brand .px-wordmark { display: block; }
+.brand img.wordmark { display: block; width: auto; height: 26px; }
 .nav nav { display: flex; gap: 22px; margin-left: auto; align-items: center; }
 .nav nav a { color: var(--fg-2); font: 500 14.5px/1 var(--f-body); }
 .nav nav a:hover { color: var(--fg); text-decoration: none; }
@@ -102,12 +98,12 @@ body::before { /* the board: a faint grid of traces */
 
 /* ---- sections ---- */
 section.block { padding: 96px 0 0; }
-.eyebrow { font: 600 calc(12.5px * var(--mono-scale) / .92)/1 var(--f-mono); letter-spacing: .16em; text-transform: uppercase; color: var(--cyan); margin: 0 0 14px; display: flex; align-items: center; gap: 10px; }
-.eyebrow::before { content: ""; width: 22px; height: 2px; background: currentColor; }
-h2.title { margin: 0; font-family: var(--f-display); font-weight: var(--display-weight); letter-spacing: var(--display-track);
+/* a section's one heading: drawn by the art's HeadingsView (assets/headings), these rules are its words' look where
+   the art is not shown (forced colours, print, no module) */
+h2.section-h { margin: 0; font-family: var(--f-display); font-weight: var(--display-weight); letter-spacing: var(--display-track);
            font-size: calc(clamp(30px, 3.6vw, 46px) * var(--display-scale)); line-height: 1.08; color: #f3f7fb; max-width: 20em; text-wrap: balance; }
-.eyebrow.pxable .px-p { font-size: calc(12.5px * var(--pixel-scale) / .82 * .9); line-height: 13px; letter-spacing: .08em; align-self: center; }
 .section-lede { margin: 18px 0 0; max-width: 46em; color: var(--fg-2); font-size: 18px; }
+.section-lede strong { color: #f3f7fb; font-weight: 600; }
 
 .pillars { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; margin-top: 44px; }
 .pillar { position: relative; padding: 26px 24px 24px; border-radius: var(--radius); background: linear-gradient(180deg, var(--panel-2), var(--panel));

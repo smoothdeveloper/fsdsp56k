@@ -244,7 +244,7 @@
     if (label && !tr) label.textContent = S.shown === 'pixel' ? source : 'vector';
   }
 
-  // both letterings of every .pxable (the headline, the kicker, the eyebrows) are laid out at once, stacked in one
+  // both letterings of every .pxable (the headline, the kicker) are laid out at once, stacked in one
   // grid cell (splash.css, .px-stack): switching only changes which is visible, so nothing on the page moves
   for (const el of document.querySelectorAll('.pxable')) {
     if (el.querySelector('.px-stack')) continue;

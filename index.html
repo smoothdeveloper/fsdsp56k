@@ -18,8 +18,7 @@
   <div class="wrap">
     <a class="brand" href="#top" aria-label="fsdsp56k, top of the page">
       <img class="icon" src="assets/logo/house-rest.svg" alt="">
-      <span class="wordmark"><span class="fs">fs</span><span class="dot">·</span>dsp<span class="dot">·</span>56k</span>
-      <img class="px px-wordmark" src="assets/lettering/wordmark-dots@2x.png" width="138" height="26" alt="">
+      <img class="wordmark px" src="assets/lettering/wordmark@2x.png" width="114" height="26" alt="">
     </a>
     <nav aria-label="Main">
       <a href="#why">Why</a>
@@ -32,7 +31,7 @@
   </div>
 </header>
 
-<main>
+<main data-headings="section.block > .wrap > h2.section-h">
 <section class="hero">
   <div class="wrap">
     <div class="hero-copy">
@@ -71,15 +70,14 @@
 </section>
 
 <div class="scroller-band" aria-hidden="true">
-  <canvas id="scroller" class="px" data-text="fs·dsp·56k  ···  write DSP in F#  ···  audition · render · stress  ···  same words on .NET, JavaScript, Rust and the DSP56300  ···  24-bit fixed point  ···  for MDS authors  ···  credits next  ···  "
-          data-credits="credits|Motorola · the DSP56300|Elektron · the Machinedrum|Justin Mammarella & Yatao Li · MDX|Justin Mammarella · MDS|The Usual Suspects · dsp56300|Matt Borgerson · dsp56300 in Rust|Matthew Fecher & Fadedlimes · TX6|fs·dsp·56k"></canvas>
+  <canvas id="scroller" class="px" data-text="fsdsp56k  ···  write DSP in F#  ···  audition · render · stress  ···  same words on .NET, JavaScript, Rust and the DSP56300  ···  24-bit fixed point  ···  for MDS authors  ···  credits next  ···  "
+          data-credits="credits|Motorola · the DSP56300|Elektron · the Machinedrum|Justin Mammarella & Yatao Li · MDX|Justin Mammarella · MDS|The Usual Suspects · dsp56300|Matt Borgerson · dsp56300 in Rust|Matthew Fecher & Fadedlimes · TX6|fsdsp56k"></canvas>
 </div>
 
 <section class="block" id="why">
   <div class="wrap">
-    <p class="eyebrow pxable">Why fsdsp56k</p>
-    <h2 class="title">Hear the idea first. Count the cycles later.</h2>
-    <p class="section-lede">Writing a machine for the Machinedrum's DSP usually starts and ends in hand-written assembly: write it, assemble it with <code>asm56300</code>, pack it, send it over SysEx, and listen. The MDS standard asks you to measure each machine's worst-case cycles before you declare them. fsdsp56k shortens that loop.</p>
+    <h2 class="section-h">Why fsdsp56k</h2>
+    <p class="section-lede"><strong>Hear the idea first. Count the cycles later.</strong> Writing a machine for the Machinedrum's DSP usually starts and ends in hand-written assembly: write it, assemble it with <code>asm56300</code>, pack it, send it over SysEx, and listen. The MDS standard asks you to measure each machine's worst-case cycles before you declare them. fsdsp56k shortens that loop.</p>
 
     <div class="pillars">
       <article class="pillar" style="--c:#56e0fe">
@@ -125,9 +123,8 @@
 
 <section class="block" id="kernel">
   <div class="wrap">
-    <p class="eyebrow pxable">A minimal kernel</p>
-    <h2 class="title">Plain F#, the DSP's arithmetic.</h2>
-    <p class="section-lede">The sine generator from Justin Mammarella's MDS examples (<a href="https://github.com/jmamma/MDS/blob/c446179d6d73a82b117ee20eb2216af78734a795/machines/examples/sine/sine.asm56k">jmamma/MDS, sine.asm56k</a>), ported. It runs as .NET code, and compiled it gives the same words as the original package.</p>
+    <h2 class="section-h">A minimal kernel</h2>
+    <p class="section-lede"><strong>Plain F#, the DSP's arithmetic.</strong> The sine generator from Justin Mammarella's MDS examples (<a href="https://github.com/jmamma/MDS/blob/c446179d6d73a82b117ee20eb2216af78734a795/machines/examples/sine/sine.asm56k">jmamma/MDS, sine.asm56k</a>), ported. It runs as .NET code, and compiled it gives the same words as the original package.</p>
     <div class="showcase">
       <div>
         <div class="code-head"><span class="dots"><i></i><i></i><i></i></span>Sine.fs</div>
@@ -176,9 +173,8 @@ let render (p: Params) (s: State) (out: Output) =
 
 <section class="block" id="playground">
   <div class="wrap">
-    <p class="eyebrow pxable">Playground</p>
-    <h2 class="title">Hear it here, in four runtimes.</h2>
-    <p class="section-lede">Pick a kernel and a runtime, then audition it live or render its phrase. The same F# runs as JavaScript and as Rust compiled to wasm; the DSP56300 runtime is The Usual Suspects' dsp56300 emulator, built for the browser, running the compiled kernel's program. Each runtime is checked block by block against the .NET reference.</p>
+    <h2 class="section-h">Playground</h2>
+    <p class="section-lede"><strong>Hear it here, in four runtimes.</strong> Pick a kernel and a runtime, then audition it live or render its phrase. The same F# runs as JavaScript and as Rust compiled to wasm; the DSP56300 runtime is The Usual Suspects' dsp56300 emulator, built for the browser, running the compiled kernel's program. Each runtime is checked block by block against the .NET reference.</p>
     <div class="pg-serve" id="pg-serve" hidden>
       <b>Opened from disk.</b> The .NET reference plays from its WAVs; the three live runtimes and the word-for-word checks need the page served over http.
       In this folder: <code>dotnet fsi build.fsx serve</code>, then open <a href="http://localhost:8056/#playground">localhost:8056</a>.
@@ -246,9 +242,8 @@ let render (p: Params) (s: State) (out: Output) =
 
 <section class="block" id="commands">
   <div class="wrap">
-    <p class="eyebrow pxable">The command line</p>
-    <h2 class="title">One tool, from source to SysEx.</h2>
-    <p class="section-lede">DSP56300 commands work on any code for the chip. The Machinedrum's live under <code>machinedrum</code>, or <code>md</code>. <code>run</code>, <code>stress</code> and <code>audition</code> take an MDS package, a SysEx dump, or an F# kernel as a project, a script or one file.</p>
+    <h2 class="section-h">The command line</h2>
+    <p class="section-lede"><strong>One tool, from source to SysEx.</strong> DSP56300 commands work on any code for the chip. The Machinedrum's live under <code>machinedrum</code>, or <code>md</code>. <code>run</code>, <code>stress</code> and <code>audition</code> take an MDS package, a SysEx dump, or an F# kernel as a project, a script or one file.</p>
     <div class="cmd-groups">
       <div class="cmd-group">
         <h3>Write &amp; check</h3>
@@ -283,9 +278,8 @@ let render (p: Params) (s: State) (out: Output) =
 
 <section class="block" id="start">
   <div class="wrap">
-    <p class="eyebrow pxable">Get started</p>
-    <h2 class="title">From clone to a WAV in five lines.</h2>
-    <p class="section-lede">You need the .NET SDK and a Rust toolchain (for the native DSP56300 oracle and emulator).</p>
+    <h2 class="section-h">Get started</h2>
+    <p class="section-lede"><strong>From clone to a WAV in five lines.</strong> You need the .NET SDK and a Rust toolchain (for the native DSP56300 oracle and emulator).</p>
     <div class="start">
       <div>
         <div class="code-head"><span class="dots"><i></i><i></i><i></i></span>terminal</div>
@@ -306,8 +300,8 @@ $ dotnet run --project src/dsp56k.tool -- run tests/dsp56k.tests/Kernels/Sine.fs
 
 <section class="block" id="credits">
   <div class="wrap">
-    <p class="eyebrow pxable">Credits</p>
-    <h2 class="title">Standing on other people's work.</h2>
+    <h2 class="section-h">Credits</h2>
+    <p class="section-lede"><strong>Standing on other people's work.</strong></p>
     <div class="credits">
       <div class="credit"><b>Motorola</b><span>For the DSP56000 family and its DSP56300 generation, and for <code>asm56300</code>, whose dialect our assembler follows.</span></div>
       <div class="credit"><b>Elektron</b><span>For the Machinedrum and its original firmware, whose machine design MDS follows.</span></div>
@@ -324,7 +318,7 @@ $ dotnet run --project src/dsp56k.tool -- run tests/dsp56k.tests/Kernels/Sine.fs
 <footer class="foot">
   <div class="wrap">
     <div>
-      <p><span class="wordmark"><span class="fs">fs</span><span class="dot">·</span>dsp<span class="dot">·</span>56k</span> is free software under the GNU Affero General Public License, version 3 or later.</p>
+      <p>fsdsp56k is free software under the GNU Affero General Public License, version 3 or later.</p>
       <p>An independent project, not affiliated with or endorsed by Elektron. Machinedrum is a trademark of its owner.</p>
     </div>
     <div class="links"><a href="readme.html">README</a><a href="https://github.com/smoothdeveloper/fsdsp56k">GitHub</a><a href="#top">Top ↑</a></div>
@@ -333,6 +327,7 @@ $ dotnet run --project src/dsp56k.tool -- run tests/dsp56k.tests/Kernels/Sine.fs
 
 <script src="assets/pixel/fsdsp56k-pixel-font.js"></script>
 <script type="module" src="assets/logo/fsdsp56k-logo.mjs"></script>
+<script type="module" src="assets/headings/fsdsp56k-headings.mjs"></script>
 <script src="assets/icons/fsdsp56k-icon-pixels.js"></script>
 <script src="assets/icons/fsdsp56k-command-icons.js"></script>
 <script src="assets/js/hero.js"></script>

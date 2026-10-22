@@ -31,7 +31,7 @@
     while (cols.length && !cols[cols.length - 1].length) cols.pop();
     return cols;
   }
-  const scroll = columns(cv.dataset.text || 'fs·dsp·56k');
+  const scroll = columns(cv.dataset.text || 'fsdsp56k');
   for (let s = 0; s < 3 + font.spacing; s++) scroll.push([]);
   const credits = (cv.dataset.credits || '').split('|').map(s => s.trim()).filter(Boolean).map(t => ({ text: t, cols: columns(t) }));
   const RAMP = ['#1788A4', '#30B9DB', '#56E0FE', '#6BE6FF', '#fff3a0', '#FFB020', '#fff3a0', '#6BE6FF', '#56E0FE', '#30B9DB'];

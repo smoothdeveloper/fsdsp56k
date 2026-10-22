@@ -24,7 +24,7 @@
 
 <header class="topbar">
   <div class="in">
-    <a class="brand" href="index.html"><img src="assets/logo/house-rest.svg" alt=""><span class="wordmark"><span class="fs">fs</span><span class="dot">·</span>dsp<span class="dot">·</span>56k</span><span class="sub">README</span></a>
+    <a class="brand" href="index.html"><img src="assets/logo/house-rest.svg" alt=""><img class="wordmark px" src="assets/lettering/wordmark@2x.png" width="114" height="26" alt="fsdsp56k"><span class="sub">README</span></a>
     <div class="right">
       <button type="button" class="chip toc-toggle" id="toc-toggle" aria-expanded="false" aria-controls="toc">☰ Contents</button>
       <div class="dock-slot" data-type-dock></div>
@@ -90,10 +90,10 @@
   </div>
 </aside>
 
-<article class="doc">
+<article class="doc" data-headings=".doc > h2, .doc > h3">
 
 <div class="doc-hero" id="overview">
-  <img class="banner px" src="assets/lettering/banner-fsdsp56k@2x.png" width="1536" height="288" alt="fsdsp56k">
+  <h1 class="doc-title"><img class="banner px" src="assets/lettering/banner-fsdsp56k@2x.png" width="1536" height="288" alt="fsdsp56k"></h1>
   <p class="lead">F# tooling for the Motorola DSP56300 family, and on top of it, a workflow for writing Machinedrum machines: MDS packages for X.20, the MDX custom firmware.</p>
   <div class="badges">
     <span class="badge"><b>F#</b> .NET</span>
@@ -115,7 +115,7 @@
   <li>Would a set of real, shipped machines as a regression suite make you braver about changing things?</li>
 </ul>
 
-<h3 id="what-you-get">What you get<a class="anchor" href="#what-you-get">#</a></h3>
+<h3 id="what-you-get">What you get<a class="anchor" href="#what-you-get" aria-label="Link to this section"></a></h3>
 <p>If some of these are yes, this is what fsdsp56k gives you:</p>
 <ul class="features">
   <li><strong>An F# prototype.</strong> A machine is a module of three functions (<code>init</code>, <code>trig</code>, <code>render</code>) over fixed-point types that behave like the DSP's own arithmetic.</li>
@@ -126,7 +126,7 @@
   <li><strong>A real test suite.</strong> All eight drums of kitbasher's TX6 kit and Justin Mammarella's four MDS examples are ported and graded on every test run, each identical, word for word, to the machine it was ported from.</li>
 </ul>
 
-<h3 id="assembly-as-fsharp">Assembly as F#<a class="anchor" href="#assembly-as-fsharp">#</a></h3>
+<h3 id="assembly-as-fsharp">Assembly as F#<a class="anchor" href="#assembly-as-fsharp" aria-label="Link to this section"></a></h3>
 <p>You can also skip the kernel layer and write the assembly yourself, in F#. Plain assembly shares code through <code>include</code>, <code>equ</code>, <code>define</code> and conditional assembly, and it does that well: in the MDS sample-playback examples, four machines are each a few <code>equ</code> lines over one shared <code>sample_player.inc</code>. The DSL writes DSP56300 programs as F# arrays of instructions, so the same ideas become ordinary F#: a routine is a function of its labels, offsets and counts, a <code>for</code> loop unrolls it, and an <code>if</code> chooses its shape when the program is built.</p>
 <div class="code-head"><span class="dots"><i></i><i></i><i></i></span>ClearY.fsx</div>
 <pre class="code" data-lang="fsharp"><code>open dsp56k.dsl
@@ -153,7 +153,7 @@ let listing = Program.source program   // INIT as a DO loop, TRIG as three moves
 let words   = Program.words program    // 13 P words</code></pre>
 <p>The assembler, disassembler and emulator work on any DSP56300 code, whether it was written this way or by hand.</p>
 
-<h2 id="getting-started">Getting started<a class="anchor" href="#getting-started">#</a></h2>
+<h2 id="getting-started">Getting started<a class="anchor" href="#getting-started" aria-label="Link to this section"></a></h2>
 <p>You need the .NET SDK and a Rust toolchain: <code>native/</code> builds the DSP56300 oracle and emulator.</p>
 <div class="code-head"><span class="dots"><i></i><i></i><i></i></span>build</div>
 <pre class="code" data-lang="shell"><code>$ git clone https://github.com/smoothdeveloper/fsdsp56k
@@ -168,8 +168,7 @@ $ (cd native &amp;&amp; cargo build --release)      # oracle, emulator, import, 
 <pre class="code" data-lang="shell"><code>$ dotnet run --project tests/dsp56k.tests</code></pre>
 <div class="todo"><b>TODO</b>Check the first-render line against the released CLI (kernel path and flags), and add a packaged install (<code>dotnet tool install</code>) once it is published.</div>
 
-<h2 id="commands">Commands<a class="anchor" href="#commands">#</a></h2>
-<img class="rule-img px" src="assets/lettering/heading-commands@2x.png" width="1536" height="192" alt="">
+<h2 id="commands">Commands<a class="anchor" href="#commands" aria-label="Link to this section"></a></h2>
 <p>DSP56300 commands work on any code for the chip; a host's commands live under its name (today the Machinedrum: <code>machinedrum</code>, or <code>md</code>). <code>run</code>, <code>stress</code> and <code>audition</code> take a machine for a host (<code>--host</code>, default <code>machinedrum</code>): an MDS package or SysEx dump, or an F# kernel as a project, a script or one file (<code>--kernel</code> picks one when it defines several). <code>fsdsp56k &lt;command&gt; --help</code> lists every flag.</p>
 <div class="table-wrap">
 <table class="cmds">
@@ -278,11 +277,10 @@ $ (cd native &amp;&amp; cargo build --release)      # oracle, emulator, import, 
   <h4>Workflows</h4><div class="todo"><b>TODO</b>Playing a kernel from a controller next to the real machine.</div>
 </section>
 
-<h2 id="kernels">Kernels<a class="anchor" href="#kernels">#</a></h2>
-<img class="rule-img px" src="assets/lettering/heading-kernels@2x.png" width="1536" height="192" alt="">
+<h2 id="kernels">Kernels<a class="anchor" href="#kernels" aria-label="Link to this section"></a></h2>
 <p>A kernel is a Machinedrum machine written as ordinary F# over fixed-point types (<code>Frac</code>, <code>Acc</code>, <code>Long</code>). The same code runs as a prototype, to hear and test it, and compiled to DSP56300 code that the Machinedrum runs. The grade checks that both give the same words.</p>
 
-<h3 id="pipeline">From F# to a running machine<a class="anchor" href="#pipeline">#</a></h3>
+<h3 id="pipeline">From F# to a running machine<a class="anchor" href="#pipeline" aria-label="Link to this section"></a></h3>
 <div class="pipeline" role="img" aria-label="The F# kernel goes through the front end, the IR, the code generator and the optimiser to DSP56300 items and an MDS package, to audition and render; the same F# runs on .NET as the prototype, and the grade compares both.">
   <div class="lane">
     <div class="lane-label">compile</div>
@@ -310,11 +308,10 @@ $ (cd native &amp;&amp; cargo build --release)      # oracle, emulator, import, 
   <li><strong>Audition and grade.</strong> fsdsp56k allows you to audition and render your kernels on the DSP56300 emulator, with an MDS-style workset. The grade runs a scenario there, runs the same F# prototype on .NET, and compares output and state word for word, and against the shipped machine when there is one.</li>
 </ol>
 
-<h3 id="portable">The prototype beyond .NET<a class="anchor" href="#portable">#</a></h3>
+<h3 id="portable">The prototype beyond .NET<a class="anchor" href="#portable" aria-label="Link to this section"></a></h3>
 <p>The kernel functions are plain F#, so <a href="https://fable.io/docs/">Fable</a> can compile them too. <code>portable/</code> builds the same <code>init</code>, <code>trig</code> and <code>render</code> with Fable to JavaScript and, with Fable's Rust backend, to Rust as WebAssembly and as a native library, and checks each one's output and state after every block against the .NET run, the run the emulator is graded against. SINE, PLUCK and INPUT-THRU pass on every target; the suite is opt-in and not part of the default test run. <code>wasm/</code> plays the Rust/WebAssembly build in a browser AudioWorklet.</p>
 
-<h3 id="declares">What a kernel declares<a class="anchor" href="#declares">#</a></h3>
-<img class="rule-img px" src="assets/lettering/rule-what-a-kernel-declares@2x.png" width="1536" height="108" alt="">
+<h3 id="declares">What a kernel declares<a class="anchor" href="#declares" aria-label="Link to this section"></a></h3>
 <div class="table-wrap">
 <table>
   <thead><tr><th>Part</th><th>In the F#</th><th>On the Machinedrum</th></tr></thead>
@@ -341,7 +338,7 @@ $ (cd native &amp;&amp; cargo build --release)      # oracle, emulator, import, 
 </div>
 <p>Each track's workset is 64-word aligned on the Machinedrum. That is why a ring over state (modulo addressing) is allowed there.</p>
 
-<h3 id="minimal-kernel">A minimal kernel<a class="anchor" href="#minimal-kernel">#</a></h3>
+<h3 id="minimal-kernel">A minimal kernel<a class="anchor" href="#minimal-kernel" aria-label="Link to this section"></a></h3>
 <p>The sine generator from Justin Mammarella's MDS examples, from <code>tests/dsp56k.tests/Kernels/Sine.fs</code>:</p>
 <div class="code-head"><span class="dots"><i></i><i></i><i></i></span>tests/dsp56k.tests/Kernels/Sine.fs</div>
 <pre class="code" data-lang="fsharp"><code>module samples.kernels.Sine
@@ -377,7 +374,7 @@ let render (p: Params) (s: State) (out: Output) =
   s.phase &lt;- Long.ofAcc phase
   s.ampPrev &lt;- plain p.amp</code></pre>
 
-<h3 id="can-use">What kernels can use<a class="anchor" href="#can-use">#</a></h3>
+<h3 id="can-use">What kernels can use<a class="anchor" href="#can-use" aria-label="Link to this section"></a></h3>
 <ul>
   <li><strong>Arithmetic:</strong> <code>Frac</code>, <code>Acc</code> and <code>Long</code> with the DSP's own rounding and saturation, MPYR/MACR, and an LFSR step. Each operation has an F# meaning that the tests check against the emulator.</li>
   <li><strong>State:</strong> <code>Frac</code>, <code>Long</code> (two words), <code>Acc</code> (three words, exact) and fixed-length <code>Frac</code> arrays, indexed by a constant, the loop index (<code>s.h[i + 1]</code>), or a run-time word (<code>s.h[Frac.index k]</code>). In the prototype an index outside the array fails; on the DSP it reaches another word.</li>
@@ -387,7 +384,7 @@ let render (p: Params) (s: State) (out: Output) =
 </ul>
 <p>A voice record read when compiling picks the code: the TX6 toms and hats are one engine each, and LT's glide (<code>if voice.glide</code>) or CY's bell layer (<code>match voice.layer with ...</code>) is decided at compile time, so each kernel holds only its own code.</p>
 
-<h3 id="fixtures">The fixture machines<a class="anchor" href="#fixtures">#</a></h3>
+<h3 id="fixtures">The fixture machines<a class="anchor" href="#fixtures" aria-label="Link to this section"></a></h3>
 <p>The TX6 kit's eight drums, by Matthew Fecher (AnalogMatthew) and Fadedlimes, published under the MIT licence in <a href="https://github.com/etcetc000/kitbasher">etcetc000/kitbasher</a>, are the most comprehensive suite of real machines the compiler is held to: glides, layered metal, noise and tables, each reproduced word for word. They are what made the compiler robust; many thanks to their authors.</p>
 <p><code>tests/dsp56k.tests/Kernels</code> ports twelve machines: Justin Mammarella's four MDS examples and all eight drums of kitbasher's TX6 kit (BD, LT, HT, CH, OH, CY, SD, CP, in five kernel files). The tests grade each against the machine it was ported from:</p>
 <div class="table-wrap">
@@ -408,7 +405,7 @@ let render (p: Params) (s: State) (out: Output) =
 </div>
 <p>Each is word for word identical to the shipped machine on the emulator, and to the same F# run as .NET code.</p>
 
-<h3 id="grade-output">What a grade writes<a class="anchor" href="#grade-output">#</a></h3>
+<h3 id="grade-output">What a grade writes<a class="anchor" href="#grade-output" aria-label="Link to this section"></a></h3>
 <p>Everything goes under <code>out/kernels/</code> (untracked, and cleared by the run that regenerates it):</p>
 <ul>
   <li><code>report.html</code>: per kernel, the verdicts, the output against the reference (SVG), the cycles of every call against the track limit, the costs, and three listings side by side: the F#, the generated assembly (hovering a line highlights the F# it came from) and the ported source, each entry point aligned with the reference's disassembly.</li>
@@ -416,7 +413,7 @@ let render (p: Params) (s: State) (out: Output) =
 </ul>
 <p>A scenario plays two bars at 120 BPM as a sequencer would (trigs, parameter locks), then sweeps each control from its default and covers every pair of controls at low, default and high values.</p>
 
-<h2 id="layers">Layers<a class="anchor" href="#layers">#</a></h2>
+<h2 id="layers">Layers<a class="anchor" href="#layers" aria-label="Link to this section"></a></h2>
 <p>The DSP56300 libraries know nothing about the Machinedrum; the Machinedrum libraries build on them; the kernel compiler, the samples and the command-line tool sit on top.</p>
 <div class="table-wrap">
 <table>
@@ -435,14 +432,14 @@ let render (p: Params) (s: State) (out: Output) =
     <tr><td><code>src/dsp56k.kernel.grade</code></td><td>Runs a scenario three ways (.NET kernel, compiled program, reference) and reports correctness, fidelity, cost and listing alignment</td></tr>
     <tr><td><code>portable</code></td><td>Opt-in direct F# execution: .NET, Fable JavaScript, Fable Rust/WASM; exact sample checks and render timing</td></tr>
     <tr><td colspan="2"><strong>On top</strong></td></tr>
-    <tr><td><code>src/dsp56k.tool</code></td><td>The <code>fsdsp56k</code> command line</td></tr>
+    <tr><td><code>src/dsp56k.tool</code></td><td>The fsdsp56k command line</td></tr>
     <tr><td><code>tests/dsp56k.tests</code></td><td>Expecto tests</td></tr>
   </tbody>
 </table>
 </div>
 <div class="todo"><b>TODO</b>Re-check this table against the released tree (<code>dsp56k.audio</code>, the samples folder, the host modules).</div>
 
-<h2 id="dsl">The DSL<a class="anchor" href="#dsl">#</a></h2>
+<h2 id="dsl">The DSL<a class="anchor" href="#dsl" aria-label="Link to this section"></a></h2>
 <p>A program is an array of items written with F# functions, so loops, tables and variants are ordinary F# code:</p>
 <div class="code-head"><span class="dots"><i></i><i></i><i></i></span>ClearWorkset.fsx</div>
 <pre class="code" data-lang="fsharp"><code>open dsp56k.dsl
@@ -462,8 +459,7 @@ let clearWorkset = [|
 let words = Program.words clearWorkset        // assembled with the same encoder as listings
 let listing = Program.source clearWorkset     // Motorola syntax, for asm56300 or review</code></pre>
 
-<h2 id="credits">Credits<a class="anchor" href="#credits">#</a></h2>
-<img class="rule-img px" src="assets/lettering/heading-credits@2x.png" width="1536" height="192" alt="">
+<h2 id="credits">Credits<a class="anchor" href="#credits" aria-label="Link to this section"></a></h2>
 <p>fsdsp56k stands on other people's work, and we are grateful for all of it.</p>
 <ul class="credits-list">
   <li><strong>Motorola</strong>The house of the 68000, for the DSP56000 family (1986), designed to stay close enough to Motorola's microprocessors to be easy to learn, and its DSP56300 generation; and for <code>asm56300</code> and its CLD/LOD tooling, whose dialect and sizing rules our assembler follows. The line passed to Freescale in 2004 and to NXP in 2015, whose Symphony Studio still supports DSP56300 development.</li>
@@ -475,7 +471,7 @@ let listing = Program.source clearWorkset     // Motorola syntax, for asm56300 o
   <li><strong>The TX6 authors</strong>Matthew Fecher (AnalogMatthew) and Fadedlimes, for the TX6 drum kit in <a href="https://github.com/etcetc000/kitbasher">kitbasher</a>. Its DSP sources are MIT-licensed, and all eight drums are ported and graded here.</li>
 </ul>
 
-<h2 id="licence">Licence<a class="anchor" href="#licence">#</a></h2>
+<h2 id="licence">Licence<a class="anchor" href="#licence" aria-label="Link to this section"></a></h2>
 <p>fsdsp56k is free software under the GNU Affero General Public License, version 3 or (at your option) any later version (AGPL-3.0-or-later); the full text is in <code>LICENSE</code>. The crates in <code>native/</code> and <code>portable/</code> carry the same licence. The ported machines credit their authors and keep their terms (<code>THIRD-PARTY-NOTICES.md</code>); dependencies keep theirs (mborgerson/dsp56300: MIT; the dsp56300 interpreter the WebAssembly build compiles: GPL-3.0, not in this repository).</p>
 
 <p class="doc-foot">An independent project, not affiliated with or endorsed by Elektron. Machinedrum is a trademark of its owner. · <a href="index.html">Home</a> · <a href="#overview">Top ↑</a></p>
@@ -483,6 +479,7 @@ let listing = Program.source clearWorkset     // Motorola syntax, for asm56300 o
 </div>
 
 <script src="assets/js/highlight.js"></script>
+<script type="module" src="assets/headings/fsdsp56k-headings.mjs"></script>
 <script>
 (() => {
   // the theme chips
