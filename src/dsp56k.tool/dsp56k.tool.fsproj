@@ -9,6 +9,7 @@
   <ItemGroup>
     <Compile Include="Cli.fs" />
     <Compile Include="Stress.fs" />
+    <Compile Include="Audition.fs" />
     <Compile Include="Commands.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
@@ -16,6 +17,7 @@
     <ProjectReference Include="../dsp56k/dsp56k.fsproj" />
     <ProjectReference Include="../dsp56k.dsl/dsp56k.dsl.fsproj" />
     <ProjectReference Include="../dsp56k.native/dsp56k.native.fsproj" />
+    <ProjectReference Include="../dsp56k.audio/dsp56k.audio.fsproj" />
     <ProjectReference Include="../machinedrum/machinedrum.fsproj" />
     <ProjectReference Include="../machinedrum.run/machinedrum.run.fsproj" />
     <ProjectReference Include="../dsp56k.kernel.grade/dsp56k.kernel.grade.fsproj" />

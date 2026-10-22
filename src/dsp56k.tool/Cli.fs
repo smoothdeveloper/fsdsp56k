@@ -154,6 +154,23 @@ type StressArgs =
       | Blocks _ -> "RENDER blocks per case (default 16)."
       | Sample _ -> "WAV loaded as the internal and userwave sample banks."
 
+type AuditionArgs =
+  | [<MainCommand; ExactlyOnce>] Input of path: string
+  | Slot of int
+  | Settings of values: string
+  | Trig_Every of blocks: int
+  | Seconds of float
+  | Sample of wav: string
+  interface IArgParserTemplate with
+    member a.Usage =
+      match a with
+      | Input _ -> ".mds package or .syx dump."
+      | Slot _ -> "slot (1..16) to take from a .syx holding several machines."
+      | Settings _ -> "front-panel settings, comma separated (default: the parameters' defaults)."
+      | Trig_Every _ -> "retrigger every N blocks (default: once, at the start)."
+      | Seconds _ -> "how long to play (default 4; Ctrl+C stops sooner)."
+      | Sample _ -> "WAV loaded as the internal and userwave sample banks."
+
 type Command =
   | [<CliPrefix(CliPrefix.None)>] Asm of ParseResults<AsmArgs>
   | [<CliPrefix(CliPrefix.None)>] Check of ParseResults<CheckArgs>
@@ -162,6 +179,7 @@ type Command =
   | [<CliPrefix(CliPrefix.None)>] Mds of ParseResults<MdsArgs>
   | [<CliPrefix(CliPrefix.None)>] Run of ParseResults<RunArgs>
   | [<CliPrefix(CliPrefix.None)>] Stress of ParseResults<StressArgs>
+  | [<CliPrefix(CliPrefix.None)>] Audition of ParseResults<AuditionArgs>
   interface IArgParserTemplate with
     member a.Usage =
       match a with
@@ -172,3 +190,4 @@ type Command =
       | Mds _ -> "MDS packages and SysEx dumps."
       | Run _ -> "run a machine on the emulator: output WAV and cycle report."
       | Stress _ -> "worst-case INIT, TRIG and RENDER cycles over many settings, as a table."
+      | Audition _ -> "play a machine on the emulator live through the default audio output."

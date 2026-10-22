@@ -331,3 +331,37 @@ let stress (args: ParseResults<StressArgs>) =
     let lines, within = Stress.report cs pkg.maxCycles cases
     for l in lines do printfn "%s" l
     if within then 0 else 1
+
+// ---------------------------------------------------------------------------------------------
+// Live output.
+
+let audition (args: ParseResults<AuditionArgs>) =
+  match loadMachine (args.GetResult AuditionArgs.Input) (args.TryGetResult AuditionArgs.Slot) with
+  | Error e -> fail e
+  | Ok(name, pkg, machine) ->
+    let settings =
+      match args.TryGetResult AuditionArgs.Settings with
+      | Some s -> s.Split ',' |> Array.map float
+      | None -> machine.parameters |> Array.map (fun p -> float p.defaultValue)
+    use track = new Track.Track(pkg, Some machine, Track.defaultLayout, sampleBanks (args.TryGetResult AuditionArgs.Sample))
+    track.SetSettings settings
+    track.Init 0 |> ignore
+    let rate = 44100
+    // a quarter second of ring: latency against underruns
+    use player = new dsp56k.audio.Output.Player(rate, rate / 4)
+    if player.SampleRate <> rate then
+      // TODO: resample; until then the pitch is off by the ratio
+      eprintfn "warning: the output plays at %d Hz, not %d: pitch off by %.3f" player.SampleRate rate (float player.SampleRate / float rate)
+    let seconds = args.GetResult(AuditionArgs.Seconds, 4.0)
+    let blocks = int (seconds * float rate / 32.0)
+    let mutable stopped = false
+    let onCancel = System.ConsoleCancelEventHandler(fun _ e -> e.Cancel <- true; stopped <- true)
+    System.Console.CancelKeyPress.AddHandler onCancel
+    try
+      printfn "%s: playing %.1f s at %d Hz, %d channel(s); Ctrl+C stops" name seconds player.SampleRate player.Channels
+      let played = Audition.play player.Write (Audition.ofTrack track machine) blocks (args.TryGetResult AuditionArgs.Trig_Every) ignore (fun () -> stopped)
+      player.Drain(System.TimeSpan.FromSeconds 1.0)
+      printfn "played %d blocks, %d trigs, %d underrun frames" played.blocks played.trigs player.Underruns
+      0
+    finally
+      System.Console.CancelKeyPress.RemoveHandler onCancel

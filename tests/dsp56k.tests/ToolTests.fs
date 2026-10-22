@@ -109,6 +109,22 @@ let tests =
       Expect.isLessThanOrEqual found.evaluations 400 "within the budget"
     }
 
+    test "audition's loop triggers on schedule and writes every block's frames" {
+      needFixture "kitbasher"
+      needNative ()
+      match dsp56k.tool.Commands.loadMachine (fixture "kitbasher" </> "mds" </> "tx6" </> "cp" </> "cp.syx") None with
+      | Error e -> failtest e
+      | Ok(_, pkg, machine) ->
+        use track = new machinedrum.run.Track.Track(pkg, Some machine, machinedrum.run.Track.defaultLayout, Map.empty)
+        track.SetSettings(machine.parameters |> Array.map (fun p -> float p.defaultValue))
+        track.Init 0 |> ignore
+        let written = ResizeArray<float32>()
+        let played = dsp56k.tool.Audition.play written.AddRange (dsp56k.tool.Audition.ofTrack track machine) 40 (Some 16) ignore (fun () -> false)
+        Expect.equal played { blocks = 40; trigs = 3 } "blocks 0, 16 and 32 trigger"
+        Expect.equal written.Count (40 * 32) "32 frames a block"
+        Expect.isTrue (written |> Seq.exists (fun f -> f <> 0.0f)) "it makes a sound"
+    }
+
     test "stress cases: the defaults first, then each control swept and the pairwise rows" {
       let cs : dsp56k.kernel.Grade.Control array =
         [| { name = "A"; low = 0.0; high = 127.0; standard = 64.0 }
