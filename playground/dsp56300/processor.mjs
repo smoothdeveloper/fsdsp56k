@@ -3,7 +3,6 @@ import { r as h } from "./Reflection.mjs";
 import { _ as g, a as _, b as v, c as y, d as b, f as x, g as S, h as C, i as w, l as T, n as E, o as D, r as O, s as k, t as A, u as j, v as M, x as N, y as P } from "./Range.mjs";
 import { i as F, n as I, r as L, t as R } from "./ProcessingTiming.mjs";
 import z from "./dsp56300.mjs";
-//#region Processor.fs
 var B = class extends AudioWorkletProcessor {
 	constructor(e) {
 		super(), this.this = new t(n()), this.options = e, this.this.contents = this, this.pending = void 0, this.kernel = void 0, this.block = [], this.cursor = 0, this.playing = !1, this.gain = .15, this.level = 0, this.quanta = 0, this.timing = R(), this.timer = typeof performance < "u" && typeof performance.now == "function" ? "high-resolution" : "1ms", this.loadRequest = 0, this.trace = i(Array(1024), 0, 1024, 0), this.traceCursor = 0, this.regions = [], this.regionTraces = [], this.regionCursors = [], this.writes = void 0, this.steps = 0, this.watch = [], this["init@29"] = 1, this.this.contents.port.onmessage = ((e) => {
@@ -201,5 +200,4 @@ function H(e) {
 	return new B(e);
 }
 registerProcessor("dsp56300", B);
-//#endregion
 export { B as DspProcessor, H as DspProcessor_$ctor_4E60E31B, V as DspProcessor_$reflection };

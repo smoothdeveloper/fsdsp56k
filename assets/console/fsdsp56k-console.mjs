@@ -1987,7 +1987,6 @@ function Yr(e, t) {
 function Xr(e) {
 	return Lr(e);
 }
-// fsdsp56k-art/art/src/Pixels.fs
 var Zr = class extends S {
 	constructor(e, t, n) {
 		super(), this.r = e, this.g = t, this.b = n;
@@ -2130,7 +2129,6 @@ function Ci(e, t, n) {
 	for (let r = 0; r <= e.w - 1; r++) Y(e, r, 0, t, n), Y(e, r, e.h - 1, t, n);
 	for (let r = 1; r <= e.h - 2; r++) Y(e, 0, r, t, n), Y(e, e.w - 1, r, t, n);
 }
-// fsdsp56k-art/art/src/Font.fs
 var wi = class extends S {
 	constructor(e, t, n) {
 		super(), this.height = e | 0, this.spacing = t | 0, this.glyphs = n;
@@ -2203,7 +2201,6 @@ function Ai(e, t, n, r, i, a) {
 function ji(e, t, n, r, i, a, o) {
 	ki(e, t, r + ~~((n - Oi(t, o)) / 2), i, a, o);
 }
-// fsdsp56k-art/art/src/Console.fs
 var X = class e extends we {
 	constructor(e, t) {
 		super(), this.tag = e, this.fields = t;
@@ -2432,7 +2429,6 @@ function Qi(e, n) {
 	if (e.has(n)) return e.get(n);
 	throw new t(`The given key '${n}' was not present in the dictionary.`);
 }
-// fsdsp56k-art/art/src/Aesthetic.fs
 var $i = class e extends we {
 	constructor(e, t) {
 		super(), this.tag = e, this.fields = t;
@@ -2738,7 +2734,6 @@ window.fsdsp56kIcon = {
 	spacing: 1,
 	glyphs: "\n= A\n.###.\n#...#\n#...#\n#####\n#...#\n#...#\n#...#\n.....\n.....\n= B\n####.\n#...#\n#...#\n####.\n#...#\n#...#\n####.\n.....\n.....\n= C\n.###.\n#...#\n#....\n#....\n#....\n#...#\n.###.\n.....\n.....\n= D\n####.\n#...#\n#...#\n#...#\n#...#\n#...#\n####.\n.....\n.....\n= E\n#####\n#....\n#....\n####.\n#....\n#....\n#####\n.....\n.....\n= F\n#####\n#....\n#....\n####.\n#....\n#....\n#....\n.....\n.....\n= G\n.###.\n#...#\n#....\n#.###\n#...#\n#...#\n.###.\n.....\n.....\n= H\n#...#\n#...#\n#...#\n#####\n#...#\n#...#\n#...#\n.....\n.....\n= I\n###\n.#.\n.#.\n.#.\n.#.\n.#.\n###\n...\n...\n= J\n..###\n...#.\n...#.\n...#.\n#..#.\n#..#.\n.##..\n.....\n.....\n= K\n#...#\n#..#.\n#.#..\n##...\n#.#..\n#..#.\n#...#\n.....\n.....\n= L\n#....\n#....\n#....\n#....\n#....\n#....\n#####\n.....\n.....\n= M\n#...#\n##.##\n#.#.#\n#.#.#\n#...#\n#...#\n#...#\n.....\n.....\n= N\n#...#\n#...#\n##..#\n#.#.#\n#..##\n#...#\n#...#\n.....\n.....\n= O\n.###.\n#...#\n#...#\n#...#\n#...#\n#...#\n.###.\n.....\n.....\n= P\n####.\n#...#\n#...#\n####.\n#....\n#....\n#....\n.....\n.....\n= Q\n.###.\n#...#\n#...#\n#...#\n#.#.#\n#..#.\n.##.#\n.....\n.....\n= R\n####.\n#...#\n#...#\n####.\n#.#..\n#..#.\n#...#\n.....\n.....\n= S\n.###.\n#...#\n#....\n.###.\n....#\n#...#\n.###.\n.....\n.....\n= T\n#####\n..#..\n..#..\n..#..\n..#..\n..#..\n..#..\n.....\n.....\n= U\n#...#\n#...#\n#...#\n#...#\n#...#\n#...#\n.###.\n.....\n.....\n= V\n#...#\n#...#\n#...#\n#...#\n#...#\n.#.#.\n..#..\n.....\n.....\n= W\n#...#\n#...#\n#...#\n#.#.#\n#.#.#\n#.#.#\n.#.#.\n.....\n.....\n= X\n#...#\n#...#\n.#.#.\n..#..\n.#.#.\n#...#\n#...#\n.....\n.....\n= Y\n#...#\n#...#\n.#.#.\n..#..\n..#..\n..#..\n..#..\n.....\n.....\n= Z\n#####\n....#\n...#.\n..#..\n.#...\n#....\n#####\n.....\n.....\n= a\n.....\n.....\n.###.\n....#\n.####\n#...#\n.####\n.....\n.....\n= b\n#....\n#....\n####.\n#...#\n#...#\n#...#\n####.\n.....\n.....\n= c\n....\n....\n.###\n#...\n#...\n#...\n.###\n....\n....\n= d\n....#\n....#\n.####\n#...#\n#...#\n#...#\n.####\n.....\n.....\n= e\n.....\n.....\n.###.\n#...#\n#####\n#....\n.###.\n.....\n.....\n= f\n..##\n.#..\n###.\n.#..\n.#..\n.#..\n.#..\n....\n....\n= g\n.....\n.....\n.####\n#...#\n#...#\n#...#\n.####\n....#\n.###.\n= h\n#....\n#....\n####.\n#...#\n#...#\n#...#\n#...#\n.....\n.....\n= i\n#\n.\n#\n#\n#\n#\n#\n.\n.\n= j\n..#\n...\n..#\n..#\n..#\n..#\n..#\n..#\n##.\n= k\n#...\n#...\n#..#\n#.#.\n##..\n#.#.\n#..#\n....\n....\n= l\n#.\n#.\n#.\n#.\n#.\n#.\n.#\n..\n..\n= m\n.....\n.....\n##.#.\n#.#.#\n#.#.#\n#.#.#\n#.#.#\n.....\n.....\n= n\n.....\n.....\n####.\n#...#\n#...#\n#...#\n#...#\n.....\n.....\n= o\n.....\n.....\n.###.\n#...#\n#...#\n#...#\n.###.\n.....\n.....\n= p\n.....\n.....\n####.\n#...#\n#...#\n#...#\n####.\n#....\n#....\n= q\n.....\n.....\n.####\n#...#\n#...#\n#...#\n.####\n....#\n....#\n= r\n....\n....\n#.##\n##..\n#...\n#...\n#...\n....\n....\n= s\n.....\n.....\n.####\n#....\n.###.\n....#\n####.\n.....\n.....\n= t\n....\n.#..\n###.\n.#..\n.#..\n.#..\n..##\n....\n....\n= u\n.....\n.....\n#...#\n#...#\n#...#\n#...#\n.####\n.....\n.....\n= v\n.....\n.....\n#...#\n#...#\n#...#\n.#.#.\n..#..\n.....\n.....\n= w\n.....\n.....\n#...#\n#...#\n#.#.#\n#.#.#\n.#.#.\n.....\n.....\n= x\n.....\n.....\n#...#\n.#.#.\n..#..\n.#.#.\n#...#\n.....\n.....\n= y\n.....\n.....\n#...#\n#...#\n#...#\n#...#\n.####\n....#\n.###.\n= z\n.....\n.....\n#####\n...#.\n..#..\n.#...\n#####\n.....\n.....\n= 0\n.###.\n#...#\n#..##\n#.#.#\n##..#\n#...#\n.###.\n.....\n.....\n= 1\n..#..\n.##..\n..#..\n..#..\n..#..\n..#..\n.###.\n.....\n.....\n= 2\n.###.\n#...#\n....#\n...#.\n..#..\n.#...\n#####\n.....\n.....\n= 3\n#####\n...#.\n..#..\n...#.\n....#\n#...#\n.###.\n.....\n.....\n= 4\n...#.\n..##.\n.#.#.\n#..#.\n#####\n...#.\n...#.\n.....\n.....\n= 5\n#####\n#....\n####.\n....#\n....#\n#...#\n.###.\n.....\n.....\n= 6\n..##.\n.#...\n#....\n####.\n#...#\n#...#\n.###.\n.....\n.....\n= 7\n#####\n....#\n...#.\n..#..\n.#...\n.#...\n.#...\n.....\n.....\n= 8\n.###.\n#...#\n#...#\n.###.\n#...#\n#...#\n.###.\n.....\n.....\n= 9\n.###.\n#...#\n#...#\n.####\n....#\n...#.\n.##..\n.....\n.....\n= space\n...\n...\n...\n...\n...\n...\n...\n...\n...\n= .\n.\n.\n.\n.\n.\n.\n#\n.\n.\n= ,\n..\n..\n..\n..\n..\n..\n.#\n#.\n..\n= :\n.\n.\n.\n#\n.\n.\n#\n.\n.\n= ;\n..\n..\n..\n.#\n..\n..\n.#\n#.\n..\n= ·\n....\n....\n....\n.##.\n.##.\n....\n....\n....\n....\n= -\n...\n...\n...\n...\n###\n...\n...\n...\n...\n= _\n.....\n.....\n.....\n.....\n.....\n.....\n.....\n#####\n.....\n= #\n.#.#.\n.#.#.\n#####\n.#.#.\n#####\n.#.#.\n.#.#.\n.....\n.....\n= /\n....#\n...#.\n...#.\n..#..\n.#...\n.#...\n#....\n.....\n.....\n= (\n..#\n.#.\n#..\n#..\n#..\n.#.\n..#\n...\n...\n= )\n#..\n.#.\n..#\n..#\n..#\n.#.\n#..\n...\n...\n= [\n##\n#.\n#.\n#.\n#.\n#.\n##\n..\n..\n= ]\n##\n.#\n.#\n.#\n.#\n.#\n##\n..\n..\n= <\n...#\n..#.\n.#..\n#...\n.#..\n..#.\n...#\n....\n....\n= >\n#...\n.#..\n..#.\n...#\n..#.\n.#..\n#...\n....\n....\n= '\n#\n#\n.\n.\n.\n.\n.\n.\n.\n= \"\n#.#\n#.#\n...\n...\n...\n...\n...\n...\n...\n= !\n#\n#\n#\n#\n#\n.\n#\n.\n.\n= ?\n.###.\n#...#\n....#\n...#.\n..#..\n.....\n..#..\n.....\n.....\n= +\n.....\n..#..\n..#..\n#####\n..#..\n..#..\n.....\n.....\n.....\n= =\n.....\n.....\n#####\n.....\n#####\n.....\n.....\n.....\n.....\n= *\n.....\n#.#.#\n.###.\n#####\n.###.\n#.#.#\n.....\n.....\n.....\n= ×\n...\n...\n...\n#.#\n.#.\n#.#\n...\n...\n...\n= &\n.##..\n#..#.\n#.#..\n.#...\n#.#.#\n#..#.\n.##.#\n.....\n.....\n= %\n##...\n##..#\n...#.\n..#..\n.#...\n#..##\n...##\n.....\n.....\n= $\n..#..\n.####\n#.#..\n.###.\n..#.#\n####.\n..#..\n.....\n.....\n= @\n.###.\n#...#\n#.###\n#.#.#\n#.###\n#....\n.###.\n.....\n.....\n= |\n#\n#\n#\n#\n#\n#\n#\n#\n.\n= #....\n.#...\n.#...\n..#..\n...#.\n...#.\n....#\n.....\n.....\n= {\n..##\n.#..\n.#..\n#...\n.#..\n.#..\n..##\n....\n....\n= }\n##..\n..#.\n..#.\n...#\n..#.\n..#.\n##..\n....\n....\n= ~\n.....\n.....\n.#..#\n#.##.\n.....\n.....\n.....\n.....\n.....\n"
 };
-// fsdsp56k-art/art/src/Dom.fs
 var va = [
 	["fsdsp56kIcon", "grids"],
 	["fsdsp56kCommandIcons", "icons"],
@@ -2761,7 +2756,6 @@ function xa(e, t) {
 function Sa() {
 	return matchMedia("(prefers-reduced-motion: reduce)").matches;
 }
-// fsdsp56k-art/art/src/Area.fs
 function Ca(e) {
 	return e.closest("[data-aesthetic]");
 }
@@ -2807,7 +2801,6 @@ function Oa(e, t) {
 		t(wa(e));
 	});
 }
-// fsdsp56k-art/art/src/Crt.fs
 var ka = "\nattribute vec2 corner;\nvarying vec2 uv;\nvoid main() {\n  uv = vec2(corner.x * 0.5 + 0.5, 0.5 - corner.y * 0.5);\n  gl_Position = vec4(corner, 0.0, 1.0);\n}\n", Aa = "\nprecision mediump float;\nuniform sampler2D picture;\nuniform vec2 size;        // the picture, in its pixels\nuniform float time;       // seconds\nuniform float strength;   // 0 a flat screen, 1 the whole tube\nvarying vec2 uv;\n\n// the glass: the picture pushed out toward the corners\nvec2 bulge(vec2 p) {\n  p = p * 2.0 - 1.0;\n  vec2 o = abs(p.yx) / vec2(5.5, 4.0);\n  p += p * o * o * strength;\n  return p * 0.5 + 0.5;\n}\n\nvec3 at(vec2 q) { return texture2D(picture, q).rgb; }\n\nvoid main() {\n  vec2 q = bulge(uv);\n  if (q.x < 0.0 || q.x > 1.0 || q.y < 0.0 || q.y > 1.0) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }\n  vec2 texel = 1.0 / size;\n  // the beams a little apart: red to the right, blue to the left\n  vec3 c = vec3(at(q + vec2(0.4 * texel.x * strength, 0.0)).r, at(q).g, at(q - vec2(0.4 * texel.x * strength, 0.0)).b);\n  // light bleeding to the neighbours\n  vec3 bleed = (at(q + vec2(texel.x, 0.0)) + at(q - vec2(texel.x, 0.0)) + at(q + vec2(0.0, texel.y)) + at(q - vec2(0.0, texel.y))) * 0.25;\n  c += bleed * 0.22 * strength;\n  // a beam per row: brightest along its middle, dark between rows\n  float row = fract(q.y * size.y);\n  c *= mix(1.0, 0.55 + 0.45 * sin(row * 3.14159), strength);\n  // the aperture grille, one stripe of each colour every three screen pixels\n  float m = mod(gl_FragCoord.x, 3.0);\n  vec3 grille = vec3(m < 1.0 ? 1.0 : 0.72, m >= 1.0 && m < 2.0 ? 1.0 : 0.72, m >= 2.0 ? 1.0 : 0.72);\n  c *= mix(vec3(1.0), grille, 0.55 * strength);\n  // the corners falling off, a faint flicker, the brightness the dark rows took back\n  vec2 d = q - 0.5;\n  c *= 1.0 - strength * dot(d, d) * 1.1;\n  c *= 1.0 + strength * (0.012 * sin(time * 60.0) + 0.18);\n  gl_FragColor = vec4(c, 1.0);\n}\n", ja = class extends S {
 	constructor(e, t, n, r) {
 		super(), this.gl = e, this.size = t, this.time = n, this.strength = r;
@@ -2861,7 +2854,6 @@ function Ma(e) {
 function Na(e, t, n, r, i, a) {
 	e.gl.viewport(0, 0, n, r), e.gl.texImage2D(3553, 0, 6408, 6408, 5121, t), e.gl.uniform2f(e.size, t.width, t.height), e.gl.uniform1f(e.time, i), e.gl.uniform1f(e.strength, a), e.gl.drawArrays(5, 0, 4);
 }
-// fsdsp56k-art/art/src/ConsoleView.fs
 var Pa = class extends S {
 	constructor(e, t) {
 		super(), this.replay = e, this.tube = t;
@@ -2900,7 +2892,6 @@ function Fa(e, t, n, r, i) {
 		p.contents = e && u != null, h();
 	});
 }
-// Entry.fs
 function Ia(e) {
 	return en(e.command) ? en(e.output) ? new Pi(2, [e.pause]) : new Pi(1, [Se(e.output)]) : new Pi(0, [Se(e.command)]);
 }

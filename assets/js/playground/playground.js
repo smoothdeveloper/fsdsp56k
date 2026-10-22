@@ -61,7 +61,8 @@
       if (k.emulatorOnly && rt !== 'dsp56300') return 'no F# kernel: ' + (k.dropped ? 'your file' : 'the original package, from GitHub,') + ' runs on the DSP56300 emulator only';
       if (rt === 'dotnet') return k.reference && k.reference.phrase ? null : 'no reference WAVs in dist';
       const r = files[rt];
-      if (!r) return 'not built yet (nothing in dist/playground/' + ({ js: 'fable-js', rust: 'rust', dsp56300: 'dsp56300' })[rt] + ')';
+      if (!r) return rt === 'js' && document.documentElement.dataset.playground ? 'not published: this site ships the F# ports as Rust → wasm only'
+        : 'not built yet (nothing in dist/playground/' + ({ js: 'fable-js', rust: 'rust', dsp56300: 'dsp56300' })[rt] + ')';
       if (missing[rt]) return 'missing ' + missing[rt];
       if (rt === 'dsp56300' && !k.image) return k.imageUnavailable || 'this kernel is not in the ' + RT[rt].label + ' build';
       if (rt !== 'dsp56300' && !(r.kernels || []).includes(k.id)) return 'this kernel is not in the ' + RT[rt].label + ' build';
@@ -235,8 +236,8 @@
         for (const k of ks) {
           const b = document.createElement('button');
           b.type = 'button'; b.className = 'chip'; b.setAttribute('aria-pressed', String(k === S.kernel));
-          b.innerHTML = `${esc(k.title)}${gradeDot(k.grade)}`;
-          b.title = gradeLine(k.grade);
+          b.innerHTML = `${esc(k.title)}${tags(k)}${gradeDot(k.grade)}`;
+          b.title = [gradeLine(k.grade), needsText(k)].filter(Boolean).join(' · ');
           b.onclick = () => selectKernel(k);
           grp.lastChild.appendChild(b);
         }
@@ -247,7 +248,7 @@
       if (refs.length) {
         const d = document.createElement('details'); d.className = 'pg-held pg-gh';
         d.open = ghOpen; d.ontoggle = () => { ghOpen = d.open; };
-        d.innerHTML = `<summary>From GitHub <small>${refs.length} original packages · DSP56300 emulator only · loaded from GitHub when picked, not hosted here${refs.some(m => m.silent) ? ` · ${refs.filter(m => m.silent).length} dimmed: they process the other tracks' audio, which a one-track playground cannot give them` : ''}</small></summary><div class="pg-held-list"></div>`;
+        d.innerHTML = `<summary>From GitHub <small>${refs.length} original packages · DSP56300 emulator only · loaded from GitHub when picked, not hosted here${refs.some(m => m.silent) ? ` · ${refs.filter(m => m.silent).length} dimmed: they process the other tracks' audio, which a one-track playground cannot give them` : ''}${refs.some(m => m.effect || m.firmware) ? ` · tagged: <span class="pg-tag fx">input</span> an effect, it needs an input source; <span class="pg-tag fw">samples</span> <span class="pg-tag fw">RAM</span> <span class="pg-tag fw">sine ROM</span> it uses the Machinedrum's firmware memory` : ''}</small></summary><div class="pg-held-list"></div>`;
         for (const [g, ms] of Object.entries(byGroup(refs))) {
           const grp = document.createElement('div'); grp.className = 'pg-kgroup';
           grp.innerHTML = `<span class="pg-kgroup-name">${esc(g)} <small>${esc(ms[0].author)} · ${esc(ms[0].ref.repo)}</small></span><div class="chips"></div>`;
@@ -256,8 +257,8 @@
             const quiet = !!m.silent || !m.ref.native.peak;
             b.type = 'button'; b.className = 'chip gh' + (refFailed[m.id] ? ' failed' : '') + (quiet ? ' quiet' : ''); b.dataset.ref = m.id;
             b.setAttribute('aria-pressed', String(S.kernel.id === 'github:' + m.id));
-            b.innerHTML = esc(m.title) + (loadingRef === m.id ? ' <small>…</small>' : '');
-            b.title = `${m.ref.repo}@${m.ref.sha.slice(0, 7)} · ${m.ref.path}` + (quiet ? ' · ' + (m.silent || 'silent at its defaults on this harness') : '') + (m.preset && m.preset.length ? ' · preset ' + presetText(m.preset) : '') + (m.status === 'held' ? ' · ' + m.reason : '') + (refFailed[m.id] ? ' · ' + refFailed[m.id] : '');
+            b.innerHTML = esc(m.title) + tags(m) + (loadingRef === m.id ? ' <small>…</small>' : '');
+            b.title = `${m.ref.repo}@${m.ref.sha.slice(0, 7)} · ${m.ref.path}` + (needsText(m) ? ' · ' + needsText(m) : '') + (quiet ? ' · ' + (m.silent || 'silent at its defaults on this harness') : '') + (m.preset && m.preset.length ? ' · preset ' + presetText(m.preset) : '') + (m.status === 'held' ? ' · ' + m.reason : '') + (refFailed[m.id] ? ' · ' + refFailed[m.id] : '');
             b.onclick = () => openReferenced(m);
             grp.lastChild.appendChild(b);
           }
@@ -282,7 +283,7 @@
         d.open = heldOpen; d.ontoggle = () => { heldOpen = d.open; };
         d.innerHTML = `<summary>Held back <small>${held.length} machines, not loaded: ${esc(commonReason(held))}</small></summary><div class="pg-held-list">` +
           Object.entries(byGroup(held)).map(([g, ms]) => `<div class="pg-kgroup"><span class="pg-kgroup-name">${esc(g)} <small>${esc(ms[0].author)} · ${esc(ms[0].licence)}</small></span>` +
-            `<div class="chips">${ms.map(m => `<span class="chip held" title="${esc(m.reason + ' · ' + gradeLine(m.grade))}">${esc(m.title)}${gradeDot(m.grade)}</span>`).join('')}</div>` +
+            `<div class="chips">${ms.map(m => `<span class="chip held" title="${esc([m.reason, needsText(m), gradeLine(m.grade)].filter(Boolean).join(' · '))}">${esc(m.title)}${tags(m)}${gradeDot(m.grade)}</span>`).join('')}</div>` +
             `<p class="pg-held-why">${esc(commonReason(ms))}</p></div>`).join('') + '</div>';
         box.appendChild(d);
       }
@@ -291,13 +292,15 @@
         (k.source ? `<a class="src" href="${esc(k.source)}" rel="noopener" target="_blank">source</a>` : '');
       const r = k.ref;
       $('pg-kmeta').innerHTML = `<b>${esc(k.title)}</b> · ${fmt(k.programWords)} program words · ${k.params.length} parameters<span class="row">${credit}</span>` +
+        (k.effect ? `<span class="row gcyc pg-needs"><span class="pg-tag fx">input</span> effect: needs an input source: it processes ${esc(EFFECT[k.effect] || k.effect)}</span>` : '') +
+        (k.firmware ? `<span class="row gcyc pg-needs"><span class="pg-tag fw">${esc(FIRMWARE_TAG[k.firmware] || k.firmware)}</span> firmware: it reads ${esc(FIRMWARE[k.firmware] || k.firmware)}</span>` : '') +
         (r ? `<span class="row gh">loaded from GitHub, not hosted here · <a href="${esc(r.blob)}" rel="noopener" target="_blank">${esc(r.repo)}@${esc(r.sha.slice(0, 7))}</a> · ${esc(r.path)}` +
              ` · <a href="${esc(r.raw)}" rel="noopener" target="_blank">download from source</a></span>` +
              `<span class="row"><span class="grade none">DSP56300 emulator only</span>${r.graded ? ' <span class="gcyc">the package the F# port is graded against</span>' : ''}</span>` +
              `<span class="row gcyc">render cycles a block, native emulator: ${fmt(Math.round(r.native.cycles.mean))} (max ${fmt(r.native.cycles.max)}) · declared ${fmt(r.native.cycles.declared)}</span>` +
              (k.preset && k.preset.length ? `<span class="row gcyc">preset ${esc(presetText(k.preset))} over its own defaults, found with fsdsp56k stress: with no input it sounds when its resonance self-oscillates</span>` : '') +
              (k.silent ? `<span class="row gcyc pg-silent">quiet on this harness, natively too · ${esc(k.silent)}</span>` :
-              r.native.peak ? '' : `<span class="row gcyc pg-silent">silent at its defaults on the fsdsp56k track harness, natively too: ${/hit|smp/i.test(k.id) ? 'no sample banks are loaded here' : 'it needs state or input the harness does not provide'}</span>`) : '') +
+              r.native.peak ? '' : `<span class="row gcyc pg-silent">silent at its defaults on the fsdsp56k track harness, natively too: ${k.firmware === 'samples' ? 'no sample banks are loaded here' : 'it needs state or input the harness does not provide'}</span>`) : '') +
         (k.dropped ? `<span class="row gh">your file, read in this browser, not uploaded · DSP56300 emulator only · declared ${fmt(k.maxCycles)} cycles a block</span>` : '') +
         (k.grade ? `<span class="row"><span class="grade ${gradeClass(k.grade)}">${gradeChip(k.grade)}</span></span><span class="row gcyc">${gradeCycles(k.grade)}</span>` : '');
       $('pg-law').textContent = k.lawNote;
@@ -323,7 +326,7 @@
         const p = window.fsdsp56kPackage.inspect(bytes, m.ref.path);
         if (p.error || !p.packages.length) throw new Error(p.error || 'no machine package in the file');
         const k = await rt.load(p.packages[0].bytes, { id, title: m.title, blocks: m.ref.native.blocks, preset: m.preset || [] });
-        Object.assign(k, { silent: m.silent || null, title: m.title, author: m.author, group: m.group, licence: m.licence, source: m.source, ref: m.ref, grade: null, reference: {}, checks: null,
+        Object.assign(k, { silent: m.silent || null, effect: m.effect || null, firmware: m.firmware || null, title: m.title, author: m.author, group: m.group, licence: m.licence, source: m.source, ref: m.ref, grade: null, reference: {}, checks: null,
           hashes: b64(m.ref.native.hashes, Uint32Array), nativeCycles: m.ref.native.cycles });
         refKernels[id] = k; loadingRef = null;
         if (S.runtime !== 'dsp56300') S.runtime = 'dsp56300';
@@ -590,6 +593,14 @@
   const gradeLine = g => 'grade: ' + gradeChip(g) + (g && g.fsharp ? ' · ' + gradeCycles(g) : '');
   const gradeCycles = g => !g || !g.fsharp ? '' : `render cycles a block: F# ${fmt(Math.round(g.fsharp.mean))} (worst ${fmt(g.fsharp.worst)})` +
     (g.original ? ` · original ${fmt(Math.round(g.original.mean))} (worst ${fmt(g.original.worst)})` : '');
+  // what a machine needs besides its own program (machines.tsv's effect and firmware columns)
+  const EFFECT = { neighbour: "the other tracks' audio", 'audio-in': 'the audio input', 'main-out': 'the main output mix' };
+  const FIRMWARE = { 'sine-rom': 'the Machinedrum\'s sine table in ROM', samples: 'the Machinedrum\'s sample banks', ram: 'the Machinedrum\'s RAM record buffer' };
+  const FIRMWARE_TAG = { 'sine-rom': 'sine ROM', samples: 'samples', ram: 'RAM' };
+  const needsText = m => [m.effect ? 'effect: needs an input source (' + (EFFECT[m.effect] || m.effect) + ')' : '',
+    m.firmware ? 'firmware: reads ' + (FIRMWARE[m.firmware] || m.firmware) + ' (stand-ins on this harness)' : ''].filter(Boolean).join(' · ');
+  const tags = m => (m.effect ? ` <small class="pg-tag fx" title="${esc('effect: needs an input source (' + (EFFECT[m.effect] || m.effect) + ')')}">input</small>` : '') +
+    (m.firmware ? ` <small class="pg-tag fw" title="${esc('firmware: reads ' + (FIRMWARE[m.firmware] || m.firmware))}">${esc(FIRMWARE_TAG[m.firmware] || m.firmware)}</small>` : '');
   const esc = t => String(t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
   let packageEntry = null;
   function packageRuntime() {

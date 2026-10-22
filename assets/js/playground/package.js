@@ -1,7 +1,7 @@
 // fsdsp56k playground: reading a dropped or picked machine file, in the browser only (nothing is uploaded). A .mds is
 // a package (an "MDS1" header); a .syx/.sysex is unpacked to its packages with the logic of `md unsyx`
-// (machinedrum/Sysex.fs: the USR-machine dump messages, 7-bit unpacking, the checksums, one package per header ...
-// end-of-dump run). Each package's header gives its program size and cycle budget (machinedrum/Mds.fs, Mds.read).
+// (the toolchain's machinedrum Sysex module: the USR-machine dump messages, 7-bit unpacking, the checksums, one package per header ...
+// end-of-dump run). Each package's header gives its program size and cycle budget (the machinedrum Mds module, Mds.read).
 // window.fsdsp56kPackage.inspect(bytes: Uint8Array, name) returns { kind, packages: [{ slot, bytes, words, maxCycles,
 // entry }], error }; the playground hands a package to the DSP56300 runtime's entry point once the dist has one.
 (() => {

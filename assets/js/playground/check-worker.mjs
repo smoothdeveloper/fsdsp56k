@@ -31,7 +31,7 @@ async function rust(kernel, module) {
     cycles: () => null };
 }
 
-// the dsp56300 interpreter (wasm/runtime.cpp's C ABI), driven as wasm/Kernel.fs's Instance drives it
+// the dsp56300 interpreter (wasm/runtime.cpp's C ABI), driven as the toolchain's wasm Kernel module's Instance drives it
 async function dsp(kernel, module, urls) {
   const { default: create } = await import(urls.glue);
   const x = await create({ locateFile: p => p, instantiateWasm: (imports, receive) => {

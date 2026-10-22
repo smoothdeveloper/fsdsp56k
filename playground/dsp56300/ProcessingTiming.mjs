@@ -1,5 +1,4 @@
 import { j as e, k as t, v as n, y as r } from "./Array.mjs";
-//#region ProcessingTiming.fs
 var i = class extends t {
 	constructor(e, t, n, r, i, a, o) {
 		super(), this.totalPercent = e, this.dspPercent = t, this.overheadPercent = n, this.peakPercent = r, this.overruns = i | 0, this.callbackMs = a, this.budgetMs = o;
@@ -24,5 +23,4 @@ function l(e) {
 	let t = (t) => e.budget === 0 ? 0 : t / e.budget * 100, n = (t) => e.count === 0 ? 0 : t / e.count, r = new i(t(e.total), t(e.dsp), t(e.total - e.dsp), e.peak, e.overruns, n(e.total), n(e.budget));
 	return s(e), r;
 }
-//#endregion
 export { l as i, c as n, s as r, o as t };

@@ -1,4 +1,3 @@
-//#region node_modules/.pnpm/@fable-org+fable-library-js@2.7.1/node_modules/@fable-org/fable-library-js/Util.js
 var e = {
 	Unspecified: 0,
 	Utc: 1,
@@ -177,8 +176,6 @@ function he(e, t, n, r, i) {
 	if (ArrayBuffer.isView(e) && ArrayBuffer.isView(n)) n.set(e.subarray(t, t + i), r);
 	else for (let a = 0; a < i; ++a) n[r + a] = e[t + a];
 }
-//#endregion
-//#region node_modules/.pnpm/@fable-org+fable-library-js@2.7.1/node_modules/@fable-org/fable-library-js/Types.js
 function ge(e) {
 	let t = 0, n = "[";
 	for (let r of e) {
@@ -298,8 +295,6 @@ function w(e, t) {
 function T(e) {
 	return typeof e == "number" ? (Number(e) >>> 0).toString(16) : typeof e == "bigint" ? BigInt.asUintN(64, e).toString(16) : e[S]().toHex();
 }
-//#endregion
-//#region node_modules/.pnpm/@fable-org+fable-library-js@2.7.1/node_modules/@fable-org/fable-library-js/Option.js
 var E = class e {
 	constructor(e) {
 		this.value = e;
@@ -327,8 +322,6 @@ function D(e) {
 function ke(e) {
 	return e == null || e instanceof E ? new E(e) : e;
 }
-//#endregion
-//#region node_modules/.pnpm/@fable-org+fable-library-js@2.7.1/node_modules/@fable-org/fable-library-js/Global.js
 var Ae = "Collection was empty.", je = "Value cannot be null.", Me = " (Parameter '", O = [
 	"Sun",
 	"Mon",
@@ -706,13 +699,9 @@ function K(t) {
 function q(t) {
 	return t.kind === e.Utc ? t.getUTCDay() : t.getDay();
 }
-//#endregion
-//#region node_modules/.pnpm/@fable-org+fable-library-js@2.7.1/node_modules/@fable-org/fable-library-js/RegExp.js
 function Je(e) {
 	return e.replace(/[$()*+.?[\\\^{|}\]]/g, "\\$&");
 }
-//#endregion
-//#region node_modules/.pnpm/@fable-org+fable-library-js@2.7.1/node_modules/@fable-org/fable-library-js/String.js
 var Ye = Symbol.for("Fable.DateTimeFormattable");
 function Xe(e) {
 	return e != null && typeof e[Ye] == "function";
@@ -820,8 +809,6 @@ function st(e, n, r, i) {
 	} while (l);
 	return s;
 }
-//#endregion
-//#region node_modules/.pnpm/@fable-org+fable-library-js@2.7.1/node_modules/@fable-org/fable-library-js/System.js
 var ct = class extends t {
 	constructor(e) {
 		super(e);
@@ -853,8 +840,6 @@ function mt(e, t) {
 function ht(e) {
 	return mt(e, je);
 }
-//#endregion
-//#region node_modules/.pnpm/@fable-org+fable-library-js@2.7.1/node_modules/@fable-org/fable-library-js/Native.js
 function Y(e, t) {
 	if (e == null) return Array(t);
 	{
@@ -862,8 +847,6 @@ function Y(e, t) {
 		return typeof n == "function" ? new n(t) : Array(t);
 	}
 }
-//#endregion
-//#region node_modules/.pnpm/@fable-org+fable-library-js@2.7.1/node_modules/@fable-org/fable-library-js/Double.js
 function gt(e) {
 	return e === Infinity || e === -Infinity;
 }
@@ -873,8 +856,6 @@ function _t(e, t) {
 function vt(e, t) {
 	return Math.min(e, t);
 }
-//#endregion
-//#region node_modules/.pnpm/@fable-org+fable-library-js@2.7.1/node_modules/@fable-org/fable-library-js/FSharp.Core.js
 function X(e) {
 	return !!v(e, l());
 }
@@ -882,8 +863,6 @@ function yt(e, t) {
 	if (v(t, l())) throw ht(e);
 	return t;
 }
-//#endregion
-//#region node_modules/.pnpm/@fable-org+fable-library-js@2.7.1/node_modules/@fable-org/fable-library-js/Array.js
 function Z() {
 	throw new t("An index satisfying the predicate was not found in the collection.");
 }
@@ -952,5 +931,4 @@ function $(e, n, r) {
 	if (n < 0 || n >= e.length) throw new t("Index was outside the bounds of the array. (Parameter 'index')");
 	e[n] = r;
 }
-//#endregion
 export { x as A, h as B, st as C, D, ke as E, c as F, te as H, oe as I, v as L, g as M, y as N, Ce as O, l as P, ee as R, $e as S, Ae as T, _ as V, gt as _, xt as a, lt as b, Ct as c, At as d, St as f, yt as g, X as h, jt as i, t as j, Se as k, Tt as l, wt as m, Et as n, Ot as o, $ as p, Dt as r, kt as s, bt as t, Q as u, _t as v, tt as w, dt as x, vt as y, me as z };

@@ -1,5 +1,4 @@
 import { A as e, D as t, E as n, F as r, H as i, L as a, N as o, O as s, P as c, R as l, T as u, V as d, a as f, b as p, d as m, g as h, j as g, k as ee, l as _, m as v, n as y, p as b, t as x, u as S, x as te, y as ne } from "./Array.mjs";
-//#region node_modules/.pnpm/@fable-org+fable-library-js@2.7.1/node_modules/@fable-org/fable-library-js/List.js
 var re = class n extends ee {
 	constructor(e, t) {
 		super(), this.head = e, this.tail = t;
@@ -148,8 +147,6 @@ function C(e) {
 		}
 	})(0, e), n;
 }
-//#endregion
-//#region node_modules/.pnpm/@fable-org+fable-library-js@2.7.1/node_modules/@fable-org/fable-library-js/Seq.js
 var w = "Enumeration already finished.", T = "Enumeration has not started. Call MoveNext.", E = "Reset is not supported on this enumerator.";
 function D() {
 	throw te(E);
@@ -330,8 +327,6 @@ function G(e, t) {
 function de(e, t) {
 	return z(() => B(G(e, t)));
 }
-//#endregion
-//#region Kernel.fs
 function K(e, t) {
 	if (t < 0) throw new g(`DSP ${e} failed (${t})`);
 	return t | 0;
@@ -445,8 +440,6 @@ function $(e) {
 		default: return _(e.image.frames * 2, (t) => K("read", e.exports._dsp_read(e.image.outputBank, e.image.output + t)) | 0);
 	}
 }
-//#endregion
-//#region node_modules/.pnpm/@fable-org+fable-library-js@2.7.1/node_modules/@fable-org/fable-library-js/Range.js
 function Ce(e, t, n, r) {
 	let i = o(e, n) | 0;
 	if (i === 0) throw new g("The step of a range cannot be zero");
@@ -463,5 +456,4 @@ function we(e, t, n, r, i) {
 function Te(e, t, n) {
 	return we(e, t, n, 0, (e, t) => e + t);
 }
-//#endregion
 export { z as _, _e as a, U as b, Z as c, J as d, me as f, de as g, Q as h, ve as i, xe as l, ge as m, pe as n, $ as o, he as p, be as r, Se as s, Te as t, ye as u, H as v, W as x, G as y };

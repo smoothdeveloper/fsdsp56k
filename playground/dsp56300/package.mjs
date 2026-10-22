@@ -1,7 +1,7 @@
 // fsdsp56k playground: an MDS machine package on the DSP56300 runtime, in the browser. Copied to
 // dist/playground/dsp56300/package.mjs by tools/export-playground.fsx, next to host.mjs (the track harness it writes).
 //
-// loadPackage(bytes, info) reads the package as machinedrum/Mds.fs does (Mds.read: the MDS1 header, the program
+// loadPackage(bytes, info) reads the package as the toolchain's machinedrum Mds module does (Mds.read: the MDS1 header, the program
 // words, the relocation bitmap, the imports; Mds.machineOf: the MDM1 description's parameters), places it on the
 // harness as machinedrum.run.Track does natively (the program at programBase, relocated, each import patched with its
 // resource's address; the services and the stand-ins' data from host.mjs), and returns a kernel the playground plays

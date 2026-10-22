@@ -1,5 +1,4 @@
 import { B as e, I as t, M as n, j as r } from "./Array.mjs";
-//#region node_modules/.pnpm/@fable-org+fable-library-js@2.7.1/node_modules/@fable-org/fable-library-js/Reflection.js
 var i = class {
 	constructor(e, t, n, r) {
 		this.declaringType = e, this.tag = t, this.name = n, this.fields = r;
@@ -57,5 +56,4 @@ function v(e) {
 	if (e.fields != null) return e.fields();
 	throw new r(`${e.fullname} is not an F# record type`);
 }
-//#endregion
 export { d as a, h as i, m as n, u as o, l as r, p as s, f as t };

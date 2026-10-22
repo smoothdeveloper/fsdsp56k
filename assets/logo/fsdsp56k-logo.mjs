@@ -2144,7 +2144,6 @@ function Ai(e, t) {
 function ji(e) {
 	return bi(e);
 }
-// fsdsp56k-art/art/src/Pixels.fs
 var Mi = class extends x {
 	constructor(e, t, n) {
 		super(), this.r = e, this.g = t, this.b = n;
@@ -2269,7 +2268,6 @@ function na(e, t, n) {
 	for (let r = 0; r <= e.w - 1; r++) ea(e, r, 0, t, n), ea(e, r, e.h - 1, t, n);
 	for (let r = 1; r <= e.h - 2; r++) ea(e, 0, r, t, n), ea(e, e.w - 1, r, t, n);
 }
-// fsdsp56k-art/art/src/Font.fs
 var ra = class extends x {
 	constructor(e, t, n) {
 		super(), this.height = e | 0, this.spacing = t | 0, this.glyphs = n;
@@ -2663,7 +2661,6 @@ function ya(e, t) {
 function ba(e, t) {
 	return P(ya(e, t));
 }
-// fsdsp56k-art/art/src/Logo.fs
 var J = 6.283185307179586, xa = P(M(() => I((e) => 123.75 + e * 17.6, q(0, 1, 15)))), Sa = class extends x {
 	constructor(e, t, n, r) {
 		super(), this.side = e | 0, this.tip = t, this.edge = n, this.cell = r;
@@ -3011,7 +3008,6 @@ function Po(e) {
 		}), i[0] < 1 ? po(t.path, i[1], a, t.phase) : void 0, .75 + .5 * (.5 + .5 * Math.sin(t.phase * 7.3)), t.colour, t.white, t.strength, (n = t.met, n == null ? void 0 : (r = (e.clock - n) / fo, r < 1 ? [t.tip, r] : void 0)));
 	}, e.comets);
 }
-// fsdsp56k-art/art/src/Aesthetic.fs
 var Fo = class e extends Se {
 	constructor(e, t) {
 		super(), this.tag = e, this.fields = t;
@@ -3161,7 +3157,6 @@ function $o(e, t) {
 		return r;
 	}
 }
-// fsdsp56k-art/art/src/LogoVector.fs
 function Z(e) {
 	return (he(e * 100) / 100).toString();
 }
@@ -3805,7 +3800,6 @@ function Ms(e) {
 	}
 	return t;
 }
-// fsdsp56k-art/art/src/Area.fs
 function Ns(e) {
 	return e.closest("[data-aesthetic]");
 }
@@ -3818,7 +3812,6 @@ function Fs(e, t) {
 		t(Ps(e));
 	});
 }
-// fsdsp56k-art/art/src/LogoView.fs
 var Is = new Oe(0), Ls = "\n.fsdsp56k-logo:focus { outline: none; }\n.fsdsp56k-logo:focus-visible { outline: 2px solid var(--accent, #30B9DB); outline-offset: 3px; }\n";
 function Rs() {
 	if (Pn(document.getElementById("fsdsp56k-logo-css"))) {
@@ -3936,7 +3929,6 @@ function zs(e, t) {
 		}
 	};
 }
-// Entry.fs
 function Bs(e) {
 	let t = zs(e, "vector");
 	return {
