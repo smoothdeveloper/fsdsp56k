@@ -192,16 +192,22 @@ let render (p: Params) (s: State) (out: Output) =
           <div class="pg-runtimes" id="pg-runtimes" role="group" aria-label="Runtime" data-picker="builtin">
           </div>
         </div>
+        <div class="pg-group">
+          <span class="pg-label">Parameters <small id="pg-law"></small></span>
+          <div class="pg-params" id="pg-params"></div>
+        </div>
+      </div>
+      <div class="pg-scope">
+        <div class="pg-screen">
+          <canvas id="pg-wave" class="px"></canvas>
+          <div class="pg-screen-label"><img class="pg-logo" src="assets/icons/fsdsp56k.png" width="16" height="16" alt=""><span id="pg-now">idle</span><span id="pg-load"></span></div>
+        </div>
         <div class="pg-transport">
           <button type="button" class="btn primary" id="pg-audition" aria-pressed="false"><span class="pg-dot"></span><span>Audition</span></button>
           <button type="button" class="btn" id="pg-render">Render the phrase</button>
           <button type="button" class="pg-pad" id="pg-pad" aria-label="Trigger">TRIG</button>
         </div>
         <p class="pg-hint">Pad, <kbd>space</kbd> or <kbd>T</kbd>, or a MIDI note triggers the kernel.</p>
-        <div class="pg-group">
-          <span class="pg-label">Parameters <small id="pg-law"></small></span>
-          <div class="pg-params" id="pg-params"></div>
-        </div>
         <div class="pg-group pg-midi">
           <span class="pg-label">MIDI in <small>Machinedrum map</small></span>
           <div class="pg-midi-row">
@@ -210,13 +216,8 @@ let render (p: Params) (s: State) (out: Output) =
             <span class="stepper"><button type="button" class="chip" data-step="track" data-d="-1" aria-label="Track down">−</button><span>track <b id="pg-track">1</b></span><button type="button" class="chip" data-step="track" data-d="1" aria-label="Track up">+</button></span>
             <button type="button" class="chip" id="pg-anynote" aria-pressed="false">any note</button>
           </div>
+          <div class="chips pg-midi-devs" id="pg-midi-devs" role="group" aria-label="MIDI input device" hidden></div>
           <p class="pg-meta" id="pg-midimap"></p>
-        </div>
-      </div>
-      <div class="pg-scope">
-        <div class="pg-screen">
-          <canvas id="pg-wave" class="px"></canvas>
-          <div class="pg-screen-label"><img class="pg-logo" src="assets/icons/fsdsp56k.png" width="16" height="16" alt=""><span id="pg-now">idle</span><span id="pg-load"></span></div>
         </div>
         <div class="pg-match">
           <div class="pg-match-head"><span class="pg-label">Word for word <small>the phrase, against .NET</small></span><button type="button" class="chip" id="pg-check">Check all</button></div>

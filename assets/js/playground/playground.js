@@ -395,29 +395,49 @@
         show(); box.appendChild(row);
       });
     }
+    // the result rows: one per runtime, the same slots in every state (idle, checking, done), so nothing moves
+    // when the pad is hit or the phrase renders; only the values change. A runtime with `checked` (and, later,
+    // a '.NET (wasm)' entry in RUNTIMES) gets a row here; one whose result carries cycles gets the cycles bar.
+    const CHECKED = ['js', 'rust', 'dsp56300'];
+    const icons = rt => `<span class="rt-icons sm" aria-hidden="true">${RT[rt].icons.map(i => `<img src="assets/icons/${i}.png" width="16" height="16" alt="">`).join('')}</span>`;
+    const chip = (cls, text, title) => `<span class="state ${cls}" title="${esc(title || text)}">${text}</span>`;
+    const stat = (v, unit, ch) => `<span class="st"><b class="v" style="--ch:${ch}">${v}</b>${unit ? ' ' + unit : ''}</span>`;
+    function cyclesLine(k, c, stale) {
+      const n = k.nativeCycles, declared = n ? n.declared : k.maxCycles, w = String(fmt(Math.max(declared || 0, (c && c.max) || 0, 9999))).length + 1;
+      const scale = Math.max(declared || 0, c ? c.max : 0, n ? n.mean : 0, 1) * 1.1, pc = v => (100 * v / scale).toFixed(1) + '%';
+      const over = c && declared && c.max > declared;
+      const more = [c ? 'max ' + fmt(c.max) : null, n ? 'native ' + fmt(Math.round(n.mean)) : null, declared ? 'declared ' + fmt(declared) : null].filter(Boolean).join(' · ');
+      const said = c ? `${fmt(Math.round(c.mean))} cycles a block, max ${fmt(c.max)}` + (n ? `, the native emulator at export ${fmt(Math.round(n.mean))}` : '') + (declared ? `, declared ${fmt(declared)}` : '') : 'cycles: not measured yet';
+      return `<span class="cyc${stale ? ' stale' : ''}" title="${esc(said)}"><span class="st"><b class="v" style="--ch:${w}">${c ? fmt(Math.round(c.mean)) : '—'}</b> cycles a block</span>` +
+        `<span class="pg-bar${over ? ' over' : ''}" role="img" aria-label="${esc(said)}">` +
+        (c ? `<i class="fill" style="width:${pc(c.mean)}"></i><i class="max" style="left:${pc(c.max)}"></i>` : '') +
+        (n ? `<i class="native" style="left:${pc(n.mean)}"></i>` : '') + (declared ? `<i class="budget" style="left:${pc(declared)}"></i>` : '') +
+        `</span><small class="more">${more || '&nbsp;'}</small></span>`;
+    }
     function rows() {
-      const box = $('pg-rows'), k = S.kernel, res = results[k.id] || {};
+      const box = $('pg-rows'), k = S.kernel, res = results[k.id] || {}, bw = String(fmt(k.phrase.blocks)).length;
       const html = [];
-      html.push(k.emulatorOnly
-        ? `<div class="pg-row ref"><span class="rt-name">.NET reference</span><span class="state na">no F# kernel</span><span class="detail">${k.dropped ? 'your file' : 'the original package'} runs on the DSP56300 emulator only` +
-          (k.hashes ? `; its reference is the native emulator's render at build (${fmt(k.phrase.blocks)} blocks, ${k.preset && k.preset.length ? 'its defaults with the preset' : 'its own defaults'})` : '; there is no reference to compare it with') + '</span></div>'
-        : `<div class="pg-row ref${S.runtime === 'dotnet' ? ' sel' : ''}"><span class="rt-name">.NET reference</span><span class="state ref">reference</span><span class="detail">${fmt(k.phrase.blocks)} blocks pre-rendered (one bar), with the native emulator in agreement when exported</span></div>`);
-      for (const rt of ['js', 'rust', 'dsp56300']) {
-        const r = res[rt], busy = running[k.id + '/' + rt];
-        let state, detail;
-        if (!available(rt)) { state = '<span class="state na">not available</span>'; detail = why(rt); }
-        else if (busy) { state = '<span class="state run">checking…</span>'; detail = 'rendering ' + fmt(k.phrase.blocks) + ' blocks'; }
-        else if (!r) { state = '<span class="state na">not checked</span>'; detail = '—'; }
-        else if (!r.ok) { state = '<span class="state na">not available</span>'; detail = r.error; }
-        else if (r.matched == null) { state = r.peak ? '<span class="state ok">rendered</span>' : '<span class="state bad">silent</span>'; detail = `${fmt(r.blocks)} blocks · peak ${level(r.peak)} · ${(r.audioMs / r.renderMs).toFixed(0)}× real time · no reference to compare with`; }
-        else if (r.matched === r.blocks) { state = `<span class="state ok">✓ ${k.emulatorOnly ? '= native emulator, ' : ''}word for word</span>`; detail = `${fmt(r.matched)} / ${fmt(r.blocks)} blocks · ${(r.audioMs / r.renderMs).toFixed(0)}× real time` + (k.emulatorOnly ? ` · peak ${level(r.peak)}` : ''); }
-        else { state = '<span class="state bad">✗ differs</span>'; detail = `${fmt(r.matched)} / ${fmt(r.blocks)} blocks match, first difference at block ${fmt(r.first)}`; }
-        if (rt === 'dsp56300' && available(rt)) {
-          const c = r && r.ok && r.cycles;
-          const n = k.nativeCycles, declared = n ? n.declared : k.maxCycles;
-          detail += `<br><span class="cyc">${c ? `<b>${fmt(Math.round(c.mean))}</b> cycles a block (max ${fmt(c.max)})` : 'cycles: —'}${n ? ' · native emulator at export ' + fmt(Math.round(n.mean)) : ''}${declared ? ' · declared ' + fmt(declared) : ''}</span>`;
+      const ref = k.emulatorOnly
+        ? { state: chip('na', 'no F# kernel'), stats: `<span class="why" title="${esc((k.dropped ? 'your file' : 'the original package') + ' runs on the DSP56300 emulator only' + (k.hashes ? `; its reference is the native emulator's render at build (${fmt(k.phrase.blocks)} blocks)` : '; there is no reference to compare it with'))}">emulator only${k.hashes ? ', reference: native render' : ', no reference'}</span>` }
+        : { state: chip('ref', 'reference', 'the .NET render: what the others are compared with'), stats: `<span class="why" title="${fmt(k.phrase.blocks)} blocks pre-rendered (one bar), with the native emulator in agreement when exported">${stat(fmt(k.phrase.blocks), 'blocks, pre-rendered', bw)}</span>` };
+      html.push(`<div class="pg-row ref${S.runtime === 'dotnet' ? ' sel' : ''}"><span class="rt-name">${icons('dotnet')}<span>.NET reference</span></span>${ref.state}<span class="detail">${ref.stats}</span></div>`);
+      for (const rt of CHECKED) {
+        const r = res[rt], busy = !!running[k.id + '/' + rt], ok = r && r.ok;
+        let state, stats;
+        if (!available(rt)) { state = chip('na', 'not available', why(rt)); stats = `<span class="why" title="${esc(why(rt))}">${esc(why(rt))}</span>`; }
+        else {
+          if (busy) state = chip('run', 'checking…', 'rendering ' + fmt(k.phrase.blocks) + ' blocks');
+          else if (!r) state = chip('na', 'not checked', 'press Check all, or render the phrase');
+          else if (!ok) state = chip('bad', 'failed', r.error);
+          else if (r.matched == null) state = r.peak ? chip('ok', 'rendered', 'no reference to compare with') : chip('bad', 'silent', 'no reference to compare with');
+          else if (r.matched === r.blocks) state = k.emulatorOnly ? chip('ok', '✓ matches native', 'word for word with the native emulator') : chip('ok', '✓ word for word', 'word for word with the .NET reference');
+          else state = chip('bad', '✗ differs', `${fmt(r.matched)} / ${fmt(r.blocks)} blocks match, first difference at block ${fmt(r.first)}`);
+          const blocks = ok ? (r.matched == null ? fmt(r.blocks) : `${fmt(r.matched)}/${fmt(r.blocks)}`) : '—';
+          stats = `<span class="nums${busy && ok ? ' stale' : ''}">` + stat(blocks, 'blocks', bw * 2 + 1) +
+            stat(ok ? (r.audioMs / r.renderMs).toFixed(0) + '×' : '—', 'real time', 5) + stat(ok ? (r.peak ? level(r.peak).replace(' dBFS', '') : '−∞') : '—', 'dBFS', 6) + '</span>';
+          if (rt === 'dsp56300' || (ok && r.cycles)) stats += cyclesLine(k, ok && r.cycles, busy && ok);
         }
-        html.push(`<div class="pg-row${S.runtime === rt ? ' sel' : ''}"><span class="rt-name">${RT[rt].label}</span>${state}<span class="detail">${detail}</span></div>`);
+        html.push(`<div class="pg-row${S.runtime === rt ? ' sel' : ''}" data-rt="${rt}"><span class="rt-name">${icons(rt)}<span>${RT[rt].label}</span></span>${state}<span class="detail">${stats}</span></div>`);
       }
       box.innerHTML = html.join('');
     }
@@ -463,20 +483,47 @@
         if (i >= 0 && i < 8 && i < S.kernel.params.length) { blink(); $('pg-params').children[i].setValue(d2); }
       }
     }
+    // the input device: 'All inputs' or one by name, as chips; the name is remembered, so a device unplugged and
+    // plugged back is listened to again. The channel and note mapping above apply to whichever input is picked.
+    const MIDI_KEY = 'fsdsp56k.playground.midi-input';
+    const store = { get: () => { try { return localStorage.getItem(MIDI_KEY) || ''; } catch (e) { return ''; } },
+                    set: v => { try { v ? localStorage.setItem(MIDI_KEY, v) : localStorage.removeItem(MIDI_KEY); } catch (e) { } } };
+    let midiAccess = null, midiPick = store.get();
+    function midiDevices() {
+      const box = $('pg-midi-devs');
+      if (!midiAccess) { box.innerHTML = ''; box.hidden = true; return; }
+      const ins = [...midiAccess.inputs.values()].filter(i => i.state !== 'disconnected');
+      ins.forEach(i => i.onmidimessage = e => { if (!midiPick || i.name === midiPick) onMidi(e); });
+      const names = [...new Set(ins.map(i => i.name))];
+      const chips = [{ name: '', label: 'All inputs' }, ...names.map(n => ({ name: n, label: n }))];
+      if (midiPick && !names.includes(midiPick)) chips.push({ name: midiPick, label: midiPick, gone: true });
+      box.innerHTML = '';
+      for (const c of chips) {
+        const b = document.createElement('button');
+        b.type = 'button'; b.className = 'chip' + (c.gone ? ' gone' : ''); b.textContent = c.label;
+        b.setAttribute('aria-pressed', String(c.name === midiPick));
+        if (c.gone) b.title = 'not connected: listened to again when it is plugged back';
+        b.onclick = () => { midiPick = c.name; store.set(midiPick); midiDevices(); };
+        box.appendChild(b);
+      }
+      box.hidden = false;
+      midiStatus = !ins.length ? 'No MIDI input connected.' : midiPick && !names.includes(midiPick) ? midiPick + ' is not connected.' : '';
+      midimap();
+    }
+    function midiOff(status) {
+      if (midiAccess) { midiAccess.onstatechange = null; for (const i of midiAccess.inputs.values()) i.onmidimessage = null; }
+      midiAccess = null; S.midi.on = false; $('pg-midi').setAttribute('aria-pressed', 'false');
+      midiStatus = status; midiDevices(); midimap();
+    }
     $('pg-midi').onclick = async () => {
       if (S.midi.on) return;
-      if (!navigator.requestMIDIAccess) { midiStatus = 'Web MIDI is not available in this browser.'; midimap(); return; }
+      if (!navigator.requestMIDIAccess) return midiOff('Web MIDI is not available in this browser.');
       try {
-        const access = await navigator.requestMIDIAccess();
-        const bind = () => {
-          const ins = [...access.inputs.values()];
-          ins.forEach(i => i.onmidimessage = onMidi);
-          midiStatus = ins.length ? 'Inputs: ' + ins.map(i => i.name).join(', ') + '.' : 'No MIDI input connected.';
-          midimap();
-        };
-        access.onstatechange = bind; bind();
+        midiAccess = await navigator.requestMIDIAccess();
+        midiAccess.onstatechange = midiDevices;
         S.midi.on = true; $('pg-midi').setAttribute('aria-pressed', 'true');
-      } catch (e) { midiStatus = 'MIDI access refused.'; midimap(); }
+        midiDevices();
+      } catch (e) { midiOff('MIDI access refused.'); }
     };
 
     // ---- the scope ----

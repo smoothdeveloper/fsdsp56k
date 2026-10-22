@@ -7,7 +7,7 @@
 .pg-rack, .pg-scope { border: 1px solid var(--line-2); border-radius: var(--radius); background:
   linear-gradient(180deg, color-mix(in srgb, var(--panel-2) 92%, transparent), color-mix(in srgb, var(--panel) 92%, transparent));
   box-shadow: var(--shadow), inset 0 1px 0 rgba(255,255,255,.04); padding: 20px; min-width: 0; }
-.pg-group + .pg-group, .pg-transport + .pg-hint + .pg-group { margin-top: 18px; }
+.pg-group + .pg-group { margin-top: 18px; }
 .pg-label { display: flex; align-items: baseline; gap: 10px; font: 600 calc(11.5px * var(--mono-scale) / .92)/1 var(--f-mono); letter-spacing: .14em;
             text-transform: uppercase; color: var(--dim); margin: 0 0 10px; }
 .pg-label small { font: 400 11.5px/1.3 var(--f-body); letter-spacing: 0; text-transform: none; color: var(--dim); opacity: .85; }
@@ -29,17 +29,19 @@
 .rt-text { display: grid; gap: 3px; min-width: 0; }
 .rt-text b { font: 600 14px/1.15 var(--f-body); }
 .rt-text small { font: 400 11.5px/1.2 var(--f-mono); color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.pg-transport { display: flex; flex-wrap: wrap; gap: 10px; align-items: stretch; margin-top: 20px; }
+/* the transport sits right under the scope, so the pad and the trace are seen together */
+.pg-transport { display: flex; flex-wrap: wrap; gap: 10px; align-items: stretch; margin-top: 14px; }
 .pg-transport .btn { padding: 12px 16px; font-size: 14.5px; }
+#pg-audition span:last-child { display: inline-block; min-width: 4.4em; text-align: left; }   /* Audition / Stop, same width */
 .pg-dot { width: 9px; height: 9px; border-radius: 50%; background: #04121a; box-shadow: inset 0 0 0 2px rgba(4,18,26,.5); }
 #pg-audition[aria-pressed="true"] .pg-dot { background: var(--red); box-shadow: 0 0 10px var(--red); animation: pg-blink 1s steps(2) infinite; }
 @keyframes pg-blink { 50% { opacity: .35; } }
 .pg-pad { margin-left: auto; min-width: 116px; border-radius: 12px; border: 1px solid #ffb02088; cursor: pointer; letter-spacing: .14em;
           font: 400 calc(22px * var(--pixel-scale)) / 1 var(--f-pixel); color: #2a1600;
           background: linear-gradient(180deg, #ffd27a, #ffb020 60%, #e4900c); box-shadow: 0 6px 22px rgba(255,176,32,.28), inset 0 1px 0 rgba(255,255,255,.55), inset 0 -3px 0 rgba(0,0,0,.18); }
-.pg-pad:active, .pg-pad.hit { transform: translateY(1px); }
+.pg-pad:active { transform: translateY(1px); }
 .pg-pad.hit { animation: pg-hit .32s ease-out; }
-@keyframes pg-hit { 0% { box-shadow: 0 0 0 0 rgba(255,176,32,.7), 0 0 30px rgba(255,243,160,.9), inset 0 1px 0 rgba(255,255,255,.55); filter: brightness(1.25); }
+@keyframes pg-hit { 0% { box-shadow: 0 0 0 0 rgba(255,176,32,.7), 0 0 30px rgba(255,243,160,.9), inset 0 1px 0 rgba(255,255,255,.55); filter: brightness(1.25); transform: translateY(1px); }
                     100% { box-shadow: 0 0 0 14px rgba(255,176,32,0), 0 6px 22px rgba(255,176,32,.28), inset 0 1px 0 rgba(255,255,255,.55); filter: none; } }
 .pg-hint { margin: 10px 0 0; font-size: 12.5px; color: var(--dim); }
 kbd { font: 500 11px/1 var(--f-mono); padding: 2px 6px; border: 1px solid var(--line-2); border-bottom-width: 2px; border-radius: 5px; color: var(--fg-2); }
@@ -59,6 +61,11 @@ kbd { font: 500 11px/1 var(--f-mono); padding: 2px 6px; border: 1px solid var(--
 .pg-param input[type=range]::-moz-range-thumb { width: 14px; height: 18px; border-radius: 3px; background: linear-gradient(180deg, #fff3a0, #ffb020); border: 1px solid #a86a00; }
 .pg-param input[type=range]:focus-visible { outline: 2px solid var(--cyan-2); outline-offset: 2px; border-radius: 4px; }
 .pg-midi-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.pg-midi-devs[hidden] { display: none; }
+.pg-midi-devs { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+.pg-midi-devs .chip { padding: 4px 10px; font-size: 12.5px; }
+.pg-midi-devs .chip.gone { opacity: .55; border-style: dashed; }
+.pg-scope .pg-midi { margin-top: 14px; }
 .stepper { display: inline-flex; align-items: center; gap: 6px; font: 500 12.5px/1 var(--f-mono); color: var(--fg-2); }
 .stepper .chip { padding: 5px 9px; }
 .stepper b { color: var(--cyan-2); }
@@ -75,18 +82,49 @@ kbd { font: 500 11px/1 var(--f-mono); padding: 2px 6px; border: 1px solid var(--
                    font: 400 calc(17px * var(--pixel-scale)) / 1 var(--f-pixel); color: #8fdcf0; text-shadow: 0 0 8px rgba(86,224,254,.5); z-index: 1; }
 .pg-screen-label .pg-logo { width: 32px; height: 32px; image-rendering: pixelated; flex: none; margin: -8px 0; }
 .pg-screen-label #pg-now { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pg-screen-label #pg-load { flex: none; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .pg-match { margin-top: 18px; }
 .pg-match-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
 .pg-match-head .pg-label { margin: 0; }
-.pg-rows { margin-top: 10px; display: grid; gap: 6px; }
-.pg-row { display: grid; grid-template-columns: 128px auto minmax(0, 1fr); gap: 4px 12px; align-items: center; padding: 10px 12px;
+/* the result rows: icons and name, a short chip, the numbers. Every state has the same slots and the values are
+   tabular with reserved widths, so a check or a render changes values, never the layout. Narrow rows (the
+   two-column playground at 1024, phones) put the numbers on their own line under the name and the chip. */
+.pg-rows { margin-top: 10px; display: grid; gap: 6px; container-type: inline-size; }
+.pg-row { display: grid; grid-template-columns: 11.5em auto minmax(0, 1fr); gap: 6px 12px; align-items: center; padding: 8px 12px; min-height: 44px;
           border: 1px solid var(--line); border-radius: 10px; background: color-mix(in srgb, var(--bg-2) 55%, transparent); }
 .pg-row.sel { border-color: color-mix(in srgb, var(--cyan-2) 60%, transparent); }
-.pg-row .rt-name { font: 600 13px/1.2 var(--f-body); color: var(--fg); }
-.pg-row .detail { font: 400 12px/1.45 var(--f-mono); color: var(--dim); min-width: 0; }
-.pg-row .detail b { color: var(--yellow); }
-.pg-row .cyc { color: var(--fg-2); }
+.pg-row .rt-name { display: flex; align-items: center; gap: 8px; min-width: 0; font: 600 13px/1.2 var(--f-body); color: var(--fg); white-space: nowrap; }
+.pg-row .rt-name > span:last-child { overflow: hidden; text-overflow: ellipsis; }
+.rt-icons.sm { gap: 2px; }
+.rt-icons.sm img { width: 16px; height: 16px; }
+.pg-row .detail { display: grid; gap: 4px; font: 400 12px/1.35 var(--f-mono); color: var(--dim); min-width: 0; font-variant-numeric: tabular-nums; }
+.pg-row .nums { display: flex; flex-wrap: wrap; gap: 2px 14px; }
+.pg-row .st { white-space: nowrap; }
+.pg-row .st .v { display: inline-block; min-width: calc(var(--ch, 4) * 1ch); text-align: right; font-weight: 500; color: var(--fg-2); }
+.pg-row .why { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pg-row .stale { opacity: .45; }
+.pg-row .cyc { display: grid; grid-template-columns: auto minmax(60px, 1fr) auto; align-items: center; gap: 4px 10px; color: var(--fg-2); }
+.pg-row .cyc .v { color: var(--yellow); font-weight: 700; }
+.pg-row .cyc .more { font-size: 11px; color: var(--dim); white-space: nowrap; }
+/* the cycles bar: the mean filled, the max as a tick, the native emulator's mean as a dot, the declared budget as a line */
+.pg-bar { position: relative; height: 8px; border-radius: 2px; border: 1px solid color-mix(in srgb, var(--dim) 70%, var(--bg-2)); background: color-mix(in srgb, var(--bg-2) 80%, transparent); }
+.pg-bar i { position: absolute; top: 0; bottom: 0; }
+.pg-bar .fill { left: 0; background: linear-gradient(90deg, var(--blue), var(--green)); border-radius: 1px; }
+.pg-bar.over .fill { background: linear-gradient(90deg, var(--blue), var(--amber)); }
+.pg-bar .max { width: 2px; margin-left: -1px; top: -3px; bottom: -3px; background: var(--fg-2); }
+.pg-bar .native { width: 4px; height: 4px; top: 1px; margin-left: -2px; border-radius: 50%; background: var(--cyan-2); }
+.pg-bar .budget { width: 0; top: -4px; bottom: -4px; border-left: 2px dashed var(--yellow); }
+@container (max-width: 560px) {
+  .pg-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .pg-row .detail { grid-column: 1 / -1; }
+}
+@container (max-width: 380px) {
+  .pg-row .cyc { grid-template-columns: auto minmax(40px, 1fr); }
+  .pg-row .cyc .more { grid-column: 1 / -1; }
+  .pg-row .state { font-size: 11px; padding: 4px 6px; }
+}
 .state { font: 600 12px/1 var(--f-mono); padding: 5px 9px; border-radius: 999px; white-space: nowrap; border: 1px solid; }
+.pg-row .state { box-sizing: content-box; width: 16ch; text-align: center; overflow: hidden; text-overflow: ellipsis; justify-self: end; }
 .state.ok { color: #04121a; background: var(--green); border-color: var(--green); }
 .state.bad { color: #fff; background: var(--red); border-color: var(--red); }
 .state.na { color: var(--dim); border-color: var(--line-2); border-style: dashed; }
@@ -99,8 +137,6 @@ kbd { font: 500 11px/1 var(--f-mono); padding: 2px 6px; border: 1px solid var(--
   .pg-param { grid-template-columns: 50px minmax(0, 1fr) 76px; }
   .pg-param .n { display: none; }
   .pg-param output small { display: none; }
-  .pg-row { grid-template-columns: minmax(0, 1fr) auto; }
-  .pg-row .detail { grid-column: 1 / -1; }
   .pg-pad { margin-left: 0; flex: 1 1 100%; min-height: 64px; }
   .pg-screen { height: 180px; }
 }
