@@ -299,38 +299,114 @@ let parseSearch (how: string) =
     | _ -> Error $"anneal:N needs a positive count, not '{n}'"
   | _ -> Error $"unknown search '{how}': anneal:N"
 
-/// `stress --search anneal:N`: the annealed worst case, every case it measured as the table, and
-/// how many measurements that took against the sweep and the full grid.
-let stressSearch name (pkg: Mds.Package) (machine: Mds.Machine) (track: Track.Track) blocks (budget: int) seed objective =
+/// One machine's stress: its cases measured by `evaluate` (a sweep, or the annealed search), the
+/// table printed; the worst case of each phase returned with whether the trig block stays within.
+let stressMachine name (pkg: Mds.Package) (machine: Mds.Machine) (evaluate: float array -> Stress.Case) (sweep: Result<Stress.Sweep, (int * int * Stress.Objective)>) (maxCases: int) blocks =
   let cs = Stress.controls machine
-  let found = Stress.anneal cs (Stress.measure track blocks) objective budget seed
-  let sweep = (Stress.exhaustiveSettings cs).Length
-  printfn "%s: anneal:%d, seed %d, maximising %s: %d measurements (the exhaustive sweep: %d; every setting: %A); %d RENDER blocks each" name budget seed (Stress.objectiveName objective) found.evaluations sweep (Stress.gridSize cs) blocks
-  printfn "worst found: %d cycles at %s" (Stress.score objective found.best) (Stress.settingsText cs found.best.settings)
-  let lines, within = Stress.report cs pkg.maxCycles found.cases
+  let cases =
+    match sweep with
+    | Ok sweep ->
+      let settings = Stress.settingsOf cs sweep
+      let picked = Stress.sample maxCases settings
+      let how = match sweep with Stress.Exhaustive -> "exhaustive" | Stress.RandomCases(n, seed) -> $"random:{n}, seed {seed}"
+      let sampled = if picked.Length < settings.Length then $" of {settings.Length}" else ""
+      printfn "%s: %d cases%s (%s), %d RENDER blocks each; cycles JSR to STOP, service stand-ins included" name picked.Length sampled how blocks
+      picked |> List.map evaluate
+    | Error(budget, seed, objective) ->
+      let found = Stress.anneal cs evaluate objective budget seed
+      printfn "%s: anneal:%d, seed %d, maximising %s: %d measurements (the exhaustive sweep: %d; every setting: %A); %d RENDER blocks each" name budget seed (Stress.objectiveName objective) found.evaluations (Stress.exhaustiveSettings cs).Length (Stress.gridSize cs) blocks
+      printfn "worst found: %d cycles at %s" (Stress.score objective found.best) (Stress.settingsText cs found.best.settings)
+      found.cases
+  let lines, within = Stress.report cs pkg.maxCycles cases
   for l in lines do printfn "%s" l
-  if within then 0 else 1
+  cases, within
+
+/// A machine on the track harness with the grade's stand-ins (the sine ROM, the input and main
+/// rings) loaded, so machines that read them make their sound.
+let harnessTrack (pkg: Mds.Package) (machine: Mds.Machine) banks =
+  let track = new Track.Track(pkg, Some machine, dsp56k.kernel.Grade.layout, banks)
+  dsp56k.kernel.Grade.loadResources track.Emulator
+  track
 
 let stress (args: ParseResults<StressArgs>) =
-  let sweep = parseSweep (args.GetResult(StressArgs.Sweep, "exhaustive")) (args.GetResult(StressArgs.Seed, 1))
-  match loadMachine (args.GetResult StressArgs.Input) (args.TryGetResult StressArgs.Slot), sweep with
-  | Error e, _ | _, Error e -> fail e
-  | Ok(name, pkg, machine), Ok sweep ->
-    let cs = Stress.controls machine
-    let blocks = args.GetResult(StressArgs.Blocks, 16)
-    use track = new Track.Track(pkg, Some machine, Track.defaultLayout, sampleBanks (args.TryGetResult StressArgs.Sample))
+  let seed = args.GetResult(StressArgs.Seed, 1)
+  let plan =
     match args.TryGetResult StressArgs.Search with
     | Some how ->
       match parseSearch how, parsePhase (args.GetResult(StressArgs.Phase, "worst")) with
-      | Error e, _ | _, Error e -> fail e
-      | Ok budget, Ok objective -> stressSearch name pkg machine track blocks budget (args.GetResult(StressArgs.Seed, 1)) objective
-    | None ->
-    let cases = Stress.settingsOf cs sweep |> List.map (Stress.measure track blocks)
-    let how = match sweep with Stress.Exhaustive -> "exhaustive" | Stress.RandomCases(n, seed) -> $"random:{n}, seed {seed}"
-    printfn "%s: %d cases (%s), %d RENDER blocks each; cycles JSR to STOP, service stand-ins included" name cases.Length how blocks
-    let lines, within = Stress.report cs pkg.maxCycles cases
-    for l in lines do printfn "%s" l
-    if within then 0 else 1
+      | Error e, _ | _, Error e -> Error e
+      | Ok budget, Ok objective -> Ok(Error(budget, seed, objective))
+    | None -> parseSweep (args.GetResult(StressArgs.Sweep, "exhaustive")) seed |> Result.map Ok
+  match plan with
+  | Error e -> fail e
+  | Ok plan ->
+    let listening = args.Contains StressArgs.Audition
+    let rate = 44100
+    let caseSeconds = args.GetResult(StressArgs.Case_Seconds, 0.75)
+    let blocks = if listening then max 1 (int (caseSeconds * float rate / 32.0)) else args.GetResult(StressArgs.Blocks, 16)
+    let trigEvery = args.TryGetResult StressArgs.Trig_Every |> Option.orElse (if listening then Some 344 else None)
+    let maxCases = args.GetResult(StressArgs.Max_Cases, if listening then 40 else 0)
+    let player = if listening then Some(new dsp56k.audio.Output.Player(rate, rate / 2)) else None
+    use _closePlayer = { new IDisposable with member _.Dispose() = player |> Option.iter (fun p -> p.Drain(TimeSpan.FromSeconds 2.0); (p :> IDisposable).Dispose()) }
+    player |> Option.iter (fun p -> if p.SampleRate <> rate then eprintfn "warning: the output plays at %d Hz, not %d: pitch off by %.3f" p.SampleRate rate (float p.SampleRate / float rate))
+    let shaper = Audition.Shaper(args.GetResult(StressArgs.Gain, 0.35), 0.5)
+    let session = ResizeArray<float>()
+    let mutable stopped = false
+    let onCancel = ConsoleCancelEventHandler(fun _ e -> e.Cancel <- true; stopped <- true)
+    Console.CancelKeyPress.AddHandler onCancel
+    try
+      let summaries =
+        [ for input in args.GetResult StressArgs.Inputs do
+            if not stopped then
+              match loadMachine input (args.TryGetResult StressArgs.Slot) with
+              | Error e -> eprintfn "error: %s" e
+              | Ok(name, pkg, machine) ->
+                printfn "\n== %s: %s (%s), declared %d cycles, limit %d" name machine.displayName machine.id pkg.maxCycles Abi.trackCycleLimit
+                use track = harnessTrack pkg machine (sampleBanks (args.TryGetResult StressArgs.Sample))
+                let cs = Stress.controls machine
+                let evaluate =
+                  match player with
+                  | None -> Stress.measureWith track blocks trigEvery ignore
+                  | Some p ->
+                    let mutable count = 0
+                    let mutable worst = Map.empty<Stress.Phase, int64>
+                    fun settings ->
+                      if stopped then Stress.measure track 1 settings
+                      else
+                        let frames = ResizeArray<float>()
+                        let case = Stress.measureWith track blocks trigEvery (fun words -> for w in words do frames.Add(Track.toFloat w)) settings
+                        count <- count + 1
+                        let fresh =
+                          [ for phase in Stress.phases do
+                              let c = Stress.cycles phase case
+                              match worst.TryFind phase with
+                              | Some w when c <= w -> ()
+                              | previous ->
+                                worst <- worst.Add(phase, c)
+                                if previous.IsSome then yield Stress.phaseName phase ]
+                        let flag = if fresh.IsEmpty then "" else $"""  NEW WORST {String.concat ", " fresh}"""
+                        printfn "  [%3d] INIT %4d TRIG %4d RENDER %5d T+R %5d  %s%s" count case.init case.trig case.render case.trigBlock (Stress.settingsText cs settings) flag
+                        let heard = Audition.shapeCase shaper 220 (rate / 20) (frames.ToArray())
+                        session.AddRange heard
+                        p.Write(heard |> Array.map float32)
+                        case
+                let cases, within = stressMachine name pkg machine evaluate plan maxCases blocks
+                yield name, cs, cases, pkg.maxCycles, within ]
+      if summaries.Length > 1 then
+        printfn "\nsummary (limit %d; T+R judged against the declared figure and the limit)" Abi.trackCycleLimit
+        printfn "%-18s %5s %5s %5s %6s %6s %8s  %s" "machine" "cases" "INIT" "TRIG" "RENDER" "T+R" "declared" "settings at the worst T+R"
+        for name, cs, cases, declared, within in summaries do
+          let worst phase = cases |> List.map (Stress.cycles phase) |> List.max
+          let at = cases |> List.maxBy (Stress.cycles Stress.TrigBlock)
+          printfn "%-18s %5d %5d %5d %6d %6d %8d  %s%s" name cases.Length (worst Stress.Init) (worst Stress.Trig) (worst Stress.Render) (worst Stress.TrigBlock) declared (Stress.settingsText cs at.settings) (if within then "" else "  OVER")
+      match args.TryGetResult StressArgs.Wav with
+      | Some path when session.Count > 0 ->
+        Wav.write path rate (session.ToArray() |> Array.map (fun x -> int (Math.Round(max -1.0 (min 1.0 x) * 8388607.0)) &&& 0xffffff))
+        printfn "wrote %s (%.1f s)" path (float session.Count / float rate)
+      | _ -> ()
+      if summaries |> List.forall (fun (_, _, _, _, within) -> within) then 0 else 1
+    finally
+      Console.CancelKeyPress.RemoveHandler onCancel
 
 // ---------------------------------------------------------------------------------------------
 // Live output.

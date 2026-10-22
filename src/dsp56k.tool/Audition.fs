@@ -109,3 +109,22 @@ let mirror (out: dsp56k.audio.Midi.Output) (baseChannel: int) (track: int) (voic
         if i >= 0 && i < 8 then out.Control(channel, MidiMap.parameterBase[(track - 1) % 4] + i, int (max 0.0 (min 127.0 setting)))
         voice.parameter i setting }
   mirrored, finish
+
+/// What goes to the speakers and the session file when listening to a sweep: a gain, then a
+/// peak limiter (instant attack, about 50 ms release) holding every frame under `ceiling`, so
+/// noisy settings at their extremes are never loud or harsh.
+type Shaper(gain: float, ceiling: float) =
+  let release = 0.9995
+  let mutable envelope = 0.0
+
+  member _.Shape(x: float) =
+    let y = gain * x
+    envelope <- max (abs y) (envelope * release)
+    if envelope > ceiling then y * ceiling / envelope else y
+
+/// A case's frames shaped, faded in and out over `fade` frames (no click between settings), then
+/// `gap` frames of silence.
+let shapeCase (shaper: Shaper) (fade: int) (gap: int) (frames: float array) =
+  let n = frames.Length
+  let ramp i = if fade <= 0 then 1.0 else min 1.0 (float (min i (n - 1 - i)) / float fade)
+  Array.append (frames |> Array.mapi (fun i x -> shaper.Shape x * ramp i)) (Array.zeroCreate gap)

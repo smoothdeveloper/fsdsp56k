@@ -169,6 +169,29 @@ let tests =
       Expect.equal code 0 text
     }
 
+    test "stress --audition's shaping: never over the ceiling, faded at both ends, a gap after" {
+      let shaper = dsp56k.tool.Audition.Shaper(0.35, 0.5)
+      let loud = Array.init 4410 (fun i -> if i % 2 = 0 then 1.0 else -1.0)
+      let heard = dsp56k.tool.Audition.shapeCase shaper 220 100 loud
+      Expect.equal heard.Length (4410 + 100) "the case, then the gap"
+      Expect.isTrue (heard |> Array.forall (fun x -> abs x <= 0.5 + 1e-9)) "under the ceiling"
+      Expect.equal heard[0] 0.0 "faded in"
+      Expect.equal heard[4409] 0.0 "faded out"
+      Expect.isTrue (heard[4410..] |> Array.forall ((=) 0.0)) "silence between cases"
+      let boosted = dsp56k.tool.Audition.Shaper(4.0, 0.5)
+      Expect.isTrue ([ for x in loud -> boosted.Shape x ] |> List.forall (fun x -> abs x <= 0.5 + 1e-9)) "a large gain is limited too"
+    }
+
+    test "stress takes several machines and sums them up" {
+      needFixture "kitbasher"
+      needNative ()
+      let tx6 d = fixture "kitbasher" </> "mds" </> "tx6" </> d </> (d + ".syx")
+      let code, text = tool [| "stress"; tx6 "bd"; tx6 "cp"; "--blocks"; "2"; "--max-cases"; "5" |]
+      Expect.equal code 0 text
+      Expect.stringContains text "5 cases of" "sampled down"
+      Expect.stringContains text "summary" "a summary of both"
+    }
+
     test "stress cases: the defaults first, then each control swept and the pairwise rows" {
       let cs : dsp56k.kernel.Grade.Control array =
         [| { name = "A"; low = 0.0; high = 127.0; standard = 64.0 }

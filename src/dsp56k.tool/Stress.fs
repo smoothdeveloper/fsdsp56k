@@ -55,19 +55,40 @@ type Case =
     render    : int64      // the worst RENDER block
     trigBlock : int64 }    // TRIG and the RENDER after it: the block a trig lands in
 
-/// A case: the settings, INIT, TRIG, then `blocks` RENDER blocks.
+/// A case: the settings, INIT, TRIG, then `blocks` RENDER blocks, retriggered every `trigEvery`
+/// blocks if given, each block's words to `sink`.
 // TODO: the state INIT leaves is all a case starts from; a machine whose cost grows with state
 // INIT does not reset (a delay line filled over seconds) needs longer runs or --trig-every.
-let measure (track: Track.Track) (blocks: int) (settings: float array) =
+let measureWith (track: Track.Track) (blocks: int) (trigEvery: int option) (sink: int array -> unit) (settings: float array) =
   track.SetSettings settings
   let init = track.Init 0
-  let trig = track.Trig 0
-  let renders = [| for _ in 1 .. max 1 blocks -> snd (track.Render 0) |]
+  let mutable trig = 0L
+  let mutable render = 0L
+  let mutable trigBlock = 0L
+  for b in 0 .. max 1 blocks - 1 do
+    let triggered = b = 0 || (trigEvery |> Option.exists (fun n -> n > 0 && b % n = 0))
+    let t = if triggered then track.Trig 0 else 0L
+    let words, r = track.Render 0
+    sink words
+    trig <- max trig t
+    render <- max render r
+    if triggered then trigBlock <- max trigBlock (t + r)
   { settings  = settings
     init      = init
     trig      = trig
-    render    = Array.max renders
-    trigBlock = trig + renders[0] }
+    render    = render
+    trigBlock = trigBlock }
+
+/// A case as `stress` measures it without listening: one TRIG, `blocks` RENDER blocks.
+let measure (track: Track.Track) (blocks: int) (settings: float array) = measureWith track blocks None ignore settings
+
+/// At most `n` of `cases`, evenly spread, the first (the defaults) kept.
+let sample (n: int) (cases: 'a list) =
+  let all = List.length cases
+  if n <= 0 || all <= n then cases
+  else
+    let a = Array.ofList cases
+    [ for k in 0 .. n - 1 -> a[k * all / n] ]
 
 type Phase =
   | Init

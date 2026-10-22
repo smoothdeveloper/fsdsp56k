@@ -134,7 +134,7 @@ type RunArgs =
       | Profile -> "single-step the first INIT, TRIG and RENDER and report hot addresses."
 
 type StressArgs =
-  | [<MainCommand; ExactlyOnce>] Input of path: string
+  | [<MainCommand; ExactlyOnce>] Inputs of paths: string list
   | Slot of int
   | Sweep of how: string
   | Search of how: string
@@ -142,11 +142,23 @@ type StressArgs =
   | Seed of int
   | Blocks of int
   | Sample of wav: string
+  | Audition
+  | Case_Seconds of float
+  | Max_Cases of int
+  | Trig_Every of blocks: int
+  | Gain of float
+  | Wav of path: string
   interface IArgParserTemplate with
     member a.Usage =
       match a with
-      | Input _ -> ".mds package or .syx dump."
+      | Inputs _ -> ".mds packages or .syx dumps, one machine after another."
       | Slot _ -> "slot (1..16) to take from a .syx holding several machines."
+      | Audition -> "listen while it sweeps: each case played through the default output, its cycles printed, new worst cases flagged."
+      | Case_Seconds _ -> "with --audition: seconds per case (default 0.75)."
+      | Max_Cases _ -> "at most this many cases per machine, evenly spread (default: all; 40 with --audition)."
+      | Trig_Every _ -> "retrigger every N blocks within a case (default: once; 344, a quarter second, with --audition)."
+      | Gain _ -> "with --audition: gain before the limiter (default 0.35; the limiter holds peaks under 0.5)."
+      | Wav _ -> "with --audition: write the whole session, as heard, to this 24-bit WAV."
       | Sweep _ -> "exhaustive (each control over its range, then pairwise; default) or random:N."
       | Search _ -> "anneal:N: search for the worst case within N measurements, instead of a sweep."
       | Phase _ -> "what --search maximises: init, trig, render, trig+render or worst (default)."
