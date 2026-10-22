@@ -1279,13 +1279,59 @@ let runFrom (level: Level) (first: int) (temps: int) (items: Item array) (lines:
 /// The passes of `level`, for a kernel without [<XMemory>] state: temporaries are X words below `temps`.
 let run (level: Level) (temps: int) (items: Item array) (lines: int array) = runFrom level 0 temps items lines
 
-/// Compile, then run the passes of `level` over the items.
-/// Compile, run the passes of `level`, and keep the program within `limit` words: when it is
-/// larger, the loops whose unswitching added the most are kept whole (tested on each pass), the
-/// largest first, until it fits or none is unswitched. None: no limit.
-let compileWithin (limit: int option) (level: Level) (target: Kernel.Target) (k: Kernel.Kernel) =
-  let attempt (unswitchMax: int option) =
-    Compile.generateUnswitching unswitchMax target k
+/// Which helpers the compiler makes subroutines by its own choice, besides the [<Subroutine>]
+/// ones ([<Inline>] helpers never):
+/// - Off: none;
+/// - Conservative: a helper called from more than one place, all of them in INIT or TRIG, when
+///   that saves at least `minSaving` program words (RENDER's code stays as it was);
+/// - Size: also helpers RENDER calls, outside its loops first, then inside them; any saving.
+/// Conservative is the default; a kernel too large for its machine tries Size before it is refused.
+type Subroutines =
+  | Off
+  | Conservative
+  | Size
+
+/// The words a chosen subroutine must save under Conservative.
+let minSaving = 4
+
+/// The policy `compile` uses: FSDSP56K_SUBROUTINES=off, conservative (the default) or size.
+let subroutinesPolicy () =
+  match System.Environment.GetEnvironmentVariable "FSDSP56K_SUBROUTINES" with
+  | null | "" | "conservative" -> Conservative
+  | "off" -> Off
+  | "size" -> Size
+  | other -> failwith $"FSDSP56K_SUBROUTINES: {other} is not off, conservative or size"
+
+/// The helpers `policy` may make subroutines, in the order they are tried: (tier, calls, key)
+/// with tier 0 called only from INIT and TRIG, 1 also from RENDER outside its loops, 2 inside
+/// them; the most calls first, then by name (deterministic).
+let subroutineCandidates (policy: Subroutines) (ik: Ir.IrKernel) =
+  // a subroutine gives a Frac, Acc or Long, or nothing (unit, a method's void)
+  let returns (t: Ir.IrTy) = t = Ir.TyFrac || t = Ir.TyAcc || t = Ir.TyLong || t = Ir.TyUnit || t = Ir.TyOther "System.Void"
+  Compile.helperUses ik
+  |> List.groupBy (fun u -> u.helper.Key)
+  |> List.choose (fun (key, uses) ->
+    let h = uses.Head.helper
+    if policy = Off || uses.Length < 2 || h.Marks.Contains "Subroutine" || h.Marks.Contains "Inline" || not (returns h.ReturnType) then None
+    else
+      let entryOnly = uses |> List.forall (fun u -> u.entry = "INIT" || u.entry = "TRIG")
+      let coldRender = uses |> List.forall (fun u -> not (u.entry = "RENDER" && u.inLoop))
+      match policy with
+      | Conservative when entryOnly -> Some(0, -uses.Length, key)
+      | Size when entryOnly -> Some(0, -uses.Length, key)
+      | Size when coldRender -> Some(1, -uses.Length, key)
+      | Size -> Some(2, -uses.Length, key)
+      | _ -> None)
+  |> List.sort
+
+/// Compile, run the passes of `level`, choose subroutines (`policy`), and keep the program within
+/// `limit` words: when it is larger, the loops whose unswitching added the most are kept whole
+/// (tested on each pass), the largest first, until it fits or none is unswitched; then, unless the
+/// policy is Off, helpers RENDER calls are made subroutines too. None: no limit.
+let compileChoosing (policy: Subroutines) (limit: int option) (level: Level) (target: Kernel.Target) (k: Kernel.Kernel) =
+  let ik = FromQuotation.kernel k
+  let attempt (chosen: Set<string>) (unswitchMax: int option) =
+    Compile.generateIrChoosing chosen unswitchMax target ik
     |> Result.map (fun (c, costs) ->
       let items, lines = runFrom level c.layout.xWorkset c.xWorkset c.items c.lines
       { c with items = items; lines = lines }, costs)
@@ -1293,20 +1339,44 @@ let compileWithin (limit: int option) (level: Level) (target: Kernel.Target) (k:
     match limit, Compile.size c with
     | Some l, Ok s -> s.total <= l
     | _ -> true
-  match attempt None with
-  | Ok(c, costs) when not (fits c) && not costs.IsEmpty ->
-    // each distinct cost, largest first: loops costing more than the next one down kept whole
-    let rec smaller (thresholds: int list) (best: Compile.Compiled) =
-      match thresholds with
-      | [] -> Ok best
-      | m :: rest ->
-        match attempt (Some m) with
-        | Ok(c, _) when fits c -> Ok c
-        | Ok(c, _) -> smaller rest c
-        | Error e -> Error e
-    let thresholds = (costs |> List.distinct |> List.sortDescending |> List.tail) @ [ -1 ]
-    smaller thresholds c
-  | r -> r |> Result.map fst
+  let words (c: Compile.Compiled) = match Compile.size c with Ok s -> s.total | Error _ -> System.Int32.MaxValue
+  // each candidate tried on top of those kept, kept when it saves enough words; a candidate the
+  // compiler refuses (an argument it cannot pass, the system stack) is left inlined
+  let choose (p: Subroutines) (unswitchMax: int option) (chosen: Set<string>, best: Compile.Compiled) =
+    subroutineCandidates p ik
+    |> List.fold (fun (chosen: Set<string>, best: Compile.Compiled) (_, _, key) ->
+      if chosen.Contains key then chosen, best
+      else
+        let need = if p = Conservative then minSaving else 1
+        match (try attempt (chosen.Add key) unswitchMax with e -> Error e.Message) with
+        | Ok(c, _) when words c <= words best - need -> chosen.Add key, c
+        | _ -> chosen, best) (chosen, best)
+  match attempt Set.empty None with
+  | Error e -> Error e
+  | Ok(c0, costs) ->
+    let chosen, c = if policy = Off then Set.empty, c0 else choose policy None (Set.empty, c0)
+    if fits c then Ok c
+    else
+      // each distinct cost, largest first: loops costing more than the next one down kept whole
+      let rec smaller (thresholds: int list) (best: Compile.Compiled) =
+        match thresholds with
+        | [] -> Ok best
+        | m :: rest ->
+          match attempt chosen (Some m) with
+          | Ok(c, _) when fits c -> Ok c
+          | Ok(c, _) -> smaller rest c
+          | Error e -> Error e
+      let shrunk = if costs.IsEmpty then Ok c else smaller ((costs |> List.distinct |> List.sortDescending |> List.tail) @ [ -1 ]) c
+      match shrunk with
+      | Ok c' when not (fits c') && policy <> Off ->
+        // size pressure: helpers RENDER calls as subroutines too
+        let unswitchMax = if costs.IsEmpty then None else Some -1
+        Ok(snd (choose Size unswitchMax (chosen, c')))
+      | r -> r
+
+/// `compileChoosing` with the policy of FSDSP56K_SUBROUTINES.
+let compileWithin (limit: int option) (level: Level) (target: Kernel.Target) (k: Kernel.Kernel) =
+  compileChoosing (subroutinesPolicy ()) limit level target k
 
 /// Compile, then run the passes of `level` over the items; refused when the program is larger
 /// than the target's machine holds (Kernel.programLimit), after keeping loops whole if that helps.

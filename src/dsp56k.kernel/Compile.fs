@@ -162,6 +162,7 @@ type Ctx =
     mutable bHeld  : bool             // an Acc local lives in B: nothing else may write it
     mutable bWrite : bool             // ...except the local's own updates
     subs     : Dictionary<Member, Sub>   // [<Subroutine>] helpers called, compiled after the entries
+    chosen   : Set<string>               // helpers (by key) made subroutines by Optimize's choice
     floors   : Map<string, int>          // the least first word of a subroutine's (Refloor)
     kept     : HashSet<Var>                  // loops not unswitched: in [<NoUnswitch>] functions
     unrolled : HashSet<Var>                  // loops written out: in [<Unroll>] functions
@@ -566,6 +567,11 @@ let inlined (mi: Member) (args: Expr list) =
 /// A helper marked [<Subroutine>]: called, not inlined.
 let isSubroutine (mi: Member) =
   mi.Marks.Contains "Subroutine" && (reflected mi).IsSome
+
+/// A helper called as a subroutine here: marked [<Subroutine>], or chosen (Optimize) and not
+/// marked [<Inline>].
+let isSub (ctx: Ctx) (mi: Member) =
+  (isSubroutine mi || (ctx.chosen.Contains mi.Key && not (mi.Marks.Contains "Inline"))) && (reflected mi).IsSome
 
 /// A helper's parameters and body.
 let parametersOf (def: Expr) =
@@ -993,14 +999,14 @@ let ringTapOf (ctx: Ctx) (value: Expr) : RingTap option =
   let rec find (env: (Var * Expr) list) (e: Expr) =
     match e with
     | Let(v, x, b) when not v.IsMutable && not (v.Type = TyCursor) -> find (env @ [ v, x ]) b
-    | Call(None, mi, args) when intrinsic (resolve mi args) = None && not (isSubroutine mi) && (reflected mi).IsSome ->
+    | Call(None, mi, args) when intrinsic (resolve mi args) = None && not (isSub ctx mi) && (reflected mi).IsSome ->
       find env (inlined mi args)
     | Intr "region.read" [ r; i ] ->
       // an index computed by a helper: inlined, its arguments' lets kept with the others
       let rec open' (env: (Var * Expr) list) (i: Expr) =
         match i with
         | Let(v, x, b) when not v.IsMutable -> open' (env @ [ v, x ]) b
-        | Call(None, mi, args) when intrinsic (resolve mi args) = None && not (isSubroutine mi) && (reflected mi).IsSome ->
+        | Call(None, mi, args) when intrinsic (resolve mi args) = None && not (isSub ctx mi) && (reflected mi).IsSome ->
           open' env (inlined mi args)
         | _ -> env, i
       let env, i = open' env i
@@ -1278,7 +1284,7 @@ let rec genAcc (ctx: Ctx) (e: Expr) : unit =
         genAcc ctx x
         emit ctx (and' (immL (m &&& 0xffffff)) a)
       | Some n, _ -> fail $"{n} does not give an Acc"
-      | None, _ when isSubroutine mi -> callSub ctx mi args
+      | None, _ when isSub ctx mi -> callSub ctx mi args
       | None, _ ->
         let body = inlined mi args
         lined ctx body (fun () -> genAcc ctx body)
@@ -1404,7 +1410,7 @@ and genLong (ctx: Ctx) (e: Expr) =
       emit ctx (move (immL 0x800000) a)
       emit ctx (Label fits)
     | Let(v, value, body) -> withLet ctx v value body (fun () -> genLong ctx body)
-    | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone && isSubroutine mi -> callSub ctx mi args
+    | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone && isSub ctx mi -> callSub ctx mi args
     | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone ->
       let body = inlined mi args
       lined ctx body (fun () -> genLong ctx body)
@@ -1470,7 +1476,7 @@ and genWord (ctx: Ctx) (e: Expr) : unit =
         emit ctx (Label skip)
         emit ctx (move a1 x0)
       | Some n, _ -> fail $"{n} does not give a Frac"
-      | None, _ when isSubroutine mi -> callSub ctx mi args
+      | None, _ when isSub ctx mi -> callSub ctx mi args
       | None, _ ->
         let body = inlined mi args
         lined ctx body (fun () -> genWord ctx body)
@@ -2202,7 +2208,7 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
           match affine env a, tryConst ctx n with
           | Some(None, c, k), Some(:? int as n) when n >= 0 && n < 16 -> Some(None, c <<< n, k <<< n)
           | _ -> None
-        | Call(None, mi, args) when intrinsic (resolve mi args) = None && not (isSubroutine mi) && (reflected mi).IsSome ->
+        | Call(None, mi, args) when intrinsic (resolve mi args) = None && not (isSub ctx mi) && (reflected mi).IsSome ->
           affine env (inlined mi args)
         | _ -> None
     let consumed = HashSet<Expr>(HashIdentity.Reference)
@@ -2281,7 +2287,7 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
         List.iter scan rest
       | Call(None, mi, [ Var i ]) when i = v && mi.Name = "ofRaw" && mi.Declaring = TyFrac -> counted <- true
       // a helper given the index: what its body does with it once inlined
-      | Call(None, mi, args) when intrinsic mi = None && not (isSubroutine mi) && (reflected mi).IsSome
+      | Call(None, mi, args) when intrinsic mi = None && not (isSub ctx mi) && (reflected mi).IsSome
                                   && args |> List.exists (fun a -> a.GetFreeVars() |> Seq.contains v) ->
         scan (inlined mi args)
       | Var i when i = v ->
@@ -2478,7 +2484,7 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
     storeWord ctx x (cursorMem ctx.cursors[c] true)
   | Call(Some(Var c), mi, [x]) when ctx.cursors.ContainsKey c && (intrinsic mi = Some "cursor.putUp" || intrinsic mi = Some "cursor.putDown") ->
     storeWord ctx x (cursorOne ctx.cursors[c] (intrinsic mi).Value)
-  | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone && isSubroutine mi -> callSub ctx mi args
+  | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone && isSub ctx mi -> callSub ctx mi args
   | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone -> genStmt ctx (inlined mi args)
   | Value(null, _) -> ()
   | _ -> fail $"not a kernel statement: {e}"
@@ -2899,11 +2905,49 @@ let keptLoops (k: IrKernel) = markedLoops "NoUnswitch" k
 /// The loops of [<Unroll>] functions (or functions of [<Unroll>] modules).
 let unrolledLoops (k: IrKernel) = markedLoops "Unroll" k
 
+/// A call of a kernel helper (inlined unless it is a subroutine): the entry it is reached from
+/// ("INIT", "TRIG", "RENDER", or "SUB" inside a [<Subroutine>]), and whether a loop is around it.
+type HelperUse =
+  { helper : Member
+    entry  : string
+    inLoop : bool }
+
+/// Every call of a helper the entries make, once for each place inlining puts it (a call in a
+/// helper inlined twice counts twice); a [<Subroutine>]'s body once.
+let helperUses (k: IrKernel) =
+  let uses = ResizeArray<HelperUse>()
+  let seenSubs = HashSet<Member>()
+  let rec walk (entry: string) (inLoop: bool) (depth: int) (e: Expr) =
+    match e with
+    | ForIntegerRangeLoop(_, lo, hi, b) ->
+      walk entry inLoop depth lo
+      walk entry inLoop depth hi
+      walk entry true depth b
+    | WhileLoop(c, b) ->
+      walk entry true depth c
+      walk entry true depth b
+    | Call(o, mi, args) ->
+      Option.iter (walk entry inLoop depth) o
+      List.iter (walk entry inLoop depth) args
+      let mi = resolve mi args
+      match intrinsic mi, reflected mi with
+      | None, Some def ->
+        uses.Add { helper = mi; entry = entry; inLoop = inLoop }
+        if isSubroutine mi then (if seenSubs.Add mi then walk "SUB" false 0 def)
+        elif depth < 32 then walk entry inLoop (depth + 1) def
+      | _ -> ()
+    | ExprShape.ShapeVar _ -> ()
+    | ExprShape.ShapeLambda(_, b) -> walk entry inLoop depth b
+    | ExprShape.ShapeCombination(_, xs) -> List.iter (walk entry inLoop depth) xs
+  for entry, mi in [ "INIT", k.init; "TRIG", k.trig; "RENDER", k.render ] do
+    reflected mi |> Option.iter (walk entry false 0)
+  List.ofSeq uses
+
 /// A subroutine compiled below a call found later: compiled again from the start, each one's
 /// words from at least the given word.
 exception Refloor of Map<string, int>
 
-let rec generateWith (floors: Map<string, int>) (unswitchMax: int option) (target: Target) (ik: IrKernel) : Result<Compiled * int list, string> =
+let rec generateWith (chosen: Set<string>) (floors: Map<string, int>) (unswitchMax: int option) (target: Target) (ik: IrKernel) : Result<Compiled * int list, string> =
   try
     let layout = layoutOf target ik.name ik.parameters (defaultArg ik.state [||])
     let ctx =
@@ -2912,7 +2956,7 @@ let rec generateWith (floors: Map<string, int>) (unswitchMax: int option) (targe
         cursors = Map.empty; freeRegs = [ 1; 2; 3; 4; 5 ]; tables = ResizeArray(); conts = []; released = Collections.Generic.HashSet(); trackHome = None
         indexed = Map.empty; counters = Map.empty; inductions = Map.empty; affineAt = Dictionary(HashIdentity.Reference); taps = Dictionary(); freeData = [ X1; Y1 ]; scores = Dictionary(); deadLocals = HashSet()
         unswitched = HashSet(); bHeld = false; bWrite = false
-        subs = Dictionary(); inSub = None; depth = 0; deepest = 0; floors = floors
+        subs = Dictionary(); chosen = chosen; inSub = None; depth = 0; deepest = 0; floors = floors
         kept = keptLoops ik; unrolled = unrolledLoops ik; pending = []; unswitchMax = unswitchMax; unswitchCosts = ResizeArray()
         bindings = ResizeArray() }
     entry ctx "INIT" ik.init
@@ -2960,19 +3004,20 @@ let rec generateWith (floors: Map<string, int>) (unswitchMax: int option) (targe
          bindings = ctx.bindings.ToArray() }, List.ofSeq ctx.unswitchCosts)
   with
   | KernelError m -> Error m
-  | Refloor floors' when floors'.Count <= 64 && floors' <> floors -> generateWith floors' unswitchMax target ik
+  | Refloor floors' when floors'.Count <= 64 && floors' <> floors -> generateWith chosen floors' unswitchMax target ik
 
 /// The compiled kernel, its size not checked, each loop unswitched only when its copy takes at
 /// most `unswitchMax` words (None: any); and what each unswitched loop's copy took.
 /// Code generation recurses once per nested let and statement: a long kernel nests thousands, more
 /// than a thread pool thread's stack holds. It runs on its own thread with a 256 MB stack.
-let generateIrUnswitching (unswitchMax: int option) (target: Target) (k: IrKernel) =
+/// `chosen`: helpers (by key) called as subroutines besides the [<Subroutine>] ones.
+let generateIrChoosing (chosen: Set<string>) (unswitchMax: int option) (target: Target) (k: IrKernel) =
   let mutable result = Unchecked.defaultof<Result<Compiled * int list, string>>
   let mutable failure : System.Runtime.ExceptionServices.ExceptionDispatchInfo option = None
   let t =
     System.Threading.Thread(
       (fun () ->
-        try result <- generateWith Map.empty unswitchMax target k
+        try result <- generateWith chosen Map.empty unswitchMax target k
         with e -> failure <- Some(System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture e)),
       256 * 1024 * 1024)
   t.Start()
@@ -2980,6 +3025,9 @@ let generateIrUnswitching (unswitchMax: int option) (target: Target) (k: IrKerne
   // what it raised, as raised (callers catch KernelError)
   failure |> Option.iter (fun f -> f.Throw())
   result
+
+/// The compiled kernel, its size not checked, only the [<Subroutine>] helpers called.
+let generateIrUnswitching (unswitchMax: int option) (target: Target) (k: IrKernel) = generateIrChoosing Set.empty unswitchMax target k
 
 /// The same for a kernel written as quotations.
 let generateUnswitching (unswitchMax: int option) (target: Target) (k: Kernel) =
