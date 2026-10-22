@@ -13,7 +13,10 @@ let main argv =
     | Check a -> Commands.check a
     | Disasm a -> Commands.disasm a
     | Import a -> Commands.import a
-    | Mds a -> Commands.mds a
+    | Machinedrum a -> Commands.machinedrum a
+    | Mds a ->
+      eprintfn "note: 'mds' is now 'machinedrum' (or 'md'); the old name will go"
+      Commands.machinedrum a
     | Run a -> Commands.run a
     | Stress a -> Commands.stress a
     | Audition a -> Commands.audition a

@@ -1,6 +1,6 @@
-/// Command line of the `fsdsp56k` tool (Argu). Pure DSP56300 commands (asm, check, disasm,
-/// import of a listing) need nothing else; the `mds` and `run` commands and binary import are
-/// about Machinedrum MDS packages.
+/// Command line of the `fsdsp56k` tool (Argu). DSP56300 commands (asm, check, disasm, import)
+/// stay at the top; a host's own commands sit under its name (`machinedrum`, or `md`); run,
+/// stress and audition play a machine for a host.
 module dsp56k.tool.Cli
 
 open Argu
@@ -99,7 +99,7 @@ type MdsUnsyxArgs =
       | Input _ -> ".syx dump."
       | Output _ -> "directory for the .mds files (default: current)."
 
-type MdsArgs =
+type MachinedrumArgs =
   | [<CliPrefix(CliPrefix.None)>] Info of ParseResults<MdsInfoArgs>
   | [<CliPrefix(CliPrefix.None)>] Pack of ParseResults<MdsPackArgs>
   | [<CliPrefix(CliPrefix.None)>] Syx of ParseResults<MdsSyxArgs>
@@ -198,7 +198,8 @@ type Command =
   | [<CliPrefix(CliPrefix.None)>] Check of ParseResults<CheckArgs>
   | [<CliPrefix(CliPrefix.None)>] Disasm of ParseResults<DisasmArgs>
   | [<CliPrefix(CliPrefix.None)>] Import of ParseResults<ImportArgs>
-  | [<CliPrefix(CliPrefix.None)>] Mds of ParseResults<MdsArgs>
+  | [<CliPrefix(CliPrefix.None); AltCommandLine("md")>] Machinedrum of ParseResults<MachinedrumArgs>
+  | [<Hidden; CliPrefix(CliPrefix.None)>] Mds of ParseResults<MachinedrumArgs>
   | [<CliPrefix(CliPrefix.None)>] Run of ParseResults<RunArgs>
   | [<CliPrefix(CliPrefix.None)>] Stress of ParseResults<StressArgs>
   | [<CliPrefix(CliPrefix.None)>] Audition of ParseResults<AuditionArgs>
@@ -209,7 +210,8 @@ type Command =
       | Check _ -> "assemble, then confirm every instruction against the dsp56300 oracle."
       | Disasm _ -> "recover a package's program as Motorola-syntax source."
       | Import _ -> "listing or package to F# DSL source."
-      | Mds _ -> "MDS packages and SysEx dumps."
+      | Machinedrum _ -> "the Machinedrum's MDS packages and SysEx dumps."
+      | Mds _ -> "the old name of machinedrum."
       | Run _ -> "run a machine on the emulator: output WAV and cycle report."
       | Stress _ -> "worst-case INIT, TRIG and RENDER cycles over many settings, as a table."
       | Audition _ -> "play a machine on the emulator live through the default audio output."

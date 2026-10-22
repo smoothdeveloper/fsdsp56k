@@ -199,7 +199,7 @@ let mdsUnsyx (args: ParseResults<MdsUnsyxArgs>) =
       printfn "%s" (dir </> (name + ".mds"))
     0
 
-let mds (args: ParseResults<MdsArgs>) =
+let machinedrum (args: ParseResults<MachinedrumArgs>) =
   match args.GetSubCommand() with
   | Info a -> mdsInfo a
   | Pack a -> mdsPack a

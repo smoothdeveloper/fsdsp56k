@@ -202,4 +202,17 @@ let tests =
       Expect.contains settings [| 127.0; 1.0 |] "a pairwise corner"
       Expect.contains settings [| 0.0; 0.0 |] "A at its low end"
     }
+
+    test "machinedrum, md and the old mds name show the same package" {
+      needFixture "MDS"
+      let sine = fixture "MDS" </> "machines" </> "examples" </> "sine" </> "sine.mds"
+      let code, long = tool [| "machinedrum"; "info"; sine |]
+      Expect.equal code 0 long
+      let code, short = tool [| "md"; "info"; sine |]
+      Expect.equal code 0 short
+      Expect.equal short long "md is machinedrum"
+      let code, old = tool [| "mds"; "info"; sine |]
+      Expect.equal code 0 old
+      Expect.stringContains old "'mds' is now 'machinedrum'" "the old name says so"
+    }
   ]
