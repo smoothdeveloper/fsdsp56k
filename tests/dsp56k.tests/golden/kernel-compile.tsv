@@ -45,6 +45,8 @@ probe-stereo	machinedrum	error	-	0ff33fe26e5970df	probe-stereo: WritePair needs 
 probe-subroutine-frames	machinedrum	ok	173	b6e94340b9f35b59
 probe-subroutines	machinedrum	ok	202	267f2edafd7ab6d6
 probe-subroutines-deep	machinedrum	error	-	9bd55f1bd0ab30b9	probe-subroutines-deep: the call to refresh takes 15 system stack levels (a call one, a DO loop two), a machine may take 12
+probe-table-constant	machinedrum	ok	61	f60f384ef9f1814e
+probe-table-held	machinedrum	ok	73	1b45f9b68186d16e
 probe-unroll	machinedrum	ok	221	8b8a07d1810818cb
 probe-unroll-deep	machinedrum	error	-	b429f3326a5b8c0c	probe-unroll-deep: the call to level1 takes 14 system stack levels (a call one, a DO loop two), a machine may take 12
 probe-unroll-flat	machinedrum	ok	250	fd9f345e20d14cef

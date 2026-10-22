@@ -1465,6 +1465,49 @@ module Stereo =
   let kernel = Kernel.define "probe-stereo" <@ init @> <@ trig @> <@ render @>
 
 
+/// Table reads at constant indexes, a program table (`movem p:>TABLE+k`, relocated), a row of it
+/// and the sine resource (`move x:>k`, patched), against the same reads through indexes held in
+/// state, whose addresses are computed when the program runs.
+[<ReflectedDefinition>]
+module ConstTable =
+  let gains = Table.program "const_gains" [| 0x100000; 0x200000; 0x300000; 0x400000; 0x500000; 0x600000; 0x700000; 0x7fffff |]
+
+  type S =
+    { mutable i3 : Frac
+      mutable i5 : Frac
+      mutable i1 : Frac
+      mutable ix : Frac
+      mutable v  : Frac }
+
+  let init (_: Banks.P) (s: S) =
+    s.i3 <- Frac.ofRaw 3
+    s.i5 <- Frac.ofRaw 5
+    s.i1 <- Frac.ofRaw 1
+    s.ix <- Frac.ofRaw 0x2000
+    s.v  <- Frac.zero
+
+  let trig (_: Banks.P) (_: S) = ()
+
+  let constant (p: Banks.P) (s: S) (out: Output) =
+    for _ in 0 .. 7 do
+      s.v <- Acc.sat (Acc.ofFrac s.v + Table.read gains (Frac.ofRaw 3) * p.a)
+      out.Write s.v
+      out.Write(Table.row gains 2 (Frac.ofRaw 1) 1)
+      out.Write(Acc.sat (Table.read Rom.sine (Frac.ofRaw 0x2000) * p.b))
+      out.Write(Table.read gains (Frac.ofRaw 5))
+
+  let held (p: Banks.P) (s: S) (out: Output) =
+    for _ in 0 .. 7 do
+      s.v <- Acc.sat (Acc.ofFrac s.v + Table.read gains s.i3 * p.a)
+      out.Write s.v
+      out.Write(Table.row gains 2 s.i1 1)
+      out.Write(Acc.sat (Table.read Rom.sine s.ix * p.b))
+      out.Write(Table.read gains s.i5)
+
+  let constantKernel = Kernel.define "probe-table-constant" <@ init @> <@ trig @> <@ constant @>
+  let heldKernel     = Kernel.define "probe-table-held" <@ init @> <@ trig @> <@ held @>
+
+
 let probeMachine =
   { Mds.machine "org.fsdsp56k.probe" "PROBE" "GND" "PR" with
       parameters = [| for n in [| "A"; "B"; "C"; "D" |] -> Mds.param n Mds.UnipolarQ23 |] }
@@ -1899,6 +1942,30 @@ let tests =
       test "[<Length n>] Long arrays in Y and X, by constant and loop index: compiled program equals the .NET kernel" {
         needNative ()
         conformance LongArray.kernel 60
+      }
+      test "table reads at a constant index: direct addresses, fewer words and cycles, the same words" {
+        needNative ()
+        let rng = Random 64
+        let steps =
+          [ yield Words(randomWords rng)
+            yield Init
+            for _ in 1 .. 50 do
+              yield Words(randomWords rng)
+              yield Render 1 ]
+        let graded k =
+          match grade k probeMachine None { name = "random words"; steps = steps } |> Result.map keep with
+          | Error e -> failtest e
+          | Ok r ->
+            Expect.isEmpty r.correctness (text r)
+            r
+        let direct, held = graded ConstTable.constantKernel, graded ConstTable.heldKernel
+        let listing = dsp56k.dsl.Program.source direct.compiled.items
+        Expect.isFalse (listing.Contains "p:(r0)") "program words read at a constant index without r0"
+        Expect.isFalse (listing.Contains "(r0+") "the sine word read at a constant index without r0"
+        Expect.equal direct.dsp.outputs held.dsp.outputs "the same output as indexes held in state"
+        Expect.equal direct.dsp.states held.dsp.states "the same state as indexes held in state"
+        Expect.isLessThan direct.ours.programWords held.ours.programWords "fewer program words"
+        Expect.isLessThan direct.ours.renderWorst held.ours.renderWorst "fewer RENDER cycles"
       }
       test "a region's address taken twice, then zeros: the patched immediate is not a known 0" {
         needNative ()

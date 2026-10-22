@@ -1496,47 +1496,63 @@ and genWord (ctx: Ctx) (e: Expr) : unit =
     | _ -> fail $"not a kernel Frac expression: {e}"
 
 /// Table word `index * width + col`: a resource as `move x:(r0+table),dst` (the address patched
-/// by the loader), program words as `move p:(r0),dst` (the address relocated).
+/// by the loader), program words as `move p:(r0),dst` (the address relocated). At a constant
+/// index the address is known when the program is built: `move x:>k,dst` (patched) or
+/// `movem p:>TABLE+k,dst` (relocated), with no address arithmetic.
 and tableRead (ctx: Ctx) (t: Expr) (index: Expr) (width: int) (col: int) (dst: Reg) =
   let table =
     match tryConst' ctx t with
     | Some(:? Table as t) -> t
     | _ -> fail $"a table must be a constant, got {t}"
-  let simple = width = 1 && (table.source <> Program)
-  if simple && col = 0 then
-    match index with
-    | _ when (wordLeaf ctx index).IsSome -> emitAll ctx (loadWord (wordLeaf ctx index).Value r0)
-    | Intr "acc.hi" [x] ->
-      genAcc ctx x
+  let constant =
+    match tryConst ctx index with
+    | Some(:? Frac as f) ->
+      let k = f.Raw * width + col
+      if k >= 0 && k < table.words.Length then Some k else None
+    | _ -> None
+  match constant, table.source with
+  | Some k, Program ->
+    if not (ctx.tables |> Seq.exists (fun x -> x.name = table.name)) then ctx.tables.Add table
+    emit ctx (Label(fresh ctx "TABLE_ADDR"))
+    emit ctx machinedrum.Abi.relocateMarker
+    emit ctx (move (pm (absL (Sym(tableLabel table) + k))) dst)
+  | Some k, Resource symbol -> importHere ctx table.name symbol (move (xm (absL k)) dst)
+  | None, _ ->
+    let simple = width = 1 && (table.source <> Program)
+    if simple && col = 0 then
+      match index with
+      | _ when (wordLeaf ctx index).IsSome -> emitAll ctx (loadWord (wordLeaf ctx index).Value r0)
+      | Intr "acc.hi" [x] ->
+        genAcc ctx x
+        emit ctx (move a1 r0)
+      | _ ->
+        match wordLeaf ctx index with
+        | Some w -> emitAll ctx (loadWord w r0)
+        | None ->
+          genWord ctx index
+          emit ctx (move x0 r0)
+    else
+      // a1 = index * width, by shifts and adds
+      genAcc ctx (Expr.Call(Ir.intrinsic "acc.ofFrac", [ index ]))
+      if width > 1 then
+        let bits = Convert.ToString(width, 2)
+        emit ctx (tfr a b)
+        for c in bits.Substring 1 do
+          emit ctx (asl a)
+          if c = '1' then emit ctx (add b a)
+      match table.source with
+      | Program ->
+        if not (ctx.tables |> Seq.exists (fun x -> x.name = table.name)) then ctx.tables.Add table
+        let l = fresh ctx "TABLE_ADDR"
+        emit ctx (Label l)
+        emit ctx machinedrum.Abi.relocateMarker
+        emit ctx (add (immL (Sym(tableLabel table) + col)) a)
+      | Resource _ ->
+        if col <> 0 then emit ctx (add (immL col) a)
       emit ctx (move a1 r0)
-    | _ ->
-      match wordLeaf ctx index with
-      | Some w -> emitAll ctx (loadWord w r0)
-      | None ->
-        genWord ctx index
-        emit ctx (move x0 r0)
-  else
-    // a1 = index * width, by shifts and adds
-    genAcc ctx (Expr.Call(Ir.intrinsic "acc.ofFrac", [ index ]))
-    if width > 1 then
-      let bits = Convert.ToString(width, 2)
-      emit ctx (tfr a b)
-      for c in bits.Substring 1 do
-        emit ctx (asl a)
-        if c = '1' then emit ctx (add b a)
     match table.source with
-    | Program ->
-      if not (ctx.tables |> Seq.exists (fun x -> x.name = table.name)) then ctx.tables.Add table
-      let l = fresh ctx "TABLE_ADDR"
-      emit ctx (Label l)
-      emit ctx machinedrum.Abi.relocateMarker
-      emit ctx (add (immL (Sym(tableLabel table) + col)) a)
-    | Resource _ ->
-      if col <> 0 then emit ctx (add (immL col) a)
-    emit ctx (move a1 r0)
-  match table.source with
-  | Resource symbol -> importHere ctx table.name symbol (move (xm (dispL r0 0)) dst)
-  | Program -> emit ctx (move (pm (ind r0)) dst)
+    | Resource symbol -> importHere ctx table.name symbol (move (xm (dispL r0 0)) dst)
+    | Program -> emit ctx (move (pm (ind r0)) dst)
 
 /// n0 = the index word w plus `extra` (a state array's offset in the workset and the index's
 /// constant), for an (r0+n0) access.
