@@ -1508,6 +1508,74 @@ module ConstTable =
   let heldKernel     = Kernel.define "probe-table-held" <@ init @> <@ trig @> <@ held @>
 
 
+/// Subroutines the compiler chooses (Optimize.Subroutines): `settle`, called twice from INIT and
+/// twice from TRIG, becomes one; the same body marked [<Inline>] stays inlined; called in RENDER's
+/// loop it stays inlined; called from RENDER, outside its loop, next to a table that leaves no room
+/// for four copies, it becomes one only because the program would not fit otherwise.
+[<ReflectedDefinition>]
+module AutoSubs =
+  type S =
+    { mutable a : Frac
+      mutable b : Frac
+      mutable c : Frac
+      mutable v : Frac }
+
+  let settle (p: Banks.P) (s: S) (x: Frac) =
+    s.a <- Acc.sat (x * p.a + s.b * p.b)
+    s.b <- Acc.sat (s.a * p.c - x * p.d)
+    s.c <- Acc.hi (Acc.ofFrac s.a + s.b)
+    s.v <- Acc.sat (s.c * p.a + s.a * p.d)
+
+  [<Inline>]
+  let settleInline (p: Banks.P) (s: S) (x: Frac) =
+    s.a <- Acc.sat (x * p.a + s.b * p.b)
+    s.b <- Acc.sat (s.a * p.c - x * p.d)
+    s.c <- Acc.hi (Acc.ofFrac s.a + s.b)
+    s.v <- Acc.sat (s.c * p.a + s.a * p.d)
+
+  let init (p: Banks.P) (s: S) =
+    s.b <- Frac.zero
+    settle p s p.b
+    settle p s p.c
+
+  let trig (p: Banks.P) (s: S) =
+    settle p s p.d
+    settle p s s.v
+
+  let initInline (p: Banks.P) (s: S) =
+    s.b <- Frac.zero
+    settleInline p s p.b
+    settleInline p s p.c
+
+  let trigInline (p: Banks.P) (s: S) =
+    settleInline p s p.d
+    settleInline p s s.v
+
+  let render (_: Banks.P) (s: S) (out: Output) =
+    for _ in 0 .. 31 do out.Write s.v
+
+  let renderHot (p: Banks.P) (s: S) (out: Output) =
+    for _ in 0 .. 31 do
+      settle p s s.v
+      out.Write s.v
+
+  let big = Table.program "auto_big" [| for i in 0 .. 13959 -> i |]
+
+  let renderBig (p: Banks.P) (s: S) (out: Output) =
+    settle p s p.a
+    settle p s p.b
+    settle p s p.c
+    settle p s p.d
+    for _ in 0 .. 31 do out.Write(Table.read big (Acc.hi (Acc.andHi 0x7 (Acc.ofFrac s.v))))
+
+  let initBig (_: Banks.P) (s: S) = s.b <- Frac.zero
+
+  let subKernel    = Kernel.define "probe-auto-sub" <@ init @> <@ trig @> <@ render @>
+  let inlineKernel = Kernel.define "probe-auto-inline" <@ initInline @> <@ trigInline @> <@ render @>
+  let hotKernel    = Kernel.define "probe-auto-hot" <@ init @> <@ trig @> <@ renderHot @>
+  let sizeKernel   = Kernel.define "probe-auto-size" <@ initBig @> <@ initBig @> <@ renderBig @>
+
+
 let probeMachine =
   { Mds.machine "org.fsdsp56k.probe" "PROBE" "GND" "PR" with
       parameters = [| for n in [| "A"; "B"; "C"; "D" |] -> Mds.param n Mds.UnipolarQ23 |] }
@@ -1966,6 +2034,56 @@ let tests =
         Expect.equal direct.dsp.states held.dsp.states "the same state as indexes held in state"
         Expect.isLessThan direct.ours.programWords held.ours.programWords "fewer program words"
         Expect.isLessThan direct.ours.renderWorst held.ours.renderWorst "fewer RENDER cycles"
+      }
+      test "chosen subroutines: a helper called from INIT and TRIG is one, the same words as inlined" {
+        needNative ()
+        let rng = Random 65
+        let steps =
+          [ yield Words(randomWords rng)
+            yield Init
+            for _ in 1 .. 50 do
+              yield Words(randomWords rng)
+              yield Trig
+              yield Render 1 ]
+        let graded k =
+          match grade k probeMachine None { name = "random words, trigs"; steps = steps } |> Result.map keep with
+          | Error e -> failtest e
+          | Ok r ->
+            Expect.isEmpty r.correctness (text r)
+            r
+        let sub, inlined = graded AutoSubs.subKernel, graded AutoSubs.inlineKernel
+        let listing (r: Report) = dsp56k.dsl.Program.source r.compiled.items
+        let lines (r: Report) (start: string) = (listing r).Split('\n') |> Array.filter (fun l -> l.Trim().StartsWith start)
+        Expect.equal (lines sub "SUB_").Length 1 "one subroutine"
+        Expect.equal (lines sub "bsr").Length 4 "called from the four places"
+        Expect.isEmpty (lines inlined "SUB_") "[<Inline>]: no subroutine"
+        Expect.equal sub.dsp.outputs inlined.dsp.outputs "the same output as inlined"
+        Expect.equal sub.dsp.states inlined.dsp.states "the same state as inlined"
+        Expect.isLessThan sub.ours.programWords (inlined.ours.programWords - Optimize.minSaving) "fewer program words"
+        Expect.equal sub.ours.renderWorst inlined.ours.renderWorst "RENDER as it was"
+      }
+      test "chosen subroutines: Off keeps every helper inlined" {
+        match Optimize.compileChoosing Optimize.Off None Optimize.Peephole Kernel.mds AutoSubs.subKernel with
+        | Error e -> failtest e
+        | Ok c -> Expect.isFalse ((dsp56k.dsl.Program.source c.items).Contains "SUB_") "no subroutine"
+      }
+      test "chosen subroutines: a helper in RENDER's loop stays inlined" {
+        needNative ()
+        conformance AutoSubs.hotKernel 66
+        match Optimize.compile Optimize.Peephole Kernel.mds AutoSubs.hotKernel with
+        | Error e -> failtest e
+        | Ok c -> Expect.isFalse ((dsp56k.dsl.Program.source c.items).Contains "SUB_") "inlined in RENDER's loop"
+      }
+      test "chosen subroutines: a kernel too large inlined fits with RENDER's helper as a subroutine" {
+        needNative ()
+        let limit = Kernel.programLimit Kernel.mds |> Option.map fst
+        match Optimize.compileChoosing Optimize.Off limit Optimize.Peephole Kernel.mds AutoSubs.sizeKernel |> Result.bind Compile.checkSize with
+        | Ok _ -> failtest "inlined, the kernel should not fit"
+        | Error _ -> ()
+        match Optimize.compile Optimize.Peephole Kernel.mds AutoSubs.sizeKernel with
+        | Error e -> failtest e
+        | Ok c -> Expect.isTrue ((dsp56k.dsl.Program.source c.items).Contains "SUB_SETTLE") "settle as a subroutine"
+        conformance AutoSubs.sizeKernel 67
       }
       test "a region's address taken twice, then zeros: the patched immediate is not a known 0" {
         needNative ()

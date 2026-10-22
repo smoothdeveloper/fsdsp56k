@@ -3,6 +3,10 @@ main-tap	machinedrum	ok	56	cdc8fa43eba3b164
 pluck	machinedrum	ok	170	25a7b08e232ba2e1
 probe-address-twice	machinedrum	ok	67	e5438ebb72aaf30b
 probe-arithmetic	machinedrum	ok	72	1cfac0cefc6c1668
+probe-auto-hot	machinedrum	ok	164	8bf70e3914c468be
+probe-auto-inline	machinedrum	ok	134	b851f692abcd921b
+probe-auto-size	machinedrum	ok	1891	ccc0000172ae2719
+probe-auto-sub	machinedrum	ok	134	33128424d5dbc065
 probe-banks	machinedrum	ok	97	5e5fd1be8c5ed144
 probe-bit-test	machinedrum	ok	145	63e6eb81f21da1ba
 probe-bool-let	machinedrum	ok	144	c48e00a8f94115c5
