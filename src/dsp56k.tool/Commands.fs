@@ -223,17 +223,43 @@ let loadMachine (path: string) (slot: int option) =
   onePackage path slot
   |> Result.bind (fun (name, _, p) -> readPackage p |> Result.map (fun pkg -> name, pkg, Mds.machineOf pkg p))
 
+/// How run, stress and audition pick their machine: the host, and for F# source the kernel and
+/// definition; a package's slot.
+type Choice = { host: string option; slot: int option; kernel: string option; json: string option }
+
+/// A machine for the chosen host from a package, or from F# source (built and compiled here); and
+/// whether it came from source, so it runs on the harness with the grade's stand-ins.
+let load (choice: Choice) (path: string) =
+  Kernels.host (defaultArg choice.host "machinedrum")
+  |> Result.bind (fun host ->
+    match host with
+    | dsp56k.kernel.Kernel.KernelHost.Machinedrum ->
+      if Kernels.isSource path then Kernels.load host path choice.kernel choice.json |> Result.map (fun m -> m, true)
+      else loadMachine path choice.slot |> Result.map (fun m -> m, false))
+
+/// A machine on the track harness with the grade's stand-ins (the sine ROM, the input and main
+/// rings) loaded, so machines that read them make their sound.
+let harnessTrack (pkg: Mds.Package) (machine: Mds.Machine) banks =
+  let track = new Track.Track(pkg, Some machine, dsp56k.kernel.Grade.layout, banks)
+  dsp56k.kernel.Grade.loadResources track.Emulator
+  track
+
+/// The track a loaded machine plays on: a kernel built from source on the grade's harness, which its
+/// layout assumes; a package on the default track, as before.
+let trackFor fromSource (pkg: Mds.Package) (machine: Mds.Machine) banks =
+  if fromSource then harnessTrack pkg machine banks else new Track.Track(pkg, Some machine, Track.defaultLayout, banks)
+
 let run (args: ParseResults<RunArgs>) =
-  match onePackage (args.GetResult RunArgs.Input) (args.TryGetResult RunArgs.Slot) |> Result.bind (fun (name, _, p) -> readPackage p |> Result.map (fun pkg -> name, p, pkg)) with
+  let choice = { host = args.TryGetResult RunArgs.Host; slot = args.TryGetResult RunArgs.Slot; kernel = args.TryGetResult RunArgs.Kernel; json = args.TryGetResult RunArgs.Json }
+  match load choice (args.GetResult RunArgs.Input) with
   | Error e -> fail e
-  | Ok(name, bytes, pkg) ->
-    let machine = Mds.machineOf pkg bytes
+  | Ok((name, pkg, machine), fromSource) ->
     let settings =
       match args.TryGetResult RunArgs.Settings with
       | Some s -> s.Split ',' |> Array.map float
       | None -> machine.parameters |> Array.map (fun p -> float p.defaultValue)
     let banks = sampleBanks (args.TryGetResult RunArgs.Sample)
-    use track = new Track.Track(pkg, Some machine, Track.defaultLayout, banks)
+    use track = trackFor fromSource pkg machine banks
     track.SetSettings settings
     let blocks = args.GetResult(RunArgs.Blocks, 1378)
     let every = args.TryGetResult RunArgs.Trig_Every
@@ -321,13 +347,6 @@ let stressMachine name (pkg: Mds.Package) (machine: Mds.Machine) (evaluate: floa
   for l in lines do printfn "%s" l
   cases, within
 
-/// A machine on the track harness with the grade's stand-ins (the sine ROM, the input and main
-/// rings) loaded, so machines that read them make their sound.
-let harnessTrack (pkg: Mds.Package) (machine: Mds.Machine) banks =
-  let track = new Track.Track(pkg, Some machine, dsp56k.kernel.Grade.layout, banks)
-  dsp56k.kernel.Grade.loadResources track.Emulator
-  track
-
 let stress (args: ParseResults<StressArgs>) =
   let seed = args.GetResult(StressArgs.Seed, 1)
   let plan =
@@ -341,6 +360,7 @@ let stress (args: ParseResults<StressArgs>) =
   | Error e -> fail e
   | Ok plan ->
     let listening = args.Contains StressArgs.Audition
+    let choice = { host = args.TryGetResult StressArgs.Host; slot = args.TryGetResult StressArgs.Slot; kernel = args.TryGetResult StressArgs.Kernel; json = args.TryGetResult StressArgs.Json }
     let rate = 44100
     let caseSeconds = args.GetResult(StressArgs.Case_Seconds, 0.75)
     let blocks = if listening then max 1 (int (caseSeconds * float rate / 32.0)) else args.GetResult(StressArgs.Blocks, 16)
@@ -358,9 +378,9 @@ let stress (args: ParseResults<StressArgs>) =
       let summaries =
         [ for input in args.GetResult StressArgs.Inputs do
             if not stopped then
-              match loadMachine input (args.TryGetResult StressArgs.Slot) with
+              match load choice input with
               | Error e -> eprintfn "error: %s" e
-              | Ok(name, pkg, machine) ->
+              | Ok((name, pkg, machine), _) ->
                 printfn "\n== %s: %s (%s), declared %d cycles, limit %d" name machine.displayName machine.id pkg.maxCycles Abi.trackCycleLimit
                 use track = harnessTrack pkg machine (sampleBanks (args.TryGetResult StressArgs.Sample))
                 let cs = Stress.controls machine
@@ -420,11 +440,12 @@ let midiList () =
 let audition (args: ParseResults<AuditionArgs>) =
   match args.Contains AuditionArgs.Midi_List, args.TryGetResult AuditionArgs.Input with
   | true, _ -> midiList ()
-  | false, None -> fail "audition needs an .mds or .syx (or --midi-list)"
+  | false, None -> fail "audition needs a machine: .mds, .syx, .fsproj, .fsx or .fs (or --midi-list)"
   | false, Some input ->
-  match loadMachine input (args.TryGetResult AuditionArgs.Slot) with
+  let choice = { host = args.TryGetResult AuditionArgs.Host; slot = args.TryGetResult AuditionArgs.Slot; kernel = args.TryGetResult AuditionArgs.Kernel; json = args.TryGetResult AuditionArgs.Json }
+  match load choice input with
   | Error e -> fail e
-  | Ok(name, pkg, machine) ->
+  | Ok((name, pkg, machine), fromSource) ->
     let settings =
       match args.TryGetResult AuditionArgs.Settings with
       | Some s -> s.Split ',' |> Array.map float
@@ -432,7 +453,7 @@ let audition (args: ParseResults<AuditionArgs>) =
     let trackNumber = args.GetResult(AuditionArgs.Track, 1)
     let baseChannel = args.GetResult(AuditionArgs.Base_Channel, 1)
     if trackNumber < 1 || trackNumber > 16 then failwith "--track is 1..16"
-    use track = new Track.Track(pkg, Some machine, Track.defaultLayout, sampleBanks (args.TryGetResult AuditionArgs.Sample))
+    use track = trackFor fromSource pkg machine (sampleBanks (args.TryGetResult AuditionArgs.Sample))
     track.SetSettings settings
     track.Init 0 |> ignore
     let midiOut =

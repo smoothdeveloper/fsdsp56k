@@ -215,4 +215,31 @@ let tests =
       Expect.equal code 0 old
       Expect.stringContains old "'mds' is now 'machinedrum'" "the old name says so"
     }
+
+    test "run takes an F# kernel as one file, built and compiled for the host" {
+      let dir = scratch ()
+      let source = dir </> "Sine.fs"
+      File.Copy(repoRoot </> "tests" </> "dsp56k.tests" </> "Kernels" </> "Sine.fs", source)
+      let code, text = tool [| "run"; source; "--blocks"; "16"; "--settings"; "100,127" |]
+      Expect.equal code 0 text
+      Expect.stringContains text "sine: 16 blocks" "the kernel by its name"
+      Expect.isFalse (text.Contains "peak 0.000") "it makes a sound"
+      let code, text = tool [| "run"; source; "--kernel"; "saw" |]
+      Expect.notEqual code 0 text
+      Expect.stringContains text "no kernel 'saw' among sine" "--kernel names one that is there"
+      let code, text = tool [| "run"; source; "--host"; "nord" |]
+      Expect.notEqual code 0 text
+      Expect.stringContains text "unknown host 'nord'" "hosts by key"
+    }
+
+    test "run takes an F# script, its #r lines dropped and a module wrapped round it" {
+      let dir = scratch ()
+      let lines = File.ReadAllLines(repoRoot </> "tests" </> "dsp56k.tests" </> "Kernels" </> "Sine.fs")
+      let body = lines |> Array.filter (fun l -> not (l.StartsWith "[<ReflectedDefinition>]" || l.StartsWith "module " || l.StartsWith "//" || l.StartsWith "///"))
+      let script = dir </> "sine.fsx"
+      File.WriteAllLines(script, Array.append [| "#r \"Dsp56k.Kernel.dll\"" |] body)
+      let code, text = tool [| "stress"; script; "--blocks"; "2"; "--max-cases"; "3" |]
+      Expect.equal code 0 text
+      Expect.stringContains text "sine: 3 cases" "the script's kernel, stressed"
+    }
   ]

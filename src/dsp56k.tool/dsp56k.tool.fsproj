@@ -10,6 +10,7 @@
     <Compile Include="Cli.fs" />
     <Compile Include="Stress.fs" />
     <Compile Include="Audition.fs" />
+    <Compile Include="Kernels.fs" />
     <Compile Include="Commands.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>

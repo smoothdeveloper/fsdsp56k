@@ -1,6 +1,6 @@
 /// Command line of the `fsdsp56k` tool (Argu). DSP56300 commands (asm, check, disasm, import)
 /// stay at the top; a host's own commands sit under its name (`machinedrum`, or `md`); run,
-/// stress and audition play a machine for a host.
+/// stress and audition take a machine for a host (`--host`), from a package or F# source.
 module dsp56k.tool.Cli
 
 open Argu
@@ -115,6 +115,9 @@ type MachinedrumArgs =
 type RunArgs =
   | [<MainCommand; ExactlyOnce>] Input of path: string
   | Slot of int
+  | Host of name: string
+  | Kernel of name: string
+  | Json of path: string
   | Settings of values: string
   | Blocks of int
   | Trig_Every of blocks: int
@@ -124,8 +127,11 @@ type RunArgs =
   interface IArgParserTemplate with
     member a.Usage =
       match a with
-      | Input _ -> ".mds package or .syx dump."
+      | Input _ -> ".mds package or .syx dump, or an F# kernel: .fsproj, .fsx or .fs."
       | Slot _ -> "slot (1..16) to take from a .syx holding several machines."
+      | Host _ -> "the host the machine runs under (default machinedrum; also md)."
+      | Kernel _ -> "the kernel to take from F# source defining several (by its Kernel.define name)."
+      | Json _ -> "with F# source: the machine definition (the mds_pack.py JSON) instead of one made from the parameter fields."
       | Settings _ -> "front-panel settings, comma separated (default: the parameters' defaults)."
       | Blocks _ -> "32-sample blocks to render (default 1378, about one second)."
       | Trig_Every _ -> "retrigger every N blocks (default: once, at the start)."
@@ -136,6 +142,9 @@ type RunArgs =
 type StressArgs =
   | [<MainCommand; ExactlyOnce>] Inputs of paths: string list
   | Slot of int
+  | Host of name: string
+  | Kernel of name: string
+  | Json of path: string
   | Sweep of how: string
   | Search of how: string
   | Phase of phase: string
@@ -151,8 +160,11 @@ type StressArgs =
   interface IArgParserTemplate with
     member a.Usage =
       match a with
-      | Inputs _ -> ".mds packages or .syx dumps, one machine after another."
+      | Inputs _ -> "machines, one after another: .mds packages, .syx dumps, or F# kernels (.fsproj, .fsx, .fs)."
       | Slot _ -> "slot (1..16) to take from a .syx holding several machines."
+      | Host _ -> "the host the machine runs under (default machinedrum; also md)."
+      | Kernel _ -> "the kernel to take from F# source defining several (by its Kernel.define name)."
+      | Json _ -> "with F# source: the machine definition (the mds_pack.py JSON) instead of one made from the parameter fields."
       | Audition -> "listen while it sweeps: each case played through the default output, its cycles printed, new worst cases flagged."
       | Case_Seconds _ -> "with --audition: seconds per case (default 0.75)."
       | Max_Cases _ -> "at most this many cases per machine, evenly spread (default: all; 40 with --audition)."
@@ -169,6 +181,9 @@ type StressArgs =
 type AuditionArgs =
   | [<MainCommand>] Input of path: string
   | Slot of int
+  | Host of name: string
+  | Kernel of name: string
+  | Json of path: string
   | Settings of values: string
   | Trig_Every of blocks: int
   | Seconds of float
@@ -181,8 +196,11 @@ type AuditionArgs =
   interface IArgParserTemplate with
     member a.Usage =
       match a with
-      | Input _ -> ".mds package or .syx dump."
+      | Input _ -> ".mds package or .syx dump, or an F# kernel: .fsproj, .fsx or .fs."
       | Slot _ -> "slot (1..16) to take from a .syx holding several machines."
+      | Host _ -> "the host the machine runs under (default machinedrum; also md)."
+      | Kernel _ -> "the kernel to take from F# source defining several (by its Kernel.define name)."
+      | Json _ -> "with F# source: the machine definition (the mds_pack.py JSON) instead of one made from the parameter fields."
       | Settings _ -> "front-panel settings, comma separated (default: the parameters' defaults)."
       | Trig_Every _ -> "retrigger every N blocks (default: once, at the start)."
       | Seconds _ -> "how long to play (default 4, or until Ctrl+C with --midi-in)."
