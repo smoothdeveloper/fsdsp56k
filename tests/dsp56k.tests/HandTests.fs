@@ -252,15 +252,15 @@ let tests =
       test "all F#" {
         let o = stage []
         has o "correctness: the compiled program matches the .NET kernel, output and state"
-        has o "RENDER mean 2395"
+        has o "RENDER mean 1539"
         Expect.isFalse (o |> Array.exists (fun l -> l.Contains "hand-written")) "no routine"
       }
       test "shape by hand" {
         let o = stage [ "HAND_SHAPE" ]
         has o "correctness: the compiled program matches the .NET kernel, output and state"
         has o "RENDER mean 2107"
-        has o "shape workshop.hand.shape 2395.0 2107.0 288.0 288 matches .NET"
-        has o "shape workshop.hand.shape 1024/1024 26 11 15.0"
+        has o "shape workshop.hand.shape 1539.0 2107.0 -568.0 -568 matches .NET"
+        has o "shape workshop.hand.shape 1024/1024 23 11 12.0"
       }
       test "a routine gone wrong fails the grade, and the table shows which" {
         let dir = ToolTests.scratch ()
@@ -270,8 +270,8 @@ let tests =
         Expect.equal code 1 out
         let o = normalized out
         Expect.isTrue (o |> Array.exists (fun l -> l.StartsWith "correctness FAILS: output differs")) out
-        Expect.contains o "shape workshop.hand.shape 2395.0 2107.0 288.0 288 matches .NET" "its F# instead matches"
-        Expect.contains o "shape workshop.hand.shape 211/1024 26 11 15.0" "on its own, 211 calls of 1024 right"
+        Expect.contains o "shape workshop.hand.shape 1539.0 2107.0 -568.0 -568 matches .NET" "its F# instead matches"
+        Expect.contains o "shape workshop.hand.shape 211/1024 23 11 12.0" "on its own, 211 calls of 1024 right"
         Expect.contains o "first difference ($7fffff, $000001): expected $000004, got $000001" "the first arguments it is wrong on"
       }
       test "--define is for a file: a project sets its own symbols" {

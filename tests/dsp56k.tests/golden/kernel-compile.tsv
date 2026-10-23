@@ -69,6 +69,7 @@ probe-unswitch	machinedrum	ok	74	1d725920adb7ab7b
 probe-unswitch-each	machinedrum	ok	53	bcd93e8128c9d8fe
 probe-unswitch-kept	machinedrum	ok	53	8219c61bfb5caf10
 probe-wide	machinedrum	error	-	51c91938102b1889	probe-wide: RENDER writes 64 words, the block is 32 frames (one word each)
+probe-workset-walk	machinedrum	ok	68	980d1effb9a89a60
 probe-x-and-y-state	machinedrum	ok	176	9bf5da50146904ea
 probe-x-beyond	machinedrum	error	-	dcf9075ddecb5767	probe-x-beyond: the [<XMemory>] state needs X+64, the target has 64 words
 probe-x-full	machinedrum	ok	109	0fa3b2e070fe42ff

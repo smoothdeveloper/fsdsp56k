@@ -1404,6 +1404,483 @@ let fixLoops (items: (Item * int) array) =
     | _ -> out.Add(it, line)
   out.ToArray()
 
+/// Walk workset sub-blocks in X: and Y: with a free address register (`r1..r5`), turning 2-cycle
+/// `x:(r6+$k)` / `y:(r6+$k)` moves (`Alone`) into 1-cycle `(rN)+` / `(rN)-` / `(rN)` / `(rN)+nN` /
+/// `(rN)-nN` moves (`Parallel`) that `pack` can fold into adjacent ALU and dual-move instructions.
+let walk (items: (Item * int) array) =
+  let cur = Array.copy items
+  let n = cur.Length
+  if n = 0 then cur
+  else
+
+  let dispOf = function
+    | Op(Par(None, [| Load(sp, Disp(6, { expr = Num k }), reg) |])) -> Some(sp, int k, reg, false)
+    | Op(Par(None, [| Store(reg, sp, Disp(6, { expr = Num k })) |])) -> Some(sp, int k, reg, true)
+    | _ -> None
+
+  let stepEa r delta =
+    if delta = 0 then Ind r
+    elif delta = 1 then PostInc r
+    elif delta = -1 then PostDec r
+    elif delta > 1 then PostIncN r
+    else PostDecN r
+
+  let rewriteAt (idx: int) (ea: Ea) =
+    let it, ln = cur[idx]
+    match dispOf it with
+    | Some(sp, _, reg, false) -> cur[idx] <- (Op(Par(None, [| Load(sp, ea, reg) |])), ln)
+    | Some(sp, _, reg, true)  -> cur[idx] <- (Op(Par(None, [| Store(reg, sp, ea) |])), ln)
+    | None -> ()
+
+  let canPackWith (idx: int) (sp: Space) (reg: Reg) (isStore: bool) =
+    if idx < 0 || idx >= n then false
+    else
+      let mv = Op(Par(None, [| (if isStore then Store(reg, sp, Ind 1) else Load(sp, Ind 1, reg)) |]))
+      let mutable j = idx - 1
+      while j >= 0 && (match fst cur[j] with Comment _ -> true | _ -> false) do j <- j - 1
+      let prevOk =
+        if j >= 0 then
+          match fst cur[j] with
+          | Op _ as prev -> (Lower.pack [| prev; mv |]).Length = 1
+          | _ -> false
+        else false
+      let mutable k = idx + 1
+      while k < n && (match fst cur[k] with Comment _ -> true | _ -> false) do k <- k + 1
+      let nextOk =
+        if k < n then
+          match fst cur[k] with
+          | Op _ as next -> (Lower.pack [| mv; next |]).Length = 1
+          | _ -> false
+        else false
+      prevOk || nextOk
+
+  let canWalkSeq (accs: (int * int * Reg * bool) array) (endOff: int) =
+    if accs.Length < 2 then None
+    else
+      let _, k0, _, _ = accs[0]
+      if k0 < -64 || k0 > 63 then None
+      else
+        let deltas =
+          [| for a in 0 .. accs.Length - 1 ->
+               let _, ka, _, _ = accs[a]
+               let kb =
+                 if a + 1 < accs.Length then
+                   let _, k, _, _ = accs[a + 1]
+                   k
+                 else endOff
+               kb - ka |]
+        let nonUnit = deltas |> Array.map abs |> Array.filter (fun d -> d > 1) |> Array.distinct
+        if nonUnit.Length = 0 then Some(k0, None, deltas)
+        elif nonUnit.Length = 1 && nonUnit[0] <= 255 then Some(k0, Some nonUnit[0], deltas)
+        else None
+
+  // Only walk inside RENDER and subroutines reachable from RENDER: INIT and TRIG do not count
+  // toward render cycles, and extra setup words there would grow program size for zero render gain.
+  let its0 = Array.map fst cur
+  let labels0 =
+    its0
+    |> Array.mapi (fun i it -> match it with Label l -> Some(l, i) | _ -> None)
+    |> Array.choose id
+    |> Map.ofArray
+  let renderIn = Array.create n false
+  match labels0.TryFind "RENDER" with
+  | None -> cur
+  | Some rStart ->
+    let rQueue = Queue<int>()
+    rQueue.Enqueue rStart
+    while rQueue.Count > 0 do
+      let idx = rQueue.Dequeue()
+      if idx >= 0 && idx < n && not renderIn[idx] then
+        renderIn[idx] <- true
+        match its0[idx] with
+        | Op Rts | Op Rti -> ()
+        | Op(Jump(_, { expr = Sym t })) ->
+          match labels0.TryFind t with Some ti -> rQueue.Enqueue ti | None -> ()
+        | Op(Branch(Bsr, { expr = Sym t })) ->
+          match labels0.TryFind t with Some ti -> rQueue.Enqueue ti | None -> ()
+          rQueue.Enqueue (idx + 1)
+        | Op(Branch(_, { expr = Sym t })) ->
+          match labels0.TryFind t with Some ti -> rQueue.Enqueue ti | None -> ()
+          rQueue.Enqueue (idx + 1)
+        | _ -> rQueue.Enqueue (idx + 1)
+
+    let computeRegInfo () =
+      let its = Array.map fst cur
+      let labels =
+        its
+        |> Array.mapi (fun i it -> match it with Label l -> Some(l, i) | _ -> None)
+        |> Array.choose id
+        |> Map.ofArray
+      let succ =
+        match successors its with
+        | Some s -> s
+        | None -> Array.init n (fun i -> if i + 1 < n then [| i + 1 |] else [||])
+      let rReads  = Array.init n (fun _ -> Array.create 8 false)
+      let rWrites = Array.init n (fun _ -> Array.create 8 false)
+      let nReads  = Array.init n (fun _ -> Array.create 8 false)
+      let nWrites = Array.init n (fun _ -> Array.create 8 false)
+      let mTouch  = Array.init n (fun _ -> Array.create 8 false)
+      let control (instr: Instr) =
+        match instr with
+        | Branch((Bra | Bcc _), _) | Jump((Jmp | Jcc _), _) | Loop(_, Count _, _) | Enddo | Nop | Rts | Rti -> true
+        | Branch(Bsr, { expr = Sym s }) when s.StartsWith "SUB_" && not (s.StartsWith "SUB_K_HAND_") -> true
+        | _ -> false
+      for i in 0 .. n - 1 do
+        match its[i] with
+        | Op(Lua(ea, dst)) ->
+          let rs = Lower.eaRegs ea
+          for r in 1 .. 5 do
+            if Array.contains (R r) rs then rReads[i][r] <- true
+            if Array.contains (N r) rs then nReads[i][r] <- true
+            if dst = R r then rWrites[i][r] <- true
+            if dst = N r then nWrites[i][r] <- true
+        | Op instr when control instr -> ()
+        | Op instr ->
+          match readsOf instr, writesOf instr with
+          | Some rs, Some ws ->
+            for r in 1 .. 5 do
+              if Array.contains (R r) rs then rReads[i][r] <- true
+              if Array.contains (R r) ws then rWrites[i][r] <- true
+              if Array.contains (N r) rs then nReads[i][r] <- true
+              if Array.contains (N r) ws then nWrites[i][r] <- true
+              if Array.contains (M r) rs || Array.contains (M r) ws then mTouch[i][r] <- true
+          | _ ->
+            for r in 1 .. 5 do
+              rReads[i][r] <- true; rWrites[i][r] <- true
+              nReads[i][r] <- true; nWrites[i][r] <- true
+              mTouch[i][r] <- true
+        | _ -> ()
+      let solveLive (reads: bool array array) (writes: bool array array) =
+        let liveIn  = Array.init n (fun _ -> Array.create 8 false)
+        let liveOut = Array.init n (fun _ -> Array.create 8 false)
+        let mutable changed = true
+        while changed do
+          changed <- false
+          for i = n - 1 downto 0 do
+            for r in 1 .. 5 do
+              let mutable lo = false
+              for s in succ[i] do
+                if liveIn[s][r] then lo <- true
+              let li = reads[i][r] || (lo && not (writes[i][r]))
+              if lo <> liveOut[i][r] || li <> liveIn[i][r] then
+                liveOut[i][r] <- lo
+                liveIn[i][r] <- li
+                changed <- true
+        liveIn, liveOut
+      let rLiveIn, rLiveOut = solveLive rReads rWrites
+      let nLiveIn, nLiveOut = solveLive nReads nWrites
+      let mNonLinear = Array.init n (fun _ -> Array.create 8 false)
+      let mutable mChanged = true
+      while mChanged do
+        mChanged <- false
+        for i in 0 .. n - 1 do
+          for r in 1 .. 5 do
+            let isNonLinWrite =
+              match its[i] with
+              | Op(Par(None, [| Imm({ expr = Num v }, M r') |])) when r' = r -> v <> 0xffffffL
+              | _ -> mTouch[i][r]
+            if isNonLinWrite && not (mNonLinear[i][r]) then
+              mNonLinear[i][r] <- true
+              mChanged <- true
+            if mNonLinear[i][r] then
+              let kills =
+                match its[i] with
+                | Op(Par(None, [| Imm({ expr = Num 0xffffffL }, M r') |])) when r' = r -> true
+                | _ -> false
+              if not kills then
+                for s in succ[i] do
+                  if not (mNonLinear[s][r]) then
+                    mNonLinear[s][r] <- true
+                    mChanged <- true
+      let subBounds = Array.init n (fun _ -> None)
+      for KeyValue(l, sIdx) in labels do
+        if l.StartsWith "SUB_" && not (l.StartsWith "SUB_K_HAND_") then
+          let mutable eIdx = sIdx
+          while eIdx < n && its[eIdx] <> Op Rts do eIdx <- eIdx + 1
+          if eIdx < n then
+            for k in sIdx .. eIdx do subBounds[k] <- Some(l, sIdx, eIdx)
+      let isFree (r: int) (needN: bool) (startIdx: int) (endIdx: int) =
+        let mutable ok = true
+        for k in startIdx .. endIdx do
+          if rReads[k][r] || rWrites[k][r] || nReads[k][r] || nWrites[k][r] || mTouch[k][r] || mNonLinear[k][r] then
+            ok <- false
+        if ok && (rLiveIn[startIdx][r] || rLiveOut[endIdx][r]) then ok <- false
+        if ok && needN && (nLiveIn[startIdx][r] || nLiveOut[endIdx][r]) then ok <- false
+        if ok then
+          match subBounds[startIdx] with
+          | Some(subName, _, _) ->
+            for i in 0 .. n - 1 do
+              match its[i] with
+              | Op(Branch(Bsr, { expr = Sym s })) when s = subName ->
+                if rLiveOut[i][r] || (needN && nLiveOut[i][r]) || mNonLinear[i][r] then ok <- false
+              | _ -> ()
+          | None -> ()
+        ok
+      its, labels, isFree
+
+    let partitionGroups (sp: Space) (allAccs: (int * int * Reg * bool) array) (isLoop: bool) (isUnconditional: int -> bool) =
+      let endOff (sub: (int * int * Reg * bool) array) =
+        if isLoop then let _, k0, _, _ = sub[0] in k0
+        else let _, lastK, _, _ = sub[sub.Length - 1] in lastK
+      let valid (sub: (int * int * Reg * bool) array) =
+        sub.Length >= 2
+        && (sub |> Array.forall (fun (idx, _, _, _) -> isUnconditional idx))
+        && (canWalkSeq sub (endOff sub)).IsSome
+      let groupSaving (sub: (int * int * Reg * bool) array) =
+        if sub.Length < 2 then 0
+        else
+          let _, k0, _, _ = sub[0]
+          let allSameReadOnly = sub |> Array.forall (fun (_, k, _, isStore) -> k = k0 && not isStore)
+          if allSameReadOnly then 0
+          else
+            match canWalkSeq sub (endOff sub) with
+            | Some(k0, needN, _) ->
+              let setupCycles = (if k0 = 0 then 1 else 3) + (if needN.IsSome then 1 else 0)
+              if isLoop then
+                max 0 (32 * sub.Length - setupCycles)
+              else
+                let packCount =
+                  sub
+                  |> Array.filter (fun (idx, _, reg, isStore) -> canPackWith idx sp reg isStore)
+                  |> Array.length
+                max 0 (sub.Length + packCount - setupCycles)
+            | None -> 0
+      let groups =
+        if valid allAccs then [| allAccs |]
+        else
+          let ks = allAccs |> Array.map (fun (_, k, _, _) -> k) |> Array.distinct |> Array.sort
+          let rawIntervals = ResizeArray<Set<int>>()
+          let mutable curSet = Set.singleton ks[0]
+          for i in 1 .. ks.Length - 1 do
+            if ks[i] = ks[i - 1] + 1 then curSet <- curSet.Add ks[i]
+            else rawIntervals.Add curSet; curSet <- Set.singleton ks[i]
+          rawIntervals.Add curSet
+          let parts = ResizeArray<Set<int>>()
+          for iv in rawIntervals do
+            let arr = Set.toArray iv
+            let mutable p = 0
+            while p < arr.Length do
+              let mutable bestEnd = -1
+              for q in p .. arr.Length - 1 do
+                let slice = Set.ofArray arr[p .. q]
+                let sub = allAccs |> Array.filter (fun (_, k, _, _) -> slice.Contains k)
+                if valid sub then bestEnd <- q
+              if bestEnd >= p then
+                parts.Add (Set.ofArray arr[p .. bestEnd])
+                p <- bestEnd + 1
+              else
+                parts.Add (Set.singleton arr[p])
+                p <- p + 1
+          let usedPart = Array.create parts.Count false
+          let byOffsets = ResizeArray<(int * int * Reg * bool) array>()
+          for a in 0 .. parts.Count - 1 do
+            if not usedPart[a] then
+              let mutable merged = parts[a]
+              let mutable curSub = allAccs |> Array.filter (fun (_, k, _, _) -> merged.Contains k)
+              let mutable curSave = if valid curSub then groupSaving curSub else 0
+              for b in a + 1 .. parts.Count - 1 do
+                if not usedPart[b] then
+                  let cand = Set.union merged parts[b]
+                  let candSub = allAccs |> Array.filter (fun (_, k, _, _) -> cand.Contains k)
+                  if valid candSub then
+                    let bSub = allAccs |> Array.filter (fun (_, k, _, _) -> parts[b].Contains k)
+                    let bSave = if valid bSub then groupSaving bSub else 0
+                    let candSave = groupSaving candSub
+                    if candSave >= curSave + bSave then
+                      merged <- cand
+                      curSub <- candSub
+                      curSave <- candSave
+                      usedPart[b] <- true
+              if valid curSub then
+                usedPart[a] <- true
+                byOffsets.Add curSub
+          let byOrder = ResizeArray<(int * int * Reg * bool) array>()
+          let mutable p = 0
+          while p < allAccs.Length do
+            let mutable bestEnd = -1
+            for q in p + 1 .. allAccs.Length - 1 do
+              if valid allAccs[p .. q] then bestEnd <- q
+            if bestEnd > p then
+              byOrder.Add allAccs[p .. bestEnd]
+              p <- bestEnd + 1
+            else
+              p <- p + 1
+          let offArr = byOffsets.ToArray()
+          let ordArr = byOrder.ToArray()
+          let offScore = offArr |> Array.sumBy groupSaving
+          let ordScore = ordArr |> Array.sumBy groupSaving
+          if ordScore > offScore then ordArr else offArr
+      groups |> Array.sortByDescending groupSaving
+
+    let insertions = ResizeArray<int * (Item * int)>()
+
+    // Phase 1: inner-most DO loops in RENDER.
+    let its1, labels1, isFree1 = computeRegInfo ()
+    let inAnyLoop = Array.create n false
+    for loopIdx in 0 .. n - 1 do
+      match its1[loopIdx] with
+      | Op(Loop(_, _, { expr = Sym endLabel })) when renderIn[loopIdx] ->
+        match labels1.TryFind endLabel with
+        | Some endIdx when endIdx > loopIdx ->
+          for k in loopIdx .. endIdx do inAnyLoop[k] <- true
+          let mutable innerOk = true
+          let branchSpans = ResizeArray<int * int>()
+          for k in loopIdx + 1 .. endIdx - 1 do
+            match its1[k] with
+            | Op(Loop _ | Forever _ | Enddo | Rts | Rti | Jump _) -> innerOk <- false
+            | Op(Branch(Bsr, _)) -> innerOk <- false
+            | Op(Branch(_, { expr = Sym t })) ->
+              match labels1.TryFind t with
+              | Some tIdx when tIdx > k && tIdx <= endIdx -> branchSpans.Add(k, tIdx)
+              | _ -> innerOk <- false
+            | _ -> ()
+          if innerOk then
+            for i in 0 .. n - 1 do
+              if i < loopIdx || i > endIdx then
+                let checkTarget t =
+                  match labels1.TryFind t with
+                  | Some tIdx when tIdx > loopIdx && tIdx < endIdx -> innerOk <- false
+                  | _ -> ()
+                match its1[i] with
+                | Op(Branch(_, { expr = Sym t })) -> checkTarget t
+                | Op(Jump(_, { expr = Sym t })) -> checkTarget t
+                | _ -> ()
+          if innerOk then
+            let usedRegs = HashSet<int>()
+            for sp in [ Space.Y; Space.X ] do
+              let allAccs =
+                [| for idx in loopIdx + 1 .. endIdx - 1 do
+                     match dispOf (fst cur[idx]) with
+                     | Some(sp', k, reg, isStore) when sp' = sp -> yield (idx, k, reg, isStore)
+                     | _ -> () |]
+              if allAccs.Length >= 2 then
+                let isUnconditional idx =
+                  branchSpans |> Seq.forall (fun (bIdx, tIdx) -> not (idx > bIdx && idx < tIdx))
+                let groups = partitionGroups sp allAccs true isUnconditional
+                let prefRegs = if sp = Space.Y then [ 4; 5; 3; 2; 1 ] else [ 1; 2; 3; 4; 5 ]
+                for sub in groups do
+                  let _, k0, _, _ = sub[0]
+                  // A single invariant offset with no stores is hoist's responsibility, not walk's.
+                  let allSameReadOnly =
+                    sub |> Array.forall (fun (_, k, _, isStore) -> k = k0 && not isStore)
+                  if not allSameReadOnly then
+                    match canWalkSeq sub k0 with
+                    | Some(k0, needN, deltas) ->
+                      let mutable p = loopIdx
+                      if p > 0 && its1[p - 1] = machinedrum.Abi.relocateMarker then p <- p - 1
+                      if p > 0 && (match its1[p - 1] with Label l -> l.EndsWith "_DO" | _ -> false) then p <- p - 1
+                      let regOpt =
+                        prefRegs
+                        |> List.tryFind (fun r ->
+                          not (usedRegs.Contains r) && isFree1 r needN.IsSome p endIdx)
+                      match regOpt with
+                      | Some r ->
+                        usedRegs.Add r |> ignore
+                        let _, ln = cur[loopIdx]
+                        let setupR =
+                          if k0 = 0 then Op(Par(None, [| Copy(R 6, R r) |])), ln
+                          else Op(Lua(Disp(6, Operand.num k0), R r)), ln
+                        insertions.Add(p, setupR)
+                        match needN with
+                        | Some d -> insertions.Add(p, (Op(Par(None, [| Imm(Operand.num d, N r) |])), ln))
+                        | None -> ()
+                        for a in 0 .. sub.Length - 1 do
+                          let idx, _, _, _ = sub[a]
+                          rewriteAt idx (stepEa r deltas[a])
+                      | None -> ()
+                    | None -> ()
+        | _ -> ()
+      | _ -> ()
+
+    // Phase 2: straight-line basic blocks in RENDER outside DO loops.
+    let its2, _, isFree2 = computeRegInfo ()
+    let targetLabels = HashSet<string>([ "INIT"; "TRIG"; "RENDER" ])
+    for i in 0 .. n - 1 do
+      match its2[i] with
+      | Label l when l.StartsWith "SUB_" || l.EndsWith "_DO" -> targetLabels.Add l |> ignore
+      | Op(Loop(_, _, { expr = Sym t }))
+      | Op(Branch(_, { expr = Sym t }))
+      | Op(Jump(_, { expr = Sym t }))
+      | Op(BitBranch(_, _, _, { expr = Sym t })) -> targetLabels.Add t |> ignore
+      | _ -> ()
+    let isBlockBoundary i =
+      match its2[i] with
+      | Label l -> targetLabels.Contains l
+      | Op(Loop _ | Forever _ | Enddo | Branch _ | Jump _ | Rts | Rti | Rep _) -> true
+      | _ -> false
+    let mutable bStart = 0
+    while bStart < n do
+      if not renderIn[bStart] || inAnyLoop[bStart] || isBlockBoundary bStart then
+        bStart <- bStart + 1
+      else
+        let mutable bEnd = bStart
+        while bEnd + 1 < n && renderIn[bEnd + 1] && not inAnyLoop[bEnd + 1] && not (isBlockBoundary (bEnd + 1)) do
+          bEnd <- bEnd + 1
+        let usedRegs = HashSet<int>()
+        for sp in [ Space.Y; Space.X ] do
+          let allAccs =
+            [| for idx in bStart .. bEnd do
+                 match dispOf (fst cur[idx]) with
+                 | Some(sp', k, reg, isStore) when sp' = sp -> yield (idx, k, reg, isStore)
+                 | _ -> () |]
+          if allAccs.Length >= 2 then
+            let groups = partitionGroups sp allAccs false (fun _ -> true)
+            let prefRegs = if sp = Space.Y then [ 4; 5; 3; 2; 1 ] else [ 1; 2; 3; 4; 5 ]
+            for sub in groups do
+              if sub.Length >= 2 then
+                let firstIdx, k0, _, _ = sub[0]
+                let lastIdx, lastK, _, _ = sub[sub.Length - 1]
+                let allSameReadOnly =
+                  sub |> Array.forall (fun (_, k, _, isStore) -> k = k0 && not isStore)
+                if not allSameReadOnly then
+                  match canWalkSeq sub lastK with
+                  | Some(k0, needN, deltas) ->
+                    let setupCycles = (if k0 = 0 then 1 else 3) + (if needN.IsSome then 1 else 0)
+                    let packCount =
+                      sub
+                      |> Array.filter (fun (idx, _, reg, isStore) -> canPackWith idx sp reg isStore)
+                      |> Array.length
+                    if sub.Length + packCount > setupCycles then
+                      let regOpt =
+                        prefRegs
+                        |> List.tryFind (fun r ->
+                          not (usedRegs.Contains r) && isFree2 r needN.IsSome firstIdx lastIdx)
+                      match regOpt with
+                      | Some r ->
+                        usedRegs.Add r |> ignore
+                        let _, ln = cur[firstIdx]
+                        let setupR =
+                          if k0 = 0 then Op(Par(None, [| Copy(R 6, R r) |])), ln
+                          else Op(Lua(Disp(6, Operand.num k0), R r)), ln
+                        insertions.Add(firstIdx, setupR)
+                        match needN with
+                        | Some d -> insertions.Add(firstIdx, (Op(Par(None, [| Imm(Operand.num d, N r) |])), ln))
+                        | None -> ()
+                        for a in 0 .. sub.Length - 1 do
+                          let idx, _, _, _ = sub[a]
+                          rewriteAt idx (stepEa r deltas[a])
+                      | None -> ()
+                  | None -> ()
+        bStart <- bEnd + 1
+
+    if insertions.Count = 0 then cur
+    else
+      let byIdx = Dictionary<int, ResizeArray<Item * int>>()
+      for idx, item in insertions do
+        match byIdx.TryGetValue idx with
+        | true, list -> list.Add item
+        | false, _ ->
+          let list = ResizeArray<Item * int>()
+          list.Add item
+          byIdx[idx] <- list
+      let out = ResizeArray<Item * int>(n + insertions.Count)
+      for i in 0 .. n - 1 do
+        match byIdx.TryGetValue i with
+        | true, list -> out.AddRange list
+        | false, _ -> ()
+        out.Add cur[i]
+      out.ToArray()
+
 /// The passes, each one switchable (for measuring what each does), and the guard that keeps a
 /// pass's rewrite only when it is no worse (`monotone`). fixLoops always runs: it is not an
 /// optimisation, it keeps DO loop ends legal.
@@ -1413,6 +1890,7 @@ type Passes =
     copyForward : bool   // a copy's source read in place of the copy
     deadTemps   : bool   // stores to X temporaries nothing reads dropped
     hoist       : bool   // loads a DO loop does not change done once, before the loop
+    walk        : bool   // workset sub-blocks walked by a pointer register instead of r6+k
     pack        : bool   // moves merged into parallel instructions
     rotate      : bool   // one-stage software pipelining of DO loops
     promote     : bool   // accumulator temporaries kept in a free accumulator
@@ -1421,12 +1899,12 @@ type Passes =
     monotone    : bool } // each pass kept only when the static cost is no worse
 
   static member all =
-    { forward = true; accCopies = true; copyForward = true; deadTemps = true; hoist = true; pack = true
-      rotate = true; promote = true; assign = true; joins = true; monotone = true }
+    { forward = true; accCopies = true; copyForward = true; deadTemps = true; hoist = true; walk = true
+      pack = true; rotate = true; promote = true; assign = true; joins = true; monotone = true }
 
   static member none =
-    { forward = false; accCopies = false; copyForward = false; deadTemps = false; hoist = false; pack = false
-      rotate = false; promote = false; assign = false; joins = false; monotone = false }
+    { forward = false; accCopies = false; copyForward = false; deadTemps = false; hoist = false; walk = false
+      pack = false; rotate = false; promote = false; assign = false; joins = false; monotone = false }
 
 /// The switchable passes by name, with how to turn each off.
 let passes : (string * (Passes -> Passes)) list =
@@ -1435,6 +1913,7 @@ let passes : (string * (Passes -> Passes)) list =
     "copyForward", (fun p -> { p with copyForward = false })
     "deadTemps",   (fun p -> { p with deadTemps = false })
     "hoist",       (fun p -> { p with hoist = false })
+    "walk",        (fun p -> { p with walk = false })
     "pack",        (fun p -> { p with pack = false })
     "rotate",      (fun p -> { p with rotate = false })
     "promote",     (fun p -> { p with promote = false })
@@ -1449,6 +1928,8 @@ type Level =
 /// The static cost the guard compares: instructions weighted by the trip counts of the DO loops
 /// around them (a loop with a count only known when running weighs 32, one block), then the
 /// instruction count. Branches inside a loop count as taken on every pass: an upper bound.
+/// Indexed `Disp` moves take 2 cycles and `lua` takes 3 cycles on the DSP56300; single-word
+/// register/indirect instructions take 1 cycle.
 let staticCost (items: (Item * int) array) =
   let mutable weighted = 0L
   let mutable count = 0L
@@ -1459,7 +1940,12 @@ let staticCost (items: (Item * int) array) =
     | Label l ->
       while (match around with (e, _) :: _ when e = l -> true | _ -> false) do around <- List.tail around
     | Op instr ->
-      weighted <- weighted + trips ()
+      let cycles =
+        match instr with
+        | Lua _ -> 3L
+        | Par(_, moves) when moves |> Array.exists (function Load(_, Disp _, _) | Store(_, _, Disp _) -> true | _ -> false) -> 2L
+        | _ -> 1L
+      weighted <- weighted + cycles * trips ()
       count <- count + 1L
       match instr with
       | Loop(_, count', { expr = Sym e }) ->
@@ -1543,6 +2029,7 @@ let runWith (p: Passes) (first: int) (temps: int) (items: Item array) (lines: in
     step p.forward forward
     step p.copyForward copyForward
   step p.hoist (hoistFrom first temps)
+  step p.walk walk
   step p.pack pack
   step p.rotate (rotate >> (if p.pack then pack else id))
   cur <- thawHand regions cur

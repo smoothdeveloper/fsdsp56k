@@ -1620,6 +1620,36 @@ module RegionSharedLet =
   let kernel = Kernel.define "probe-region-shared-let" <@ init @> <@ trig @> <@ render @>
 
 
+/// State words in Y memory read and written on every pass of RENDER's loop: `walk` points a free
+/// address register at the first state word before the loop (`lua (r6+$9),r4`) and steps it with
+/// `(r4)+` / `(r4)-` back to its start each pass, turning 2-cycle `y:(r6+k)` moves into 1-cycle
+/// parallel-eligible moves.
+[<ReflectedDefinition>]
+module WorksetWalk =
+  type S =
+    { mutable phase : Long
+      mutable level : Long }
+
+  let init (_: Banks.P) (s: S) =
+    s.phase <- Long.zero
+    s.level <- Long.zero
+
+  let trig (_: Banks.P) (s: S) =
+    s.phase <- Long.zero
+
+  let render (p: Banks.P) (s: S) (out: Output) =
+    let step = Acc.ofFrac p.a >>> 4
+    let ramp = Acc.ofFrac p.b >>> 5
+    for _ in 0 .. 31 do
+      let ph = Acc.andHi 0x7fffff (Acc.ofLong s.phase + step)
+      let lv = Acc.andHi 0x7fffff (Acc.ofLong s.level + ramp)
+      s.phase <- Long.ofAcc ph
+      s.level <- Long.ofAcc lv
+      out.Write(Acc.sat (Acc.hi ph * Acc.hi lv))
+
+  let kernel = Kernel.define "probe-workset-walk" <@ init @> <@ trig @> <@ render @>
+
+
 let probeMachine =
   { Mds.machine "org.fsdsp56k.probe" "PROBE" "GND" "PR" with
       parameters = [| for n in [| "A"; "B"; "C"; "D" |] -> Mds.param n Mds.UnipolarQ23 |] }
@@ -2197,6 +2227,30 @@ let tests =
           Expect.equal (r.dsp.outputs[0][5] &&& 0xffffff) (Input.ring.words[5] &&& 0xffffff) "word 5: the input ring's, less the cleared scratch word"
           Expect.isLessThanOrEqual r.ours.renderWorst 240 "stepped address registers, within cycle ceiling"
         conformance RegionSharedLet.kernel 69
+      }
+      test "workset words in a DO loop walked by a pointer register: compiled program equals the .NET kernel" {
+        needNative ()
+        match Optimize.compile Optimize.Peephole Kernel.mds WorksetWalk.kernel with
+        | Error e -> failtest e
+        | Ok c ->
+          let lines = c.items |> Array.map dsp56k.Print.item
+          let at (label: string) = Array.findIndex ((=) label) lines
+          let render = lines[at "RENDER:" + 1 ..]
+          let doIdx  = render |> Array.findIndex (fun l -> l.TrimStart().StartsWith "do ")
+          Expect.exists render[.. doIdx - 1] (fun l -> l.Contains "lua" && l.Contains "(r6+$9),r4") "pointer set up before the loop"
+          Expect.exists render[doIdx + 1 ..] (fun l -> l.Contains "y:(r4)+") "stepped forward in the loop"
+          Expect.exists render[doIdx + 1 ..] (fun l -> l.Contains "y:(r4)-") "stepped back in the loop"
+          Expect.isFalse (render[doIdx + 1 ..] |> Array.exists (fun l -> l.Contains "y:(r6+$")) "no indexed Y state access left in the loop"
+        let steps = [ Words [| 0x100000; 0x080000; 0; 0 |]; Init; Trig; Render 1 ]
+        let noWalk = Optimize.Chosen { Optimize.Passes.all with walk = false }
+        match Grade.gradeMdsAt noWalk WorksetWalk.kernel probeMachine None { name = "one block"; steps = steps },
+              grade WorksetWalk.kernel probeMachine None { name = "one block"; steps = steps } |> Result.map keep with
+        | Ok before, Ok after ->
+          Expect.isEmpty after.correctness (text after)
+          Expect.isLessThan after.ours.renderWorst (before.ours.renderWorst - 200L) "walk saves >200 cycles on the 32-sample loop"
+          Expect.isLessThanOrEqual after.ours.renderWorst 1100L "walked state words, within cycle ceiling"
+        | Error e, _ | _, Error e -> failtest e
+        conformance WorksetWalk.kernel 70
       }
       test "register locals read in both branches of an if: compiled program equals the .NET kernel" {
         needNative ()
