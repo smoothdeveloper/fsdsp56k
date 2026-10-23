@@ -1715,6 +1715,52 @@ module LiveRanges =
   let kernel = Kernel.define "probe-live-ranges" <@ init @> <@ trig @> <@ render @>
 
 
+/// Cross-stage cursor loop fusion and dual X:Y cursor loads: a 32-sample producer loop writing
+/// `Scratch.x` via `c1.Put` fuses with a 32-sample consumer loop updating `Scratch.x` in place via
+/// `c2.Peek()` / `c2.Put`, eliminating the intermediate buffer read and second `do #32`; a second
+/// loop mixing `Scratch.x` and `Scratch.y` packs both cursor reads into one `move x:(r1)+,x0 y:(r4)+,y0`.
+[<ReflectedDefinition>]
+module LoopFusion =
+  type S =
+    { mutable seed : Frac
+      mutable z1   : Frac }
+
+  let init (_: Banks.P) (s: S) =
+    s.seed <- Frac.ofRaw 0x2468ac
+    s.z1   <- Frac.zero
+
+  let trig (_: Banks.P) (s: S) =
+    s.z1 <- Frac.zero
+
+  let render (p: Banks.P) (s: S) (out: Output) =
+    let yFill = Cursor.linear Scratch.y Frac.zero
+    let mutable seed = s.seed
+    for _ in 0 .. 31 do
+      seed <- Frac.lfsr 0xc20001 seed
+      yFill.Put(Acc.hi (seed * p.a))
+    s.seed <- seed
+    let c1 = Cursor.linear Scratch.x Frac.zero
+    let mutable ph = Frac.zero
+    for _ in 0 .. 31 do
+      ph <- Acc.hi (Acc.ofFrac ph + p.b)
+      c1.Put ph
+    let c2 = Cursor.linear Scratch.x Frac.zero
+    let mutable z1 = s.z1
+    for _ in 0 .. 31 do
+      let x = Acc.sat (c2.Peek() * p.c + z1 * p.d)
+      c2.Put x
+      z1 <- x
+    s.z1 <- z1
+    let rx = Cursor.linear Scratch.x Frac.zero
+    let ry = Cursor.linear Scratch.y Frac.zero
+    for _ in 0 .. 31 do
+      let x = rx.Next()
+      let y = ry.Next()
+      out.Write(Acc.sat (x * p.c + y * p.d))
+
+  let kernel = Kernel.define "probe-loop-fusion" <@ init @> <@ trig @> <@ render @>
+
+
 let probeMachine =
   { Mds.machine "org.fsdsp56k.probe" "PROBE" "GND" "PR" with
       parameters = [| for n in [| "A"; "B"; "C"; "D" |] -> Mds.param n Mds.UnipolarQ23 |] }
@@ -2331,6 +2377,20 @@ let tests =
           Expect.isFalse (secondLoop |> Array.exists (fun l -> l.Contains "x:(r6" || l.Contains "x:(r2")) "biquad loop keeps z2 and fed in b1/b0 without X workset spills"
           Expect.isFalse (render |> Array.exists (fun l -> l.Contains "a0,x:" || l.Contains "a2,x:")) "no 3-word accumulator spill in RENDER"
         conformance LiveRanges.kernel 74
+      }
+      test "cross-stage cursor loop fusion and dual X:Y loads: compiled program equals the .NET kernel" {
+        needNative ()
+        match Optimize.compile Optimize.Peephole Kernel.mds LoopFusion.kernel with
+        | Error e -> failtest e
+        | Ok c ->
+          let lines = c.items |> Array.map dsp56k.Print.item
+          let at (label: string) = Array.findIndex ((=) label) lines
+          let render = lines[at "RENDER:" + 1 ..]
+          let doIdxs = [| for i in 0 .. render.Length - 1 do if render[i].TrimStart().StartsWith "do " then i |]
+          Expect.equal doIdxs.Length 3 "four source loops fused to three DO loops in RENDER"
+          let mixLoop = render[doIdxs[2] + 1 ..]
+          Expect.exists mixLoop (fun l -> l.Contains "x:(r1)+" && l.Contains "y:(r4)+") "final mix loop packs both cursor reads into one dual X:Y move"
+        conformance LoopFusion.kernel 75
       }
       test "register locals read in both branches of an if: compiled program equals the .NET kernel" {
         needNative ()

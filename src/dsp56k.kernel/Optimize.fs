@@ -974,10 +974,109 @@ let hoistFrom (first: int) (temps: int) (items: (Item * int) array) =
 
 let hoist (items: (Item * int) array) = hoistFrom 0 0 items
 
+/// When two adjacent single-move loads read X memory into Y0/Y1 and Y memory into X0/X1 (in
+/// either order), swapping their destination registers across the straight-line stretch until
+/// both are dead lets `Lower.pack` merge the two loads into a single 1-word X:Y dual move.
+let uncrossDualLoads (items: (Item * int) array) =
+  let cur = Array.copy items
+  let overlap (a: Reg) (b: Reg) =
+    let pa = parts a
+    parts b |> List.exists (fun x -> List.contains x pa)
+  let rewriteInstr (r1: Reg) (r2: Reg) (instr: Instr) =
+    let swap r = if r = r1 then r2 elif r = r2 then r1 else r
+    match readsOf instr, writesOf instr with
+    | Some rs, Some ws when not (ws |> Array.exists (fun w -> overlap w r1 || overlap w r2)) ->
+      if not (rs |> Array.exists (fun r -> overlap r r1 || overlap r r2)) then Some instr
+      else
+        match instr with
+        | Par(alu, moves) ->
+          let alu' =
+            match alu with
+            | None -> Some None
+            | Some a ->
+              if not (Lower.aluReads a |> Array.exists (fun r -> overlap r r1 || overlap r r2)) then Some(Some a)
+              else
+                match a with
+                | Binary((AluOp.Add | AluOp.Sub | AluOp.Cmp | AluOp.And | AluOp.Or | AluOp.Eor) as op, s, d) ->
+                  Some(Some(Binary(op, swap s, d)))
+                | Mul(kind, neg, s1, s2, d) ->
+                  let a1 = Mul(kind, neg, swap s1, swap s2, d)
+                  let a2 = Mul(kind, neg, swap s2, swap s1, d)
+                  if Lower.encodes (Par(Some a1, [||])) then Some(Some a1)
+                  elif Lower.encodes (Par(Some a2, [||])) then Some(Some a2)
+                  else None
+                | _ -> None
+          let moves' =
+            moves |> Array.map (fun m ->
+              if not (Lower.moveReads m |> Array.exists (fun r -> overlap r r1 || overlap r r2)) then Some m
+              else
+                match m with
+                | Store(s, sp, ea) -> Some(Store(swap s, sp, ea))
+                | Copy(s, d) -> Some(Copy(swap s, d))
+                | _ -> None)
+          match alu', (if moves' |> Array.forall Option.isSome then Some(moves' |> Array.map Option.get) else None) with
+          | Some a', Some ms' ->
+            let ins' = Par(a', ms')
+            if Lower.encodes ins' && Lower.wordsOf ins' <= Lower.wordsOf instr then Some ins' else None
+          | _ -> None
+        | MulI(kind, neg, imm, s, d) ->
+          let ins' = MulI(kind, neg, imm, swap s, d)
+          if Lower.encodes ins' then Some ins' else None
+        | _ -> None
+    | _ -> None
+  let mutable i = 0
+  while i < cur.Length do
+    let mutable j = i + 1
+    while j < cur.Length && (match fst cur[j] with Comment _ -> true | _ -> false) do j <- j + 1
+    let swapped =
+      if j < cur.Length then
+        match fst cur[i], fst cur[j] with
+        | Op(Par(None, [| Load(sp1, ea1, r1) |])), Op(Par(None, [| Load(sp2, ea2, r2) |]))
+            when (sp1 = Space.X && sp2 = Space.Y && (r1 = Y0 || r1 = Y1) && (r2 = X0 || r2 = X1))
+                 || (sp1 = Space.Y && sp2 = Space.X && (r1 = X0 || r1 = X1) && (r2 = Y0 || r2 = Y1)) ->
+          let mX = if sp1 = Space.X then Load(Space.X, ea1, r2) else Load(Space.X, ea2, r1)
+          let mY = if sp1 = Space.Y then Load(Space.Y, ea1, r2) else Load(Space.Y, ea2, r1)
+          let dual = Par(None, [| mX; mY |])
+          if Lower.disjoint (Lower.moveWrites mX) (Lower.moveWrites mY)
+             && Lower.disjoint (Lower.moveWrites mX) (Lower.moveReads mY)
+             && Lower.disjoint (Lower.moveWrites mY) (Lower.moveReads mX)
+             && Lower.encodes dual && Lower.wordsOf dual = 1 then
+            let rewrites = ResizeArray<int * Item>()
+            let mutable k = j + 1
+            let mutable scanning = true
+            let mutable ok = false
+            while scanning do
+              if deadAfter cur k r1 && deadAfter cur k r2 then
+                ok <- true
+                scanning <- false
+              elif k >= cur.Length then
+                scanning <- false
+              else
+                match fst cur[k] with
+                | Comment _ -> k <- k + 1
+                | Op instr ->
+                  match rewriteInstr r1 r2 instr with
+                  | Some instr' ->
+                    if instr' <> instr then rewrites.Add(k, Op instr')
+                    k <- k + 1
+                  | None -> scanning <- false
+                | _ -> scanning <- false
+            if ok then
+              cur[i] <- (Op(Par(None, [| mX |])), snd cur[i])
+              cur[j] <- (Op(Par(None, [| mY |])), snd cur[j])
+              for idx, it' in rewrites do cur[idx] <- (it', snd cur[idx])
+              true
+            else false
+          else false
+        | _ -> false
+      else false
+    i <- if swapped then j + 1 else i + 1
+  cur
+
 /// Lower.pack with each item's source line kept (a merged instruction takes the first's), across
 /// the comments quoting the F# (they follow the merged instruction).
 let pack (items: (Item * int) array) =
-  let mutable cur = items
+  let mutable cur = uncrossDualLoads items
   let mutable changed = true
   while changed do
     changed <- false

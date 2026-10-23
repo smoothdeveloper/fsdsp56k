@@ -159,6 +159,7 @@ type Ctx =
     deadLocals : HashSet<Var>                 // register locals given back before their scope ended
     tables   : ResizeArray<Table>     // program tables, emitted after the code
     unswitched : HashSet<Var>         // loops (by index) already split on a condition
+    fusedSpines : HashSet<Expr>       // statement spines already checked for cross-stage loop fusion
     mutable bHeld  : bool             // an Acc local lives in B: nothing else may write it
     mutable bWrite : bool             // ...except the local's own updates
     subs     : Dictionary<Member, Sub>   // [<Subroutine>] helpers called, compiled after the entries
@@ -1034,6 +1035,409 @@ let ringTapOf (ctx: Ctx) (value: Expr) : RingTap option =
     | _ -> None
   if value.Type <> TyFrac then None else find [] value
 
+let rec weigh (ctx: Ctx) (w: int) (e: Expr) =
+  match e with
+  | ForIntegerRangeLoop(_, lo, hi, b) ->
+    let n = match tryConst ctx lo, tryConst ctx hi with | Some(:? int as l), Some(:? int as h) -> max 1 (h - l + 1) | _ -> 1
+    weigh ctx (w * n) b
+  // passes not known: weighed as a short loop
+  | WhileLoop(c, b) -> weigh ctx (w * 8) c; weigh ctx (w * 8) b
+  | Var v | VarSet(v, _) ->
+    ctx.scores[v] <- (match ctx.scores.TryGetValue v with | true, n -> n | _ -> 0) + w
+    match e with VarSet(_, x) -> weigh ctx w x | _ -> ()
+  // a helper's locals are the kernel's once inlined
+  | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone && (reflected mi).IsSome ->
+    List.iter (weigh ctx w) args
+    weigh ctx w (reflected mi).Value
+  | ExprShape.ShapeVar _ -> ()
+  | ExprShape.ShapeLambda(_, b) -> weigh ctx w b
+  | ExprShape.ShapeCombination(_, xs) -> List.iter (weigh ctx w) xs
+
+type SpineItem =
+  | SLet  of Var * Expr * Range option
+  | SStmt of Expr
+
+let exprOfSpineItem = function
+  | SLet(_, x, _) | SStmt x -> x
+
+let rec toSpine (ctx: Ctx) (e: Expr) : SpineItem list =
+  match e with
+  | Let(v, value, body) ->
+    if not v.IsMutable then
+      match constObject ctx value with
+      | Some c -> ctx.consts <- ctx.consts.Add(v, c)
+      | None ->
+        match tryConst ctx value with
+        | Some c -> ctx.consts <- ctx.consts.Add(v, c)
+        | None -> ()
+    SLet(v, value, e.Range) :: toSpine ctx body
+  | Sequential(a, b) ->
+    let sa = toSpine ctx a
+    sa @ toSpine ctx b
+  | IfThenElse(c, t, f) when (match tryConst ctx c with Some(:? bool) -> true | _ -> false) ->
+    if (tryConst ctx c).Value :?> bool then toSpine ctx t else toSpine ctx f
+  | Value(null, _) -> []
+  | s -> [ SStmt s ]
+
+let rec ofSpine (items: SpineItem list) : Expr =
+  match items with
+  | [] -> Expr.Value(())
+  | [ SStmt s ] -> s
+  | SLet(v, value, r) :: rest -> Expr.Let(v, value, ofSpine rest).WithRange(r)
+  | SStmt s :: rest -> Expr.Sequential(s, ofSpine rest).WithRange(s.Range)
+
+let rec spineLoops (n: int) (e: Expr) : int =
+  if n >= 2 then n
+  else
+    match e with
+    | Let(_, _, b) -> spineLoops n b
+    | Sequential(a, b) -> spineLoops (spineLoops n a) b
+    | IfThenElse(_, t, f) -> spineLoops (spineLoops n t) f
+    | ForIntegerRangeLoop _ -> n + 1
+    | _ -> n
+
+let rec markSpine (ctx: Ctx) (e: Expr) =
+  match e with
+  | Let(_, _, b) -> ctx.fusedSpines.Add e |> ignore; markSpine ctx b
+  | Sequential(a, b) -> ctx.fusedSpines.Add e |> ignore; markSpine ctx a; markSpine ctx b
+  | _ -> ()
+
+/// Cross-stage loop fusion: adjacent constant-trip DO loops on a statement spine that communicate
+/// lockstep through `Cursor.linear region start` (stage 1 ends with `c1.Put v1`, stage 2 either
+/// reads `c2.Peek()` before ending with `c2.Put v2` or reads `c2.Next()` once into a dead scratch
+/// buffer) fuse into one DO loop when their other state, memory and local accesses are independent.
+let fuseSpine (ctx: Ctx) (root: Expr) : Expr =
+  let savedConsts = ctx.consts
+  try
+    let items0 = toSpine ctx root
+    let mentions (v: Var) (e: Expr) = e.GetFreeVars() |> Seq.contains v
+    let itemMentions (v: Var) (it: SpineItem) =
+      match it with
+      | SLet(w, x, _) -> w = v || mentions v x
+      | SStmt x -> mentions v x
+    let varsAssigned (e: Expr) =
+      let s = HashSet<Var>()
+      e |> visit (fun n -> match n with VarSet(w, _) -> s.Add w |> ignore; true | _ -> true)
+      Set.ofSeq s
+    let varsBound (e: Expr) =
+      let s = HashSet<Var>()
+      e |> visit (fun n ->
+        match n with
+        | Let(w, _, _) | ForIntegerRangeLoop(w, _, _, _) -> s.Add w |> ignore; true
+        | _ -> true)
+      Set.ofSeq s
+    let itemFreeVars (it: SpineItem) = Set.ofSeq ((exprOfSpineItem it).GetFreeVars())
+    let itemAssignedVars (it: SpineItem) = varsAssigned (exprOfSpineItem it)
+    let itemBoundVars (it: SpineItem) =
+      match it with
+      | SLet(v, x, _) -> Set.add v (varsBound x)
+      | SStmt x -> varsBound x
+    let hasRegionOp (e: Expr) =
+      let mutable found = false
+      e |> visit (fun n ->
+        match n with
+        | Intr "region.read" _ | Intr "region.write" _ -> found <- true; false
+        | _ -> not found)
+      found
+    let mentionsRegion (r: Region) (e: Expr) =
+      let mutable found = false
+      e |> visit (fun n ->
+        if found then false
+        else
+          match constObject ctx n with
+          | Some(:? Region as r') when r'.name = r.name -> found <- true; false
+          | _ -> true)
+      found
+    let cursorInBranch (c: Var) (e: Expr) =
+      let mutable bad = false
+      e |> visit (fun n ->
+        match n with
+        | IfThenElse(cond, t, f) ->
+          if mentions c cond || mentions c t || mentions c f then bad <- true
+          false
+        | ForIntegerRangeLoop(_, _, _, b) | WhileLoop(_, b) ->
+          if mentions c b then bad <- true
+          false
+        | _ -> not bad)
+      bad
+    let rec cursorCalls (c: Var) (e: Expr) : string list option =
+      match e with
+      | Call(Some(Var v), mi, args) when v = c ->
+        match intrinsic mi, args |> List.map (cursorCalls c) with
+        | Some op, xs when xs |> List.forall Option.isSome ->
+          Some(op :: List.collect Option.get xs)
+        | _ -> None
+      | Var v when v = c -> None
+      | ExprShape.ShapeVar _ -> Some []
+      | ExprShape.ShapeLambda(_, b) -> cursorCalls c b
+      | ExprShape.ShapeCombination(_, xs) ->
+        let rs = xs |> List.map (cursorCalls c)
+        if rs |> List.forall Option.isSome then Some(List.collect Option.get rs) else None
+    let rec replaceCursorRead (c: Var) (rep: Expr) (e: Expr) : Expr =
+      match e with
+      | Call(Some(Var v), mi, []) when v = c && (intrinsic mi = Some "cursor.peek" || intrinsic mi = Some "cursor.next") -> rep
+      | ExprShape.ShapeVar _ -> e
+      | ExprShape.ShapeLambda(u, b) -> Expr.Lambda(u, replaceCursorRead c rep b).WithRange(e.Range)
+      | ExprShape.ShapeCombination(o, xs) -> ExprShape.RebuildShapeCombination(o, xs |> List.map (replaceCursorRead c rep)).WithRange(e.Range)
+    let replaceInItem (c: Var) (rep: Expr) (it: SpineItem) =
+      match it with
+      | SLet(w, rhs, r) -> SLet(w, ordered (replaceCursorRead c rep rhs), r)
+      | SStmt s -> SStmt(ordered (replaceCursorRead c rep s))
+    let linearCursor (it: SpineItem) =
+      match it with
+      | SLet(c, Call(None, mi, [ r; start ]), _) when c.Type = TyCursor && intrinsic mi = Some "cursor.linear" ->
+        match constObject ctx r, tryConst ctx start with
+        | Some(:? Region as reg), Some(:? Frac as st) -> Some(c, reg, st.Raw)
+        | _ -> None
+      | _ -> None
+    let tryFuseOnce (items: SpineItem array) =
+      let n = items.Length
+      [ 0 .. n - 1 ] |> List.tryPick (fun loop1Idx ->
+        match items[loop1Idx] with
+        | SStmt(ForIntegerRangeLoop(i1, lo1, hi1, body1) as loop1Expr) when not (ctx.unrolled.Contains i1) ->
+          match tryConst ctx lo1, tryConst ctx hi1 with
+          | Some(:? int as l1), Some(:? int as h1) when l1 <= h1 && not (mentions i1 body1) ->
+            let b1Items = toSpine ctx body1 |> Array.ofList
+            if b1Items.Length = 0 then None
+            else
+              match b1Items[b1Items.Length - 1] with
+              | SStmt(Call(Some(Var c1), putMi1, [ val1 ]))
+                  when c1.Type = TyCursor && intrinsic putMi1 = Some "cursor.put"
+                       && not (mentions c1 val1)
+                       && (b1Items[0 .. b1Items.Length - 2] |> Array.forall (fun it -> not (itemMentions c1 it))) ->
+                let c1Info =
+                  [ 0 .. loop1Idx - 1 ] |> List.tryPick (fun k ->
+                    match linearCursor items[k] with
+                    | Some(c, reg1, st1) when c = c1 ->
+                      if items[k + 1 .. loop1Idx - 1] |> Array.forall (fun it -> not (itemMentions c1 it)) then
+                        Some(k, reg1, st1)
+                      else None
+                    | _ -> None)
+                let nextLoop =
+                  [ loop1Idx + 1 .. n - 1 ] |> List.tryFind (fun k ->
+                    match items[k] with SStmt(ForIntegerRangeLoop _) -> true | _ -> false)
+                match c1Info, nextLoop with
+                | Some(c1Idx, reg1, st1), Some loop2Idx ->
+                  match items[loop2Idx] with
+                  | SStmt(ForIntegerRangeLoop(i2, lo2, hi2, body2)) when not (ctx.unrolled.Contains i2) ->
+                    match tryConst ctx lo2, tryConst ctx hi2 with
+                    | Some(:? int as l2), Some(:? int as h2) when l2 = l1 && h2 = h1 && not (mentions i2 body2) ->
+                      let c2Candidates =
+                        [ for k in loop1Idx + 1 .. loop2Idx - 1 do
+                            match linearCursor items[k] with
+                            | Some(c2, reg2, st2) when reg2.name = reg1.name && st2 = st1 -> yield k, c2
+                            | _ -> () ]
+                      match c2Candidates with
+                      | [ (c2Idx, c2) ] ->
+                        let midItems = [ for k in loop1Idx + 1 .. loop2Idx - 1 do if k <> c2Idx then yield items[k] ]
+                        let afterItems = items[loop2Idx + 1 ..]
+                        let c1c2DeadAfter =
+                          (midItems |> List.forall (fun it -> not (itemMentions c1 it) && not (itemMentions c2 it)))
+                          && (afterItems |> Array.forall (fun it -> not (itemMentions c1 it) && not (itemMentions c2 it)))
+                          && (ctx.conts |> List.forall (fun e -> not (mentions c1 e) && not (mentions c2 e)))
+                        if not c1c2DeadAfter || hasRegionOp body1 || hasRegionOp body2 || cursorInBranch c2 body2 then None
+                        else
+                          let assigned1 = varsAssigned body1
+                          let bound1 = Set.add i1 (varsBound body1)
+                          let post1 = ResizeArray<SpineItem>()
+                          let pre2 = ResizeArray<SpineItem>()
+                          let mutable midOk = true
+                          let mutable boundPre2SoFar = Set.empty
+                          for it in midItems do
+                            if not midOk then ()
+                            elif not (itemAssignedVars it).IsEmpty then midOk <- false
+                            else
+                              match it with
+                              | SLet(v, _, _) when v.Type = TyCursor -> midOk <- false
+                              | _ ->
+                                let fv = itemFreeVars it
+                                if not (Set.intersect fv assigned1).IsEmpty then
+                                  match it with
+                                  | SStmt(PropertySet(Some(Var s), _, [], rhs))
+                                      when s.Type = ctx.kernel.stateType && (touches false rhs).writes.IsEmpty
+                                           && not ((touches false rhs).reads.Contains "M")
+                                           && (Set.intersect fv boundPre2SoFar).IsEmpty ->
+                                    let tIt = touches false (exprOfSpineItem it)
+                                    if pre2 |> Seq.exists (fun p -> conflict (touches false (exprOfSpineItem p)) tIt) then
+                                      midOk <- false
+                                    else post1.Add it
+                                  | _ -> midOk <- false
+                                else
+                                  let okPre =
+                                    match it with
+                                    | SLet(v, rhs, _) ->
+                                      not (assigned1.Contains v) && (touches false rhs).writes.IsEmpty && not ((touches false rhs).reads.Contains "M")
+                                    | SStmt(PropertySet(Some(Var s), _, [], rhs)) ->
+                                      s.Type = ctx.kernel.stateType && (touches false rhs).writes.IsEmpty && not ((touches false rhs).reads.Contains "M")
+                                    | _ -> false
+                                  if not okPre then midOk <- false
+                                  else
+                                    let tIt = touches false (exprOfSpineItem it)
+                                    if post1 |> Seq.exists (fun p -> conflict (touches false (exprOfSpineItem p)) tIt) then
+                                      midOk <- false
+                                    else
+                                      boundPre2SoFar <- boundPre2SoFar + itemBoundVars it
+                                      pre2.Add it
+                          if not midOk then None
+                          else
+                            let post1List = List.ofSeq post1
+                            let pre2List = List.ofSeq pre2
+                            let assigned2 = varsAssigned body2
+                            let bound2 = varsBound body2
+                            let free1 = Set.unionMany ((Set.ofSeq (body1.GetFreeVars()) - set [ i1 ]) :: (post1List |> List.map itemFreeVars))
+                            let free2 = Set.unionMany ((Set.ofSeq (body2.GetFreeVars()) - set [ i2 ]) :: (pre2List |> List.map itemFreeVars))
+                            let varsIndependent =
+                              (Set.intersect assigned1 (free2 + assigned2 + boundPre2SoFar + bound2)).IsEmpty
+                              && (Set.intersect assigned2 (free1 + assigned1 + bound1)).IsEmpty
+                              && (Set.intersect boundPre2SoFar (free1 + assigned1 + bound1)).IsEmpty
+                              && (Set.intersect (bound1 - set [ i1 ]) (free2 + assigned2 + bound2)).IsEmpty
+                              && (Set.intersect bound2 (free1 + assigned1)).IsEmpty
+                            let stripCursor (t: Touches) =
+                              let drop = set [ "M"; "C:" + c1.Name; "C:" + c2.Name ]
+                              { reads = t.reads - drop; writes = t.writes - drop }
+                            let t1 = stripCursor (List.fold both (touches false body1) [ for it in post1List -> touches false (exprOfSpineItem it) ])
+                            let t2 = stripCursor (List.fold both (touches false body2) [ for it in pre2List -> touches false (exprOfSpineItem it) ])
+                            let touchesIndependent =
+                              not (t1.reads.Contains "O") && not (t1.writes.Contains "O")
+                              && (t1.reads |> Set.forall (fun k -> not (k.StartsWith "C:")))
+                              && (t1.writes |> Set.forall (fun k -> not (k.StartsWith "C:")))
+                              && (t2.reads |> Set.forall (fun k -> not (k.StartsWith "C:")))
+                              && (t2.writes |> Set.forall (fun k -> not (k.StartsWith "C:")))
+                              && not (conflict t1 t2)
+                            if not (varsIndependent && touchesIndependent) then None
+                            else
+                              let b2Items = toSpine ctx body2 |> Array.ofList
+                              if b2Items.Length = 0 then None
+                              else
+                                let b1Prefix = b1Items[0 .. b1Items.Length - 2]
+                                let chooseReplacement (c2ReadsInFirstOnly: bool) =
+                                  match val1 with
+                                  | Var next when b1Prefix.Length >= 1 ->
+                                    match b1Prefix[b1Prefix.Length - 1] with
+                                    | SStmt(VarSet(carriedVar, Var next'))
+                                        when next' = next && not (assigned2.Contains carriedVar) ->
+                                      List.ofArray b1Prefix, Expr.Var carriedVar
+                                    | _ ->
+                                      if c2ReadsInFirstOnly && (touches false val1).writes.IsEmpty
+                                         && not (conflict (touches false val1) (stripCursor (touches false (exprOfSpineItem b2Items[0])))) then
+                                        List.ofArray b1Prefix, val1
+                                      else
+                                        let stageVar = Var("stage", TyFrac)
+                                        List.ofArray b1Prefix @ [ SLet(stageVar, val1, val1.Range) ], Expr.Var stageVar
+                                  | _ ->
+                                    if c2ReadsInFirstOnly && (touches false val1).writes.IsEmpty
+                                       && not (conflict (touches false val1) (stripCursor (touches false (exprOfSpineItem b2Items[0])))) then
+                                      List.ofArray b1Prefix, val1
+                                    else
+                                      let stageVar = Var("stage", TyFrac)
+                                      List.ofArray b1Prefix @ [ SLet(stageVar, val1, val1.Range) ], Expr.Var stageVar
+                                // Case A: in-place Peek + Put on c2
+                                // Fusing two loops that together need more than 3 outer Frac locals
+                                // spills a register-held local (X1/Y1 or a hoisted load in X0/Y0);
+                                // that pays off only when stage 1 forwards its carried register local
+                                // directly and neither loop body reads Y-state fields (so X workset
+                                // locals walk together on one address register).
+                                let isCarriedForward =
+                                  match val1 with
+                                  | Var next when b1Prefix.Length >= 1 ->
+                                    match b1Prefix[b1Prefix.Length - 1] with
+                                    | SStmt(VarSet(carriedVar, Var next')) -> next' = next && not (assigned2.Contains carriedVar)
+                                    | _ -> false
+                                  | _ -> false
+                                let outerFracLocals =
+                                  (free1 + free2 + assigned1 + assigned2)
+                                  |> Set.filter (fun v -> v.Type = TyFrac && not (ctx.consts.ContainsKey v))
+                                let readsStateInLoop =
+                                  ((touches false body1).reads |> Set.exists (fun k -> k.StartsWith "F:"))
+                                  || ((touches false body2).reads |> Set.exists (fun k -> k.StartsWith "F:"))
+                                let caseAProfitable =
+                                  outerFracLocals.Count <= 3 || (isCarriedForward && not readsStateInLoop)
+                                let putPositions =
+                                  if not caseAProfitable then []
+                                  else
+                                    [ for idx in 0 .. b2Items.Length - 1 do
+                                        match b2Items[idx] with
+                                        | SStmt(Call(Some(Var c), putMi2, [ val2 ]) as putCall2)
+                                            when c = c2 && intrinsic putMi2 = Some "cursor.put" ->
+                                          yield idx, val2, putCall2
+                                        | _ -> () ]
+                                let caseA =
+                                  match putPositions with
+                                  | [ (putIdx, val2, putCall2) ]
+                                      when (b2Items[putIdx + 1 ..] |> Array.forall (fun it -> not (itemMentions c2 it))) ->
+                                    let prefixCalls =
+                                      b2Items[0 .. putIdx - 1]
+                                      |> Array.map (fun it -> cursorCalls c2 (exprOfSpineItem it))
+                                    match cursorCalls c2 val2 with
+                                    | Some val2Ops when prefixCalls |> Array.forall Option.isSome ->
+                                      let prefixOps = prefixCalls |> Array.collect (fun o -> Array.ofList o.Value) |> List.ofArray
+                                      let allPeeks = prefixOps @ val2Ops
+                                      if not allPeeks.IsEmpty && (allPeeks |> List.forall ((=) "cursor.peek")) then
+                                        let firstOnly =
+                                          allPeeks.Length = 1 && b2Items.Length >= 1
+                                          && (match cursorCalls c2 (exprOfSpineItem b2Items[0]) with Some [ "cursor.peek" ] -> true | _ -> false)
+                                        let b1Prefix', rep = chooseReplacement firstOnly
+                                        let b2PrefixReplaced =
+                                          b2Items[0 .. putIdx - 1] |> Array.map (replaceInItem c2 rep) |> List.ofArray
+                                        let putReplaced =
+                                          SStmt(Expr.Call(Expr.Var c1, putMi1, [ ordered (replaceCursorRead c2 rep val2) ]).WithRange(putCall2.Range))
+                                        let b2Suffix = List.ofArray b2Items[putIdx + 1 ..]
+                                        let fusedBody = ofSpine (b1Prefix' @ b2PrefixReplaced @ [ putReplaced ] @ b2Suffix)
+                                        let fusedLoop = SStmt(Expr.ForIntegerRangeLoop(i1, lo1, hi1, fusedBody).WithRange(loop1Expr.Range))
+                                        Some(
+                                          Array.concat
+                                            [ items[0 .. loop1Idx - 1]
+                                              Array.ofList pre2List
+                                              [| fusedLoop |]
+                                              Array.ofList post1List
+                                              afterItems ])
+                                      else None
+                                    | _ -> None
+                                  | _ -> None
+                                match caseA with
+                                | Some res -> Some res
+                                | None ->
+                                  // Case B: Producer Put + Consumer Next on a scratch region dead after loop2
+                                  let regionDeadAfter =
+                                    reg1.name.StartsWith "scratch_"
+                                    && (afterItems |> Array.forall (fun it -> not (mentionsRegion reg1 (exprOfSpineItem it))))
+                                    && (ctx.conts |> List.forall (fun e -> not (mentionsRegion reg1 e)))
+                                  match regionDeadAfter, cursorCalls c2 body2, cursorCalls c2 (exprOfSpineItem b2Items[0]) with
+                                  | true, Some [ "cursor.next" ], Some [ "cursor.next" ] ->
+                                    let b1Prefix', rep = chooseReplacement true
+                                    let b2Replaced = b2Items |> Array.map (replaceInItem c2 rep) |> List.ofArray
+                                    let fusedBody = ofSpine (b1Prefix' @ b2Replaced)
+                                    let fusedLoop = SStmt(Expr.ForIntegerRangeLoop(i1, lo1, hi1, fusedBody).WithRange(loop1Expr.Range))
+                                    let beforeLoop1 =
+                                      [| for k in 0 .. loop1Idx - 1 do if k <> c1Idx then yield items[k] |]
+                                    Some(
+                                      Array.concat
+                                        [ beforeLoop1
+                                          Array.ofList pre2List
+                                          [| fusedLoop |]
+                                          Array.ofList post1List
+                                          afterItems ])
+                                  | _ -> None
+                      | _ -> None
+                    | _ -> None
+                  | _ -> None
+                | _ -> None
+              | _ -> None
+          | _ -> None
+        | _ -> None)
+    let mutable cur = Array.ofList items0
+    let mutable fused = false
+    let mutable searching = true
+    while searching do
+      match tryFuseOnce cur with
+      | Some next ->
+        cur <- next
+        fused <- true
+      | None -> searching <- false
+    if not fused then root else ofSpine (List.ofArray cur)
+  finally
+    ctx.consts <- savedConsts
+
 let snapshot (ctx: Ctx) =
   let count = ctx.items.Count
   let bindings = ctx.bindings.Count
@@ -1044,6 +1448,8 @@ let snapshot (ctx: Ctx) =
   let inductions = ctx.inductions
   let bHeld, bWrite = ctx.bHeld, ctx.bWrite
   let unswitched = List.ofSeq ctx.unswitched
+  let fusedSpines = List.ofSeq ctx.fusedSpines
+  let scores = Dictionary(ctx.scores)
   fun () ->
     ctx.items.RemoveRange(count, ctx.items.Count - count)
     ctx.bindings.RemoveRange(bindings, ctx.bindings.Count - bindings)
@@ -1058,6 +1464,9 @@ let snapshot (ctx: Ctx) =
     ctx.bHeld <- bHeld; ctx.bWrite <- bWrite
     // a loop split in the attempt given up is split again (it is not left as seen)
     ctx.unswitched.Clear(); ctx.unswitched.UnionWith unswitched
+    ctx.fusedSpines.Clear(); ctx.fusedSpines.UnionWith fusedSpines
+    ctx.scores.Clear()
+    for KeyValue(k, v) in scores do ctx.scores[k] <- v
 
 /// A condition in a loop's body (at its top level, not in a branch or an inner loop) that the
 /// loop does not change: it reads parameters, constants, locals bound outside the loop and not
@@ -1716,9 +2125,20 @@ and withCursor (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit ->
       if c.ring then emit ctx (movec (immL 0xffffff) (M c.reg))
       ctx.freeRegs <- c.reg :: ctx.freeRegs
   let reg =
-    match ctx.freeRegs with
-    | r :: rest -> ctx.freeRegs <- rest; r
-    | [] ->
+    let mutable mixed =
+      ctx.cursors |> Map.exists (fun w c -> not (ctx.released.Contains w) && c.region.bank <> region.bank)
+    if not mixed then
+      bodyExpr |> visit (fun n ->
+        match n with
+        | Let(w, _, b) when w.Type = TyCursor && (b.GetFreeVars() |> Seq.contains v) -> mixed <- true; false
+        | _ -> not mixed)
+    let pick =
+      if mixed then ctx.freeRegs |> List.tryFind (fun r -> (r >= 4) = (region.bank = YMemory))
+      else None
+    match pick, ctx.freeRegs with
+    | Some r, _ -> ctx.freeRegs <- ctx.freeRegs |> List.filter ((<>) r); r
+    | None, r :: rest -> ctx.freeRegs <- rest; r
+    | None, [] ->
       let held = [ for KeyValue(c, cr) in ctx.cursors do if not (ctx.released.Contains c) then $"{c.Name} (r{cr.reg})" ]
       let others = [ for KeyValue((i, n), (r, _)) in ctx.indexed -> $"{n}[{i.Name}] (r{r})" ]
       let holders = String.Join(", ", held @ others |> List.distinct)
@@ -2130,6 +2550,19 @@ and genStmt (ctx: Ctx) (e: Expr) : unit =
   | _ -> thenRun ctx e (fun () -> genStmtIn ctx e)
 
 and genStmtIn (ctx: Ctx) (e: Expr) : unit =
+  let e =
+    if ctx.depth = 0 && (match e with Let _ | Sequential _ -> true | _ -> false) && not (ctx.fusedSpines.Contains e) then
+      if spineLoops 0 e < 2 then
+        markSpine ctx e
+        e
+      else
+        let e' = fuseSpine ctx e
+        markSpine ctx e'
+        if not (obj.ReferenceEquals(e, e')) then
+          weigh ctx -1 e
+          weigh ctx 1 e'
+        e'
+    else e
   let mark = ctx.next
   match e with
   | Sequential _ -> ()
@@ -2894,24 +3327,7 @@ let entry (ctx: Ctx) (name: string) (mi: Member) =
   | None -> ()
   // how much each local is used, loops weighted by their trip counts
   ctx.scores.Clear()
-  let rec weigh (w: int) (e: Expr) =
-    match e with
-    | ForIntegerRangeLoop(_, lo, hi, b) ->
-      let n = match tryConst ctx lo, tryConst ctx hi with | Some(:? int as l), Some(:? int as h) -> max 1 (h - l + 1) | _ -> 1
-      weigh (w * n) b
-    // passes not known: weighed as a short loop
-    | WhileLoop(c, b) -> weigh (w * 8) c; weigh (w * 8) b
-    | Var v | VarSet(v, _) when (match e with VarSet _ -> true | _ -> true) ->
-      ctx.scores[v] <- (match ctx.scores.TryGetValue v with | true, n -> n | _ -> 0) + w
-      match e with VarSet(_, x) -> weigh w x | _ -> ()
-    // a helper's locals are the kernel's once inlined
-    | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone && (reflected mi).IsSome ->
-      List.iter (weigh w) args
-      weigh w (reflected mi).Value
-    | ExprShape.ShapeVar _ -> ()
-    | ExprShape.ShapeLambda(_, b) -> weigh w b
-    | ExprShape.ShapeCombination(_, xs) -> List.iter (weigh w) xs
-  weigh 1 (normalize (body def))
+  weigh ctx 1 (normalize (body def))
   emit ctx (Label name)
   if savesTrack then
     // R1 holds the track number only on entry
@@ -3058,7 +3474,7 @@ let rec generateWith (handOff: Set<string>) (chosen: Set<string>) (floors: Map<s
         vars = Map.empty; consts = Map.empty; next = layout.xWorkset; high = layout.xWorkset; labels = 0
         cursors = Map.empty; freeRegs = [ 1; 2; 3; 4; 5 ]; tables = ResizeArray(); conts = []; released = Collections.Generic.HashSet(); trackHome = None
         indexed = Map.empty; counters = Map.empty; inductions = Map.empty; affineAt = Dictionary(HashIdentity.Reference); taps = Dictionary(); freeData = [ X1; Y1 ]; scores = Dictionary(); deadLocals = HashSet()
-        unswitched = HashSet(); bHeld = false; bWrite = false
+        unswitched = HashSet(); fusedSpines = HashSet(HashIdentity.Reference); bHeld = false; bWrite = false
         subs = Dictionary(); chosen = chosen; handOff = handOff; inSub = None; depth = 0; deepest = 0; floors = floors
         kept = keptLoops ik; unrolled = unrolledLoops ik; pending = []; unswitchMax = unswitchMax; unswitchCosts = ResizeArray()
         bindings = ResizeArray() }

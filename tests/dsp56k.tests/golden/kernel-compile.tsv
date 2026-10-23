@@ -36,6 +36,7 @@ probe-index-arg	machinedrum	ok	57	df6192c2db161b4b
 probe-live-ranges	machinedrum	ok	194	95a154134b49d6ef
 probe-long-array	machinedrum	ok	146	4bca515e2645acd0
 probe-long-sat	machinedrum	ok	85	9e404adcad63d9f0
+probe-loop-fusion	machinedrum	ok	94	3f6e6fa7d150640f
 probe-many-arrays	machinedrum	ok	205	c750e79049eccb97
 probe-memory	machinedrum	ok	115	4d39ce814aa4da3a
 probe-mulsu-dmac	machinedrum	ok	57	3398177a383e9896
@@ -54,7 +55,7 @@ probe-size-14100	machinedrum	ok	1788	173bc2ad60c0b394
 probe-size-3400	machinedrum	ok	450	a8542ebefb4d74fc
 probe-size-8100	machinedrum	ok	1038	38d56890bfaef8d5
 probe-size-small	machinedrum	ok	30	347015f8740b6210
-probe-state-ring	machinedrum	ok	149	6bec3b0d7cc38030
+probe-state-ring	machinedrum	ok	149	ec25ad9deba533cd
 probe-state-ring-off	machinedrum	error	-	e3268e71cb3bfb09	ring at Y+$9: a 6-word ring starts on a multiple of 8 in the workset (move the field)
 probe-stereo	machinedrum	error	-	0ff33fe26e5970df	probe-stereo: WritePair needs a stereo target, Machinedrum MDS has 1 channel(s)
 probe-subroutine-frames	machinedrum	ok	167	34a45b3706160ab4
@@ -78,11 +79,11 @@ probe-x-over	machinedrum	error	-	4a6ec08369eb90a1	probe-x-over: the [<XMemory>] 
 probe-x-state	machinedrum	ok	99	df2a79b89a541991
 probe-y-only	machinedrum	ok	16	67b23ab1411cb12f
 sine	machinedrum	ok	79	ef77c252597abbe3
-tx6-bd	machinedrum	ok	675	c343337df947e8a2
-tx6-ch	machinedrum	ok	762	e74eb353b42e192a
-tx6-cp	machinedrum	ok	985	dc889d1688de8086
-tx6-cy	machinedrum	ok	721	6014153d1831dd96
-tx6-ht	machinedrum	ok	697	3036bffa5fbd20f6
-tx6-lt	machinedrum	ok	760	b63da244a9876c03
-tx6-oh	machinedrum	ok	762	b64b69cdc0b8edc1
-tx6-sd	machinedrum	ok	670	53d07f865d3ebe1c
+tx6-bd	machinedrum	ok	666	daa695ad10f856bc
+tx6-ch	machinedrum	ok	754	e1a031f1575119b9
+tx6-cp	machinedrum	ok	973	4850fce326fcbd6a
+tx6-cy	machinedrum	ok	713	0afff4b0dd664b10
+tx6-ht	machinedrum	ok	688	fc7aca220bd93dae
+tx6-lt	machinedrum	ok	751	8155ee4e3f788851
+tx6-oh	machinedrum	ok	754	489162668a4cbebf
+tx6-sd	machinedrum	ok	662	af6f4450739cdd36
