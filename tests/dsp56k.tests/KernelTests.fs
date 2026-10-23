@@ -1761,6 +1761,52 @@ module LoopFusion =
   let kernel = Kernel.define "probe-loop-fusion" <@ init @> <@ trig @> <@ render @>
 
 
+/// Helpers wrapping `Region.read` and `Region.write` called inside a `DO` loop at two distinct
+/// affine offsets (`i` and `i + 16`), split onto two post-incrementing address registers (`x:(r1)+`
+/// and `x:(r2)+`); followed by an outer `DO` loop with a nested `DO` loop and a contiguous Y-state
+/// block walked by `y:(r4)+`.
+[<ReflectedDefinition>]
+module OuterWalkAndRegions =
+  type S =
+    { mutable z1 : Frac
+      mutable z2 : Frac
+      mutable z3 : Frac
+      mutable z4 : Frac }
+
+  let readX (idx: Frac) = Region.read Scratch.x idx
+  let writeX (idx: Frac) (v: Frac) = Region.write Scratch.x idx v
+
+  let tapPair (p: Banks.P) (i: int) =
+    let a = readX (Frac.ofRaw i)
+    let b = readX (Acc.hi (Acc.ofFrac (Frac.ofRaw i) + Frac.ofRaw 16))
+    Acc.sat (a * p.a + b * p.b)
+
+  let init (_: Banks.P) (s: S) =
+    s.z1 <- Frac.zero
+    s.z2 <- Frac.zero
+    s.z3 <- Frac.zero
+    s.z4 <- Frac.zero
+
+  let trig (_: Banks.P) (s: S) =
+    s.z1 <- Frac.zero
+    s.z2 <- Frac.zero
+
+  let render (p: Banks.P) (s: S) (out: Output) =
+    for i in 0 .. 31 do
+      writeX (Frac.ofRaw i) (Acc.hi (Acc.ofFrac p.a + Frac.ofRaw i))
+    for i in 0 .. 15 do
+      let t = tapPair p i
+      for _ in 0 .. 1 do
+        s.z1 <- Acc.sat (Acc.ofFrac s.z1 + (Acc.ofFrac t >>> 2))
+      s.z2 <- Acc.sat (Acc.ofFrac s.z2 + (Acc.ofFrac s.z1 >>> 1))
+      s.z3 <- Acc.sat (Acc.ofFrac s.z3 + (Acc.ofFrac s.z2 >>> 1))
+      s.z4 <- Acc.sat (Acc.ofFrac s.z4 + (Acc.ofFrac s.z3 >>> 1))
+      out.Write s.z3
+      out.Write s.z4
+
+  let kernel = Kernel.define "probe-outer-walk-regions" <@ init @> <@ trig @> <@ render @>
+
+
 let probeMachine =
   { Mds.machine "org.fsdsp56k.probe" "PROBE" "GND" "PR" with
       parameters = [| for n in [| "A"; "B"; "C"; "D" |] -> Mds.param n Mds.UnipolarQ23 |] }
@@ -2391,6 +2437,20 @@ let tests =
           let mixLoop = render[doIdxs[2] + 1 ..]
           Expect.exists mixLoop (fun l -> l.Contains "x:(r1)+" && l.Contains "y:(r4)+") "final mix loop packs both cursor reads into one dual X:Y move"
         conformance LoopFusion.kernel 75
+      }
+      test "helper-wrapped region affine splitting and outer DO loop workset walking: compiled program equals the .NET kernel" {
+        needNative ()
+        match Optimize.compile Optimize.Peephole Kernel.mds OuterWalkAndRegions.kernel with
+        | Error e -> failtest e
+        | Ok c ->
+          let lines = c.items |> Array.map dsp56k.Print.item
+          let at (label: string) = Array.findIndex ((=) label) lines
+          let render = lines[at "RENDER:" + 1 ..]
+          Expect.isFalse (render |> Array.exists (fun l -> l.Contains "(r0+n0)")) "no (r0+n0) region access in RENDER"
+          Expect.exists render (fun l -> l.Contains "x:(r1)+") "first region offset stepped with x:(r1)+"
+          Expect.exists render (fun l -> l.Contains "x:(r2)+") "second region offset split onto x:(r2)+"
+          Expect.exists render (fun l -> l.Contains "y:(r4)+") "outer DO loop state block walked with y:(r4)+"
+        conformance OuterWalkAndRegions.kernel 76
       }
       test "register locals read in both branches of an if: compiled program equals the .NET kernel" {
         needNative ()

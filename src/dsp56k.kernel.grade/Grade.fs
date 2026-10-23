@@ -727,6 +727,117 @@ let private runStatesCached (h: Harness) (p: Program) (stateWords: int) (xStateW
     key.Text("program", $"{p.name}\n{p.programWords}\n{p.xWorkset}\n{p.yWorkset}\n{p.declaredCycles}\n{stateWords}\n{xStateWords}")
     GradeCache.cached "dsp" $"{p.name} / {scenario.name}" key saveRun loadRun (fun () -> runStates h p stateWords xStateWords scenario)
 
+module private LiveAudition =
+  open System.IO
+  open System.Runtime.InteropServices
+  open System.Threading
+
+  [<Literal>]
+  let Lib = "fsdsp56k_audio"
+
+  [<DllImport(Lib)>]
+  extern nativeint fsdsp56k_audio_open(uint32 sampleRate, uint32 capacityFrames)
+  [<DllImport(Lib)>]
+  extern uint32 fsdsp56k_audio_push(nativeint player, float32[] frames, uint32 count)
+  [<DllImport(Lib)>]
+  extern uint32 fsdsp56k_audio_queued(nativeint player)
+
+  type Marker = class end
+  let mutable resolverSet = false
+  let mutable handle = 0n
+  let mutable envelope = 0.0
+  let gate = obj ()
+
+  let ensurePlayer () =
+    lock gate (fun () ->
+      if not resolverSet then
+        resolverSet <- true
+        let file =
+          if OperatingSystem.IsWindows() then "fsdsp56k_audio.dll"
+          elif OperatingSystem.IsMacOS() then "libfsdsp56k_audio.dylib"
+          else "libfsdsp56k_audio.so"
+        NativeLibrary.SetDllImportResolver(typeof<Marker>.Assembly, DllImportResolver(fun name _ _ ->
+          if name <> Lib then IntPtr.Zero
+          else
+            let candidates =
+              [ match Native.locate () with
+                | Some p ->
+                  let dir = Path.GetDirectoryName p
+                  if not (isNull dir) then yield Path.Combine(dir, file)
+                | None -> ()
+                for start in [ Environment.CurrentDirectory; AppContext.BaseDirectory ] do
+                  let mutable d : DirectoryInfo | null = DirectoryInfo start
+                  while not (isNull d) do
+                    let cur = nonNull d
+                    yield Path.Combine(cur.FullName, "native", "target", "release", file)
+                    d <- cur.Parent ]
+            match candidates |> List.tryFind File.Exists with
+            | Some path -> NativeLibrary.Load path
+            | None -> IntPtr.Zero))
+      if handle = 0n then
+        try handle <- fsdsp56k_audio_open(uint32 sampleRate, uint32 (sampleRate / 2))
+        with _ -> handle <- 0n
+      handle)
+
+  let shapeAndPlay (seconds: float) (outputs: int array array) =
+    let h = ensurePlayer ()
+    if h <> 0n && outputs.Length > 0 then
+      let maxFrames = max 32 (int (seconds * float sampleRate))
+      let raw = ResizeArray<float>(min maxFrames (outputs.Length * 32))
+      let firstNonZero =
+        outputs |> Array.tryFindIndex (Array.exists (fun w -> (w &&& 0xffffff) <> 0)) |> Option.defaultValue 0
+      let mutable b = firstNonZero
+      while b < outputs.Length && raw.Count < maxFrames do
+        let blk = outputs[b]
+        for i in 0 .. blk.Length - 1 do
+          if raw.Count < maxFrames then raw.Add(Track.toFloat blk[i])
+        b <- b + 1
+      let n = raw.Count
+      if n > 0 then
+        let fade = min 220 (n / 4)
+        let gap = sampleRate / 25
+        let gain, ceiling, release = 0.35, 0.5, 0.9995
+        let buf = Array.zeroCreate<float32> (n + gap)
+        for i in 0 .. n - 1 do
+          let y = gain * raw[i]
+          envelope <- max (abs y) (envelope * release)
+          let lim = if envelope > ceiling then y * ceiling / envelope else y
+          let ramp = if fade <= 0 then 1.0 else min 1.0 (float (min i (n - 1 - i)) / float fade)
+          buf[i] <- float32 (lim * ramp)
+        let mutable rest = buf
+        while rest.Length > 0 do
+          let pushed = int (fsdsp56k_audio_push(h, rest, uint32 rest.Length))
+          rest <- rest[pushed..]
+          if rest.Length > 0 then Thread.Sleep 2
+        let until = DateTime.UtcNow + TimeSpan.FromSeconds(seconds + 0.5)
+        while int (fsdsp56k_audio_queued h) > sampleRate / 10 && DateTime.UtcNow < until do
+          Thread.Sleep 5
+
+let private reportProgressAndAudition (r: Report) =
+  let progEnv = Environment.GetEnvironmentVariable "FSDSP56K_GRADE_PROGRESS"
+  let audEnv = Environment.GetEnvironmentVariable "FSDSP56K_GRADE_AUDITION"
+  let isSet (s: string | null) =
+    not (String.IsNullOrWhiteSpace s) && s <> "0" && not (s.Equals("false", StringComparison.OrdinalIgnoreCase))
+  if isSet progEnv || isSet audEnv then
+    let refText =
+      match r.reference with
+      | Some rc when rc.renderMean > 0.0 -> sprintf " (ref %.1f / %d)" rc.renderMean rc.renderWorst
+      | _ -> ""
+    let status =
+      if not r.correctness.IsEmpty then "MISMATCH(net)"
+      else match r.fidelity with Some(Some _) -> "MISMATCH(ref)" | _ -> "match"
+    let scen = if r.scenario.Length > 42 then r.scenario.Substring(0, 39) + "..." else r.scenario
+    printfn "  -> %-10s | %-42s | %4d blk | %4d w | mean %7.1f worst %6d%s | %s"
+      r.kernel scen r.blocks r.ours.programWords r.ours.renderMean r.ours.renderWorst refText status
+    Console.Out.Flush()
+  if isSet audEnv then
+    let s = nonNull audEnv
+    let secs =
+      match Double.TryParse(s, Globalization.NumberStyles.Float, Globalization.CultureInfo.InvariantCulture) with
+      | true, v when v > 0.0 && s <> "1" -> v
+      | _ -> 1.0
+    LiveAudition.shapeAndPlay secs r.dsp.outputs
+
 /// Compile for the harness's target with the optimizer at `level`, the [<HandWritten>] helpers of
 /// `handOff` (by key) from their F#, load, run and compare.
 let gradeAtWith (handOff: Set<string>) (level: Optimize.Level) (h: Harness) (k: Kernel.Kernel) (reference: Program option) (scenario: Scenario) =
@@ -746,14 +857,17 @@ let gradeAtWith (handOff: Set<string>) (level: Optimize.Level) (h: Harness) (k: 
           let theirs = sections r.items |> Map.ofArray
           sections compiled.items |> Array.map (fun (e, o) -> align e o (theirs.TryFind e |> Option.defaultValue [||]))
         | _ -> [||]
-      Ok { kernel = k.name; scenario = scenario.name; steps = scenario.steps; blocks = dsp.outputs.Length
-           harness = h; compiled = compiled; program = program
-           net = net; dsp = dsp; refRun = refRun; refItems = (reference |> Option.map _.items |> Option.defaultValue [||])
-           correctness = correctness
-           fidelity = refRun |> Option.map (fun r -> compare "output" r.outputs dsp.outputs)
-           ours = cost program dsp
-           reference = Option.map2 cost reference refRun
-           shapes = shapes }
+      let report =
+        { kernel = k.name; scenario = scenario.name; steps = scenario.steps; blocks = dsp.outputs.Length
+          harness = h; compiled = compiled; program = program
+          net = net; dsp = dsp; refRun = refRun; refItems = (reference |> Option.map _.items |> Option.defaultValue [||])
+          correctness = correctness
+          fidelity = refRun |> Option.map (fun r -> compare "output" r.outputs dsp.outputs)
+          ours = cost program dsp
+          reference = Option.map2 cost reference refRun
+          shapes = shapes }
+      if handOff.IsEmpty && level = Optimize.Peephole then reportProgressAndAudition report
+      Ok report
     with Kernel.KernelError m -> Error m)
 
 /// Compile for the harness's target with the optimizer at `level`, load, run and compare.

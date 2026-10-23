@@ -41,11 +41,12 @@ probe-many-arrays	machinedrum	ok	205	c750e79049eccb97
 probe-memory	machinedrum	ok	115	4d39ce814aa4da3a
 probe-mulsu-dmac	machinedrum	ok	57	3398177a383e9896
 probe-order	machinedrum	ok	147	980cc74e19d3ef6e
+probe-outer-walk-regions	machinedrum	ok	108	bc98eb6f8b882cb8
 probe-piped	machinedrum	ok	32	962bfd9a19a9e066
 probe-region-induction	machinedrum	ok	116	e014675fc088d78c
 probe-region-shared-index	machinedrum	ok	88	7f281bc137a539c0
-probe-region-shared-let	machinedrum	ok	57	49d597132f16765b
-probe-ring-taps	machinedrum	ok	243	18257c2388cbb287
+probe-region-shared-let	machinedrum	ok	53	23f6dc3b8f53b942
+probe-ring-taps	machinedrum	ok	241	35dae2cbd6a97633
 probe-scaled-index	machinedrum	error	-	599a999915510cfe	the loop index i can index state arrays (s.field[i + c]) or be read as Frac.ofRaw i; not <expression>
 probe-shape-events	machinedrum	ok	112	1be1dc754eea684c
 probe-shape-selects	machinedrum	ok	130	0b24ca5c6f23bb06

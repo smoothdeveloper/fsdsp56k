@@ -374,22 +374,31 @@ let successors (items: Item array) =
     | _ -> next ()
   if followable then Some(succ |> Array.map (fun l -> l.ToArray())) else None
 
+/// A compiler temporary word: X workset words from `first` up to `temps`, and Y workset words
+/// from `yFirst` up to `yTemps` (mapped to 1024 + k so X and Y slots never share an ID or
+/// appear contiguous across banks).
+let tempSlot (first: int) (temps: int) (yFirst: int) (yTemps: int) (space: Space) (ea: Ea) =
+  match workset space ea with
+  | Some(SMem(Space.X, k)) when k >= first && k < temps -> Some k
+  | Some(SMem(Space.Y, k)) when k >= yFirst && k < yTemps -> Some(1024 + k)
+  | _ -> None
+
 /// Whole-accumulator reloads whose three raw parts equal their temporary on every incoming
 /// path. Value IDs need not agree between paths: a clamp can select a different value while
 /// keeping A equal to its home on both. Unknown effects and entry paths contribute no facts.
-let joinAccumulators (first: int) (temps: int) (items: (Item * int) array) =
+let joinAccumulatorsY (first: int) (temps: int) (yFirst: int) (yTemps: int) (items: (Item * int) array) =
   let its = Array.map fst items
   let n = its.Length
+  let temp = tempSlot first temps yFirst yTemps
   let single i = match its[i] with Op(Par(None, [| m |])) -> Some m | _ -> None
   let reload i =
     if i + 2 >= n then None
     else
       match single i, single (i + 1), single (i + 2) with
-      | Some(Load(Space.X, e1, ((A | B) as acc))), Some(Load(Space.X, e0, lo)), Some(Load(Space.X, e2, ext))
+      | Some(Load(sp1, e1, ((A | B) as acc))), Some(Load(sp0, e0, lo)), Some(Load(sp2, e2, ext))
           when lo = (if acc = A then A0 else B0) && ext = (if acc = A then A2 else B2) ->
-        match workset Space.X e1, workset Space.X e0, workset Space.X e2 with
-        | Some(SMem(_, k)), Some(SMem(_, k0)), Some(SMem(_, k2))
-            when k >= first && k + 2 < temps && k0 = k + 1 && k2 = k + 2 -> Some(k, acc)
+        match temp sp1 e1, temp sp0 e0, temp sp2 e2 with
+        | Some k, Some k0, Some k2 when k0 = k + 1 && k2 = k + 2 -> Some(k, acc)
         | _ -> None
       | _ -> None
   match successors its with
@@ -400,16 +409,19 @@ let joinAccumulators (first: int) (temps: int) (items: (Item * int) array) =
     let candidates = [| for i in 0 .. n - 1 do match reload i with Some pair -> yield pair | _ -> () |] |> Array.distinct
     let dropped = HashSet<int>()
     for k, acc in candidates do
+      let spSlot = if k >= 1024 then Space.Y else Space.X
       let registers = if acc = A then [| A1; A0; A2 |] else [| B1; B0; B2 |]
       let regMask r =
         let touched = parts r
         registers |> Array.mapi (fun bit r -> if List.contains r touched then 1 <<< bit else 0) |> Array.fold (|||) 0
       let memoryMask space ea =
-        match workset space ea with
-        | Some(SMem(Space.X, word)) when word >= k && word < k + 3 -> 1 <<< (word - k)
-        | Some _ -> 0
-        | None when space = Space.X -> 7     // an indirect store can alias the temporary
-        | _ -> 0
+        match temp space ea with
+        | Some word when word >= k && word < k + 3 -> 1 <<< (word - k)
+        | _ ->
+          match workset space ea with
+          | Some _ -> 0
+          | None when space = spSlot -> 7     // an indirect store can alias the temporary
+          | _ -> 0
       let transfer state item =
         match item with
         | Label _ -> state
@@ -439,16 +451,16 @@ let joinAccumulators (first: int) (temps: int) (items: (Item * int) array) =
             // sources precede all writes, and overlapping destinations need more modelling.
             for move in (if alu.IsNone && moves.Length = 1 then moves else [||]) do
               match move with
-              | Store(src, Space.X, ea) ->
-                match workset Space.X ea with
-                | Some(SMem(_, word)) when word >= k && word < k + 3 ->
+              | Store(src, sp, ea) ->
+                match temp sp ea with
+                | Some word when word >= k && word < k + 3 ->
                   let bit = 1 <<< (word - k)
                   // Parallel stores read the old register, before any ALU/register writes.
                   if src = registers[word - k] && changed &&& bit = 0 then result <- result ||| bit
                 | _ -> ()
-              | Load(Space.X, ea, dst) ->
-                match workset Space.X ea with
-                | Some(SMem(_, word)) when word >= k && word < k + 3 ->
+              | Load(sp, ea, dst) ->
+                match temp sp ea with
+                | Some word when word >= k && word < k + 3 ->
                   let bit = 1 <<< (word - k)
                   if (dst = registers[word - k] || (word = k && dst = acc)) && stored &&& bit = 0 then
                     result <- result ||| bit
@@ -478,14 +490,15 @@ let joinAccumulators (first: int) (temps: int) (items: (Item * int) array) =
           for j in i .. i + 2 do dropped.Add j |> ignore
     items |> Array.mapi (fun i item -> i, item) |> Array.choose (fun (i, item) -> if dropped.Contains i then None else Some item)
 
-/// Stores to the compiler's temporaries (X workset words from `first` up to `temps`; the words
-/// below `first` are [<XMemory>] state) that no path reads before the word is written again.
-let deadTempsFrom (first: int) (temps: int) (items: (Item * int) array) =
+let joinAccumulators (first: int) (temps: int) (items: (Item * int) array) =
+  joinAccumulatorsY first temps 0 0 items
+
+/// Stores to the compiler's temporaries (X workset words from `first` up to `temps` and Y
+/// workset words from `yFirst` up to `yTemps`; the words below are state) that no path reads
+/// before the word is written again.
+let deadTempsFromY (first: int) (temps: int) (yFirst: int) (yTemps: int) (items: (Item * int) array) =
   let its = Array.map fst items
-  let temp (space: Space) (ea: Ea) =
-    match workset space ea with
-    | Some(SMem(Space.X, k)) when k >= first && k < temps -> Some k
-    | _ -> None
+  let temp = tempSlot first temps yFirst yTemps
   let uses i =
     match its[i] with
     | Op(Par(_, moves)) -> moves |> Array.choose (function Load(sp, ea, _) -> temp sp ea | _ -> None) |> Set.ofArray
@@ -520,6 +533,9 @@ let deadTempsFrom (first: int) (temps: int) (items: (Item * int) array) =
         | None -> true
       | _ -> true) |> Array.map snd
 
+let deadTempsFrom (first: int) (temps: int) (items: (Item * int) array) =
+  deadTempsFromY first temps 0 0 items
+
 /// The dead temporaries of a kernel without [<XMemory>] state: X words below `temps`.
 let deadTemps (temps: int) (items: (Item * int) array) = deadTempsFrom 0 temps items
 
@@ -528,6 +544,12 @@ let readsOf (instr: Instr) =
   match instr with
   | Par(alu, moves) ->
     Some(Array.append (alu |> Option.map Lower.aluReads |> Option.defaultValue [||]) (Array.collect Lower.moveReads moves))
+  | IfCc(alu, _, _) -> Some(Lower.aluReads alu)
+  | Tcc(_, accPair, rPair) ->
+    let a = match accPair with Some(s, _) -> [| s |] | None -> [||]
+    let r = match rPair with Some(s, _) -> [| R s |] | None -> [||]
+    Some(Array.append a r)
+  | Norm(r, d) -> Some [| R r; Acc.reg d |]
   | MulI(kind, _, _, src, d) | MulImm(kind, _, src, _, d) ->
     Some(match kind with Mac | Macr -> [| src; Acc.reg d |] | _ -> [| src |])
   | MulSu(kind, _, _, s1, s2, d) ->
@@ -542,7 +564,7 @@ let readsOf (instr: Instr) =
   | ShiftReg(_, r, s, _) -> Some [| r; Acc.reg s |]
   | Lua(ea, _) -> Some(Lower.eaRegs ea)
   | BitOp(_, _, BitReg r) -> Some(Lower.storage r)
-  | BitOp(Btst, _, BitMem(_, ea)) -> Some(Lower.eaRegs ea)
+  | BitOp(_, _, BitMem(_, ea)) -> Some(Lower.eaRegs ea)
   | CtrlImm(_, _, (Ccr | Mr | Omr)) | Rep(Count _) | Nop -> Some [||]
   | Rep(FromReg r) -> Some(Lower.storage r)
   | Rep(FromMem(_, ea)) -> Some(Lower.eaRegs ea)
@@ -552,6 +574,7 @@ let writesOf (instr: Instr) =
   match instr with
   | Par(alu, moves) ->
     Some(Array.append (alu |> Option.map Lower.aluWrites |> Option.defaultValue [||]) (Array.collect Lower.moveWrites moves))
+  | BitOp(_, _, BitMem(_, ea)) -> Some(Lower.eaWrites ea)
   | i -> aluWrites i |> Option.map List.toArray
 
 /// Whether `instr` overwrites every part of `t`.
@@ -791,7 +814,7 @@ let deadTempsGlobal (temps: int) (items: (Item * int) array) =
 /// where nothing else in the loop writes the register and the straight code before the load does
 /// not read it: done once, before the loop (a parameter, a state word only read there, a
 /// constant such as the zero a silent block writes).
-let hoistFrom (first: int) (temps: int) (items: (Item * int) array) =
+let hoistFromY (first: int) (temps: int) (yFirst: int) (yTemps: int) (items: (Item * int) array) =
   let control (instr: Instr) =
     match instr with
     | Branch _ | Jump _ | Loop _ | Rep _ | Enddo -> true
@@ -865,7 +888,7 @@ let hoistFrom (first: int) (temps: int) (items: (Item * int) array) =
                     | Some(space, w) ->
                       let unaliased =
                         (space = Space.X && w >= first && w < temps)
-                        || (space = Space.Y && w >= 1 && w < 9)
+                        || (space = Space.Y && ((w >= 1 && w < 9) || (w >= yFirst && w < yTemps)))
                         || not derivesWorksetAddr
                       moves |> Array.forall (fun m ->
                         match m with
@@ -971,6 +994,9 @@ let hoistFrom (first: int) (temps: int) (items: (Item * int) array) =
       cur <- rest |> Array.insertAt p moved
     | None -> go <- false
   cur
+
+let hoistFrom (first: int) (temps: int) (items: (Item * int) array) =
+  hoistFromY first temps 0 0 items
 
 let hoist (items: (Item * int) array) = hoistFrom 0 0 items
 
@@ -1193,13 +1219,10 @@ let tripWeights (items: Item array) =
 /// the temporary is live, it holds the value instead: the store becomes `tfr a,b`, the reload
 /// `tfr b,a`, a read of the high word `move b1,x0`. Only temporaries every access of which is
 /// one of those forms; calls, returns and anything not modelled count as using every register.
-let promote (first: int) (temps: int) (items: (Item * int) array) =
+let promoteY (first: int) (temps: int) (yFirst: int) (yTemps: int) (items: (Item * int) array) =
   let its = Array.map fst items
   let n = its.Length
-  let temp (space: Space) (ea: Ea) =
-    match workset space ea with
-    | Some(SMem(Space.X, k)) when k >= first && k < temps -> Some k
-    | _ -> None
+  let temp = tempSlot first temps yFirst yTemps
   let single i = match its[i] with Op(Par(None, [| m |])) -> Some m | _ -> None
   let hi acc = if acc = A then A1 else B1
   let lo acc = if acc = A then A0 else B0
@@ -1349,7 +1372,10 @@ let promote (first: int) (temps: int) (items: (Item * int) array) =
              | _ -> yield items[i] |]
   | _ -> items
 
-/// The compiler's X temporaries in registers, web by web. A temporary word is reused for many
+let promote (first: int) (temps: int) (items: (Item * int) array) =
+  promoteY first temps 0 0 items
+
+/// The compiler's temporaries in registers, web by web. A temporary word is reused for many
 /// expressions; each definition with the uses it reaches (reaching definitions, per word) is a
 /// web, given a register when one is neither touched nor live anywhere the web is live:
 ///
@@ -1362,13 +1388,10 @@ let promote (first: int) (temps: int) (items: (Item * int) array) =
 /// Heavier webs (trip-weighted accesses) first; webs sharing a register have disjoint ranges. A
 /// move between a web's register and itself goes. Calls, returns and anything not modelled use
 /// every register, so a web across one keeps its memory.
-let assign (first: int) (temps: int) (items: (Item * int) array) =
+let assignY (first: int) (temps: int) (yFirst: int) (yTemps: int) (items: (Item * int) array) =
   let its = Array.map fst items
   let n = its.Length
-  let temp (space: Space) (ea: Ea) =
-    match workset space ea with
-    | Some(SMem(Space.X, k)) when k >= first && k < temps -> Some k
-    | _ -> None
+  let temp = tempSlot first temps yFirst yTemps
   let single i = match its[i] with Op(Par(None, [| m |])) -> Some m | _ -> None
   let hi acc = if acc = A then A1 else B1
   let lo acc = if acc = A then A0 else B0
@@ -1601,6 +1624,9 @@ let assign (first: int) (temps: int) (items: (Item * int) array) =
            | true, None -> ()
            | _ -> yield items[i] |]
 
+let assign (first: int) (temps: int) (items: (Item * int) array) =
+  assignY first temps 0 0 items
+
 /// A DO loop's last instruction cannot be a branch target: a NOP where a pass left a label (or
 /// nothing) at the end of a loop.
 let fixLoops (items: (Item * int) array) =
@@ -1624,15 +1650,15 @@ let fixLoops (items: (Item * int) array) =
 /// Walk workset sub-blocks in X: and Y: with a free address register (`r1..r5`), turning 2-cycle
 /// `x:(r6+$k)` / `y:(r6+$k)` moves (`Alone`) into 1-cycle `(rN)+` / `(rN)-` / `(rN)` / `(rN)+nN` /
 /// `(rN)-nN` moves (`Parallel`) that `pack` can fold into adjacent ALU and dual-move instructions.
-let walk (items: (Item * int) array) =
+let walkWith (yLimit: int) (items: (Item * int) array) =
   let cur = Array.copy items
   let n = cur.Length
   if n = 0 then cur
   else
 
   let dispOf = function
-    | Op(Par(None, [| Load(sp, Disp(6, { expr = Num k }), reg) |])) -> Some(sp, int k, reg, false)
-    | Op(Par(None, [| Store(reg, sp, Disp(6, { expr = Num k })) |])) -> Some(sp, int k, reg, true)
+    | Op(Par(None, [| Load(sp, Disp(6, { expr = Num k }), reg) |])) when sp <> Space.Y || int k < yLimit -> Some(sp, int k, reg, false)
+    | Op(Par(None, [| Store(reg, sp, Disp(6, { expr = Num k })) |])) when sp <> Space.Y || int k < yLimit -> Some(sp, int k, reg, true)
     | _ -> None
 
   let stepEa r delta =
@@ -1711,15 +1737,19 @@ let walk (items: (Item * int) array) =
         renderIn[idx] <- true
         match its0[idx] with
         | Op Rts | Op Rti -> ()
-        | Op(Jump(_, { expr = Sym t })) ->
+        | Op(Jump(op, { expr = Sym t })) ->
           match labels0.TryFind t with Some ti -> rQueue.Enqueue ti | None -> ()
+          if op <> Jmp then rQueue.Enqueue (idx + 1)
         | Op(Branch(Bsr, { expr = Sym t })) ->
           match labels0.TryFind t with Some ti -> rQueue.Enqueue ti | None -> ()
           rQueue.Enqueue (idx + 1)
-        | Op(Branch(_, { expr = Sym t })) ->
+        | Op(Branch(_, { expr = Sym t }))
+        | Op(BitBranch(_, _, _, { expr = Sym t })) ->
           match labels0.TryFind t with Some ti -> rQueue.Enqueue ti | None -> ()
           rQueue.Enqueue (idx + 1)
         | _ -> rQueue.Enqueue (idx + 1)
+
+    let insertions = ResizeArray<int * (Item * int)>()
 
     let computeRegInfo () =
       let its = Array.map fst cur
@@ -1742,6 +1772,13 @@ let walk (items: (Item * int) array) =
         | Branch((Bra | Bcc _), _) | Jump((Jmp | Jcc _), _) | Loop(_, Count _, _) | Enddo | Nop | Rts | Rti -> true
         | Branch(Bsr, { expr = Sym s }) when s.StartsWith "SUB_" && not (s.StartsWith "SUB_K_HAND_") -> true
         | _ -> false
+      let markRegs i (rs: Reg array) (ws: Reg array) =
+        for r in 1 .. 5 do
+          if Array.contains (R r) rs then rReads[i][r] <- true
+          if Array.contains (R r) ws then rWrites[i][r] <- true
+          if Array.contains (N r) rs then nReads[i][r] <- true
+          if Array.contains (N r) ws then nWrites[i][r] <- true
+          if Array.contains (M r) rs || Array.contains (M r) ws then mTouch[i][r] <- true
       for i in 0 .. n - 1 do
         match its[i] with
         | Op(Lua(ea, dst)) ->
@@ -1751,21 +1788,24 @@ let walk (items: (Item * int) array) =
             if Array.contains (N r) rs then nReads[i][r] <- true
             if dst = R r then rWrites[i][r] <- true
             if dst = N r then nWrites[i][r] <- true
+        | Op(Loop(_, FromReg r, _)) | Op(BitBranch(_, _, BitReg r, _)) ->
+          markRegs i (Lower.storage r) [||]
+        | Op(Loop(_, FromMem(_, ea), _)) | Op(BitBranch(_, _, BitMem(_, ea), _)) ->
+          markRegs i (Lower.eaRegs ea) (Lower.eaWrites ea)
         | Op instr when control instr -> ()
         | Op instr ->
           match readsOf instr, writesOf instr with
-          | Some rs, Some ws ->
-            for r in 1 .. 5 do
-              if Array.contains (R r) rs then rReads[i][r] <- true
-              if Array.contains (R r) ws then rWrites[i][r] <- true
-              if Array.contains (N r) rs then nReads[i][r] <- true
-              if Array.contains (N r) ws then nWrites[i][r] <- true
-              if Array.contains (M r) rs || Array.contains (M r) ws then mTouch[i][r] <- true
+          | Some rs, Some ws -> markRegs i rs ws
           | _ ->
             for r in 1 .. 5 do
               rReads[i][r] <- true; rWrites[i][r] <- true
               nReads[i][r] <- true; nWrites[i][r] <- true
               mTouch[i][r] <- true
+        | _ -> ()
+      for idx, (it, _) in insertions do
+        match it with
+        | Op(Lua(_, R r)) | Op(Par(None, [| Copy(_, R r) |])) when r >= 1 && r <= 5 -> rWrites[idx][r] <- true
+        | Op(Par(None, [| Imm(_, N r) |])) when r >= 1 && r <= 5 -> nWrites[idx][r] <- true
         | _ -> ()
       let solveLive (reads: bool array array) (writes: bool array array) =
         let liveIn  = Array.init n (fun _ -> Array.create 8 false)
@@ -1929,27 +1969,26 @@ let walk (items: (Item * int) array) =
           if ordScore > offScore then ordArr else offArr
       groups |> Array.sortByDescending groupSaving
 
-    let insertions = ResizeArray<int * (Item * int)>()
-
     // Phase 1: inner-most DO loops in RENDER.
     let its1, labels1, isFree1 = computeRegInfo ()
-    let inAnyLoop = Array.create n false
+    let inWalkedLoop = Array.create n false
     for loopIdx in 0 .. n - 1 do
       match its1[loopIdx] with
       | Op(Loop(_, _, { expr = Sym endLabel })) when renderIn[loopIdx] ->
         match labels1.TryFind endLabel with
         | Some endIdx when endIdx > loopIdx ->
-          for k in loopIdx .. endIdx do inAnyLoop[k] <- true
           let mutable innerOk = true
           let branchSpans = ResizeArray<int * int>()
           for k in loopIdx + 1 .. endIdx - 1 do
             match its1[k] with
             | Op(Loop _ | Forever _ | Enddo | Rts | Rti | Jump _) -> innerOk <- false
             | Op(Branch(Bsr, _)) -> innerOk <- false
-            | Op(Branch(_, { expr = Sym t })) ->
+            | Op(Branch(_, { expr = Sym t }))
+            | Op(BitBranch(_, _, _, { expr = Sym t })) ->
               match labels1.TryFind t with
               | Some tIdx when tIdx > k && tIdx <= endIdx -> branchSpans.Add(k, tIdx)
               | _ -> innerOk <- false
+            | Op(Branch _ | BitBranch _) -> innerOk <- false
             | _ -> ()
           if innerOk then
             for i in 0 .. n - 1 do
@@ -1959,10 +1998,15 @@ let walk (items: (Item * int) array) =
                   | Some tIdx when tIdx > loopIdx && tIdx < endIdx -> innerOk <- false
                   | _ -> ()
                 match its1[i] with
-                | Op(Branch(_, { expr = Sym t })) -> checkTarget t
-                | Op(Jump(_, { expr = Sym t })) -> checkTarget t
+                | Op(Branch(_, { expr = Sym t }))
+                | Op(Jump(_, { expr = Sym t }))
+                | Op(BitBranch(_, _, _, { expr = Sym t })) -> checkTarget t
                 | _ -> ()
           if innerOk then
+            let mutable p0 = loopIdx
+            if p0 > 0 && its1[p0 - 1] = machinedrum.Abi.relocateMarker then p0 <- p0 - 1
+            if p0 > 0 && (match its1[p0 - 1] with Label l -> l.EndsWith "_DO" | _ -> false) then p0 <- p0 - 1
+            for k in p0 .. endIdx do inWalkedLoop[k] <- true
             let usedRegs = HashSet<int>()
             for sp in [ Space.Y; Space.X ] do
               let allAccs =
@@ -1983,13 +2027,10 @@ let walk (items: (Item * int) array) =
                   if not allSameReadOnly then
                     match canWalkSeq sub k0 with
                     | Some(k0, needN, deltas) ->
-                      let mutable p = loopIdx
-                      if p > 0 && its1[p - 1] = machinedrum.Abi.relocateMarker then p <- p - 1
-                      if p > 0 && (match its1[p - 1] with Label l -> l.EndsWith "_DO" | _ -> false) then p <- p - 1
                       let regOpt =
                         prefRegs
                         |> List.tryFind (fun r ->
-                          not (usedRegs.Contains r) && isFree1 r needN.IsSome p endIdx)
+                          not (usedRegs.Contains r) && isFree1 r needN.IsSome p0 endIdx)
                       match regOpt with
                       | Some r ->
                         usedRegs.Add r |> ignore
@@ -1997,9 +2038,9 @@ let walk (items: (Item * int) array) =
                         let setupR =
                           if k0 = 0 then Op(Par(None, [| Copy(R 6, R r) |])), ln
                           else Op(Lua(Disp(6, Operand.num k0), R r)), ln
-                        insertions.Add(p, setupR)
+                        insertions.Add(p0, setupR)
                         match needN with
-                        | Some d -> insertions.Add(p, (Op(Par(None, [| Imm(Operand.num d, N r) |])), ln))
+                        | Some d -> insertions.Add(p0, (Op(Par(None, [| Imm(Operand.num d, N r) |])), ln))
                         | None -> ()
                         for a in 0 .. sub.Length - 1 do
                           let idx, _, _, _ = sub[a]
@@ -2009,7 +2050,7 @@ let walk (items: (Item * int) array) =
         | _ -> ()
       | _ -> ()
 
-    // Phase 2: straight-line basic blocks in RENDER outside DO loops.
+    // Phase 2: straight-line basic blocks in RENDER outside walked DO loops.
     let its2, _, isFree2 = computeRegInfo ()
     let targetLabels = HashSet<string>([ "INIT"; "TRIG"; "RENDER" ])
     for i in 0 .. n - 1 do
@@ -2023,15 +2064,15 @@ let walk (items: (Item * int) array) =
     let isBlockBoundary i =
       match its2[i] with
       | Label l -> targetLabels.Contains l
-      | Op(Loop _ | Forever _ | Enddo | Branch _ | Jump _ | Rts | Rti | Rep _) -> true
+      | Op(Loop _ | Forever _ | Enddo | Branch _ | Jump _ | BitBranch _ | Rts | Rti | Rep _) -> true
       | _ -> false
     let mutable bStart = 0
     while bStart < n do
-      if not renderIn[bStart] || inAnyLoop[bStart] || isBlockBoundary bStart then
+      if not renderIn[bStart] || inWalkedLoop[bStart] || isBlockBoundary bStart then
         bStart <- bStart + 1
       else
         let mutable bEnd = bStart
-        while bEnd + 1 < n && renderIn[bEnd + 1] && not inAnyLoop[bEnd + 1] && not (isBlockBoundary (bEnd + 1)) do
+        while bEnd + 1 < n && renderIn[bEnd + 1] && not inWalkedLoop[bEnd + 1] && not (isBlockBoundary (bEnd + 1)) do
           bEnd <- bEnd + 1
         let usedRegs = HashSet<int>()
         for sp in [ Space.Y; Space.X ] do
@@ -2097,6 +2138,8 @@ let walk (items: (Item * int) array) =
         | false, _ -> ()
         out.Add cur[i]
       out.ToArray()
+
+let walk (items: (Item * int) array) = walkWith 64 items
 
 /// The passes, each one switchable (for measuring what each does), and the guard that keeps a
 /// pass's rewrite only when it is no worse (`monotone`). fixLoops always runs: it is not an
@@ -2221,10 +2264,13 @@ let thawHand (regions: (Item * int) array array) (items: (Item * int) array) =
     if seen.Count <> regions.Length then Kernel.fail "an optimizer pass dropped hand-written code"
     out.ToArray()
 
-/// The passes of `p`; the compiler's temporaries are X words `first` up to `temps`.
-let runWith (p: Passes) (first: int) (temps: int) (items: Item array) (lines: int array) =
+/// The passes of `p`; the compiler's temporaries are X words `first` up to `temps` and Y words
+/// `yFirst` up to `yTemps`.
+let runWithY (p: Passes) (first: int) (temps: int) (yFirst: int) (yTemps: int) (items: Item array) (lines: int array) =
   let frozen, regions = freezeHand (Array.zip items lines)
   let mutable cur = frozen
+  let yf, yt = if first < 64 then yFirst, yTemps else 0, 0
+  let yLim = if first >= 64 && yTemps > yFirst then yFirst else 64
   // a pass's rewrite, kept when it is no worse (when the passes are guarded)
   let step (on: bool) (pass: (Item * int) array -> (Item * int) array) =
     if on then
@@ -2233,34 +2279,42 @@ let runWith (p: Passes) (first: int) (temps: int) (items: Item array) (lines: in
   for _ in 1 .. 3 do
     step p.forward forward
     step p.copyForward copyForward
-    step p.deadTemps (deadTempsFrom first temps)
+    step p.deadTemps (deadTempsFromY first temps yf yt)
   for _ in 1 .. 2 do
     step p.accCopies (forwardWith true true)
     step p.copyForward copyForward
-    step p.deadTemps (deadTempsFrom first temps)
-  step p.joins (joinAccumulators first temps)
-  if p.joins then step p.deadTemps (deadTempsFrom first temps)
-  step p.promote (promote first temps)
-  step p.assign (assign first temps)
+    step p.deadTemps (deadTempsFromY first temps yf yt)
+  step p.joins (joinAccumulatorsY first temps yf yt)
+  if p.joins then step p.deadTemps (deadTempsFromY first temps yf yt)
+  step p.promote (promoteY first temps yf yt)
+  step p.assign (assignY first temps yf yt)
   for _ in 1 .. 2 do
     step p.forward (forwardWith p.accCopies false)
     step p.copyForward copyForward
-    step p.deadTemps (deadTempsFrom first temps)
-  step p.hoist (hoistFrom first temps)
+    step p.deadTemps (deadTempsFromY first temps yf yt)
+  step p.hoist (hoistFromY first temps yf yt)
   step p.copyForward copyForward
-  step p.walk walk
+  step p.walk (walkWith yLim)
   step p.pack pack
   step p.rotate (rotate >> (if p.pack then pack else id))
   cur <- thawHand regions cur
   cur <- fixLoops cur
   Array.map fst cur, Array.map snd cur
 
-/// The passes of `level`; the compiler's temporaries are X words `first` up to `temps`.
-let runFrom (level: Level) (first: int) (temps: int) (items: Item array) (lines: int array) =
+let runWith (p: Passes) (first: int) (temps: int) (items: Item array) (lines: int array) =
+  runWithY p first temps 0 0 items lines
+
+/// The passes of `level`; the compiler's temporaries are X words `first` up to `temps` and Y
+/// words `yFirst` up to `yTemps`.
+let runFromY (level: Level) (first: int) (temps: int) (yFirst: int) (yTemps: int) (items: Item array) (lines: int array) =
   match level with
   | Direct -> items, lines
-  | Peephole -> runWith Passes.all first temps items lines
-  | Chosen p -> runWith p first temps items lines
+  | Peephole -> runWithY Passes.all first temps yFirst yTemps items lines
+  | Chosen p -> runWithY p first temps yFirst yTemps items lines
+
+/// The passes of `level`; the compiler's temporaries are X words `first` up to `temps`.
+let runFrom (level: Level) (first: int) (temps: int) (items: Item array) (lines: int array) =
+  runFromY level first temps 0 0 items lines
 
 /// The passes of `level`, for a kernel without [<XMemory>] state: temporaries are X words below `temps`.
 let run (level: Level) (temps: int) (items: Item array) (lines: int array) = runFrom level 0 temps items lines
@@ -2319,7 +2373,7 @@ let compileChoosingWith (handOff: Set<string>) (policy: Subroutines) (limit: int
   let attempt (chosen: Set<string>) (unswitchMax: int option) =
     Compile.generateIrWith handOff chosen unswitchMax target ik
     |> Result.map (fun (c, costs) ->
-      let items, lines = runFrom level c.layout.xWorkset c.xWorkset c.items c.lines
+      let items, lines = runFromY level c.layout.xWorkset c.xWorkset c.layout.yWorkset c.yWorkset c.items c.lines
       { c with items = items; lines = lines }, costs)
   let fits (c: Compile.Compiled) =
     match limit, Compile.size c with

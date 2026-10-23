@@ -432,8 +432,13 @@ let rec normalize (e: Expr) : Expr =
         | _ -> fail $"cannot reduce the application {e}"
       bind f args
   | ExprShape.ShapeVar _ -> e
-  | ExprShape.ShapeLambda(v, body) -> Expr.Lambda(v, normalize body)
-  | ExprShape.ShapeCombination(shape, xs) -> ExprShape.RebuildShapeCombination(shape, xs |> List.map normalize)
+  | ExprShape.ShapeLambda(v, body) ->
+    let body' = normalize body
+    if obj.ReferenceEquals(body, body') then e else Expr.Lambda(v, body')
+  | ExprShape.ShapeCombination(shape, xs) ->
+    let xs' = List.map normalize xs
+    if List.forall2 (fun (a: Expr) b -> obj.ReferenceEquals(a, b)) xs xs' then e
+    else ExprShape.RebuildShapeCombination(shape, xs')
 
 /// Whether `e` (the helpers it calls included) may assign a record field named `name`.
 let writesField (name: string) (e: Expr) =
@@ -2662,6 +2667,83 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
     // Frac.ofRaw i (a counter word); anything else is refused
     // region indexes affine in the index (inv + c·v + d, through lets, helpers, sums and shifts):
     // grouped by region, invariant part and stride, an address register each
+    let rec hasRegionAccess (seen: HashSet<Member>) (e: Expr) =
+      match e with
+      | Intr "region.read" _ | Intr "region.write" _ -> true
+      | Call(None, mi, args) ->
+        List.exists (hasRegionAccess seen) args
+        || (intrinsic (resolve mi args) = None && not (isSub ctx mi)
+            && match reflected mi with Some def when seen.Add mi -> hasRegionAccess seen def | _ -> false)
+      | ExprShape.ShapeVar _ -> false
+      | ExprShape.ShapeLambda(_, b) -> hasRegionAccess seen b
+      | ExprShape.ShapeCombination(_, xs) -> List.exists (hasRegionAccess seen) xs
+    let freshenInlined (e: Expr) : Expr =
+      let rec go (env: Map<Var, Var>) (e: Expr) : Expr =
+        let rebuild node = Expr.Make(node, e.Type, e.Range)
+        let freshVar (u: Var) =
+          let u' = u.Fresh()
+          match ctx.scores.TryGetValue u with
+          | true, sc -> ctx.scores[u'] <- sc
+          | _ -> ()
+          u', env.Add(u, u')
+        match e.Node with
+        | NVar u ->
+          match env.TryFind u with
+          | Some u' -> rebuild (NVar u')
+          | None -> e
+        | NLambda(u, b) ->
+          let u', env' = freshVar u
+          rebuild (NLambda(u', go env' b))
+        | NLet(u, x, b) ->
+          let x' = go env x
+          let u', env' = freshVar u
+          rebuild (NLet(u', x', go env' b))
+        | NVarSet(u, x) ->
+          let u' = defaultArg (env.TryFind u) u
+          rebuild (NVarSet(u', go env x))
+        | NFor(u, lo, hi, b) ->
+          let lo', hi' = go env lo, go env hi
+          let u', env' = freshVar u
+          rebuild (NFor(u', lo', hi', go env' b))
+        | _ ->
+          match e with
+          | ExprShape.ShapeCombination(shape, xs) ->
+            let xs' = List.map (go env) xs
+            if List.forall2 (fun (a: Expr) b -> obj.ReferenceEquals(a, b)) xs xs' then e
+            else ExprShape.RebuildShapeCombination(shape, xs')
+          | _ -> e
+      go Map.empty e
+    let depVars = HashSet<Var>([ v ])
+    let mutable depChanged = true
+    while depChanged do
+      depChanged <- false
+      body |> visit (fun e ->
+        match e with
+        | Let(w, x, _) when not w.IsMutable && not (depVars.Contains w) ->
+          if x.GetFreeVars() |> Seq.exists depVars.Contains then
+            depVars.Add w |> ignore
+            depChanged <- true
+        | _ -> ()
+        true)
+    let rec expandRegionCalls (e: Expr) : Expr =
+      match e with
+      | Call(None, mi, args)
+          when intrinsic (resolve mi args) = None && not (isSub ctx mi)
+               && (match reflected mi with Some def -> hasRegionAccess (HashSet()) def | None -> false)
+               && (args |> List.exists (fun a -> a.GetFreeVars() |> Seq.exists depVars.Contains)) ->
+        let args' = List.map expandRegionCalls args
+        let exp = freshenInlined (inlined mi args')
+        let exp = if exp.Range.IsNone && e.Range.IsSome then exp.WithRange e.Range else exp
+        expandRegionCalls exp
+      | ExprShape.ShapeVar _ -> e
+      | ExprShape.ShapeLambda(u, b) ->
+        let b' = expandRegionCalls b
+        if obj.ReferenceEquals(b, b') then e else Expr.Lambda(u, b')
+      | ExprShape.ShapeCombination(shape, xs) ->
+        let xs' = List.map expandRegionCalls xs
+        if List.forall2 (fun (a: Expr) b -> obj.ReferenceEquals(a, b)) xs xs' then e
+        else ExprShape.RebuildShapeCombination(shape, xs')
+    let body = expandRegionCalls body
     let assignedIn = HashSet<Var>()
     let boundIn = HashSet<Var>()
     let lets = Dictionary<Var, Expr>()
@@ -2704,13 +2786,13 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
           affine env (inlined mi args)
         | _ -> None
     let consumed = HashSet<Expr>(HashIdentity.Reference)
-    let groups = Dictionary<string, Region * Expr option * int * int>()   // key -> region, inv, stride, register (-1: none yet)
-    let accessAt = Dictionary<Expr, string * int>(HashIdentity.Reference) // access -> group key, displacement
+    let groups = Dictionary<string, Region * Expr option * int * int * int>() // key -> region, inv, stride, baseDisp, register (-1: none yet)
+    let accessAt = Dictionary<Expr, string * int>(HashIdentity.Reference)     // access -> group key, displacement
     let take (e: Expr) (r: Expr) (i: Expr) =
       match constObject ctx r, affine Map.empty i with
       | Some(:? Region as region), Some(inv, c, d) when c <> 0 ->
         let key = $"{region.name}|{c}|%A{inv}"
-        if not (groups.ContainsKey key) then groups[key] <- (region, inv, c, -1)
+        if not (groups.ContainsKey key) then groups[key] <- (region, inv, c, 0, -1)
         accessAt[e] <- (key, d)
         consumed.Add i |> ignore
         true
@@ -2749,8 +2831,13 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
           match e with
           | Let(w, x, b) when skipped.Contains w -> (drop b).Substitute(fun u -> if u = w then Some(drop x) else None)
           | ExprShape.ShapeVar _ -> e
-          | ExprShape.ShapeLambda(u, b) -> Expr.Lambda(u, drop b)
-          | ExprShape.ShapeCombination(o, xs) -> ExprShape.RebuildShapeCombination(o, List.map drop xs)
+          | ExprShape.ShapeLambda(u, b) ->
+            let b' = drop b
+            if obj.ReferenceEquals(b, b') then e else Expr.Lambda(u, b')
+          | ExprShape.ShapeCombination(o, xs) ->
+            let xs' = List.map drop xs
+            if List.forall2 (fun (a: Expr) b -> obj.ReferenceEquals(a, b)) xs xs' then e
+            else ExprShape.RebuildShapeCombination(o, xs')
         let rewritten = drop body
         consumed.Clear(); accessAt.Clear(); groups.Clear()
         rewritten |> visit (fun e ->
@@ -2832,9 +2919,101 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
                     $"End a cursor before the loop, or index with a word counted when running: s.{name}[Frac.index (Frac.ofRaw {v.Name})] (r0 and n0, no register held)") ]
       // the affine groups' registers, after the arrays' (which must have one): all or none, and
       // with none the indexes and lets are compiled as they are (scanned again for a counter)
+      let unconditional = HashSet<Expr>(HashIdentity.Reference)
+      let order = ResizeArray<Expr * int>()
+      let mutable stepId = 0
+      let rec collectUncond (inCond: bool) (e: Expr) =
+        match e with
+        | Intr "region.read" [ _; _ ] when accessAt.ContainsKey e ->
+          if not inCond then unconditional.Add e |> ignore
+          order.Add(e, stepId)
+        | Intr "region.write" [ _; _; v ] ->
+          collectUncond inCond v
+          if accessAt.ContainsKey e then
+            stepId <- stepId + 1
+            if not inCond then unconditional.Add e |> ignore
+            order.Add(e, stepId)
+        | _ when consumed.Contains e -> ()
+        | _ ->
+          match e.Node with
+          | NVar _ | NValue _ -> ()
+          | NLambda(_, b) -> collectUncond true b
+          | NApplication(f, a) -> collectUncond inCond f; collectUncond inCond a
+          | NCall(o, _, args) | NPropertyGet(o, _, args) ->
+            Option.iter (collectUncond inCond) o; List.iter (collectUncond inCond) args
+          | NPropertySet(o, _, idx, x) ->
+            Option.iter (collectUncond inCond) o; List.iter (collectUncond inCond) idx; collectUncond inCond x
+          | NLet(_, x, b) ->
+            collectUncond inCond x
+            stepId <- stepId + 1
+            collectUncond inCond b
+          | NSequential(a, b) ->
+            collectUncond inCond a
+            stepId <- stepId + 1
+            collectUncond inCond b
+          | NIfThenElse(c, t, f) ->
+            collectUncond inCond c; collectUncond true t; collectUncond true f
+          | NVarSet(_, x) -> collectUncond inCond x
+          | NFor(_, lo, hi, b) ->
+            collectUncond inCond lo; collectUncond inCond hi; collectUncond true b
+          | NWhile(c, b) -> collectUncond true c; collectUncond true b
+          | NUnionCaseTest(o, _) -> collectUncond inCond o
+          | NTuple es | NOther(_, es) -> List.iter (collectUncond inCond) es
+      if groups.Count > 0 then
+        collectUncond false body
+        let counts = Dictionary<Expr, int>(HashIdentity.Reference)
+        for e, _ in order do
+          counts[e] <- (match counts.TryGetValue e with true, n -> n | _ -> 0) + 1
+        for KeyValue(e, n) in counts do
+          if n > 1 then unconditional.Remove e |> ignore
       let affineRegs =
         if groups.Count > 0 && ctx.freeRegs.Length >= groups.Count then
-          [ for KeyValue(key, (region, inv, c, _)) in Array.ofSeq groups do
+          let indRegs = inductionsOf ctx body |> List.sumBy (fun (_, _, rs) -> rs.Length)
+          let mutable spare = ctx.freeRegs.Length - groups.Count - indRegs
+          for KeyValue(key, (region, inv, c, _, _)) in Array.ofSeq groups do
+            let accs =
+              [ for e, s in order do
+                  match accessAt.TryGetValue e with
+                  | true, (k, d) when k = key -> yield e, d, s
+                  | _ -> () ]
+            let totalInGroup = accessAt.Values |> Seq.filter (fun (k, _) -> k = key) |> Seq.length
+            let allUncond =
+              accs.Length = totalInGroup
+              && (accs |> List.forall (fun (e, _, _) -> unconditional.Contains e))
+              && (accs |> List.map (fun (_, _, s) -> s) |> List.pairwise |> List.forall (fun (s1, s2) -> s1 < s2))
+            let isUnitSeq =
+              allUncond && c > 1 && accs.Length = c
+              && (let _, d0, _ = accs.Head in (accs |> List.map (fun (_, d, _) -> d - d0)) = [ 0 .. c - 1 ])
+            if isUnitSeq then
+              let _, d0, _ = accs.Head
+              groups[key] <- (region, inv, c, d0, -1)
+              for e, d, _ in accs do accessAt[e] <- (key, d - d0)
+            else
+              let allEntries =
+                [ for KeyValue(e, (k, d)) in Array.ofSeq accessAt do
+                    if k = key then yield e, d ]
+              let ds =
+                allEntries
+                |> List.groupBy snd
+                |> List.sortByDescending (fun (d, es) -> es.Length, (if d = 0 then 1 else 0), -abs d)
+                |> List.map fst
+              match ds with
+              | [] -> ()
+              | d0 :: rest when (allUncond && (c = 1 || c = -1)) || not rest.IsEmpty ->
+                groups[key] <- (region, inv, c, d0, -1)
+                for e, d in allEntries do
+                  if d = d0 then accessAt[e] <- (key, 0)
+                  else accessAt[e] <- (key, d - d0)
+                if count >= 4 then
+                  for dOther in rest do
+                    if spare > 0 then
+                      let newKey = $"{key}|d={dOther}"
+                      groups[newKey] <- (region, inv, c, dOther, -1)
+                      for e, d in allEntries do
+                        if d = dOther then accessAt[e] <- (newKey, 0)
+                      spare <- spare - 1
+              | _ -> ()
+          [ for KeyValue(key, (region, inv, c, d0, _)) in Array.ofSeq groups do
               let reg =
                 match ctx.freeRegs |> List.tryFind (fun r -> (r >= 4) = (region.bank = YMemory)) with
                 | Some r -> r
@@ -2843,22 +3022,45 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
               match inv with
               | Some e -> genAcc ctx (Expr.Call(Ir.intrinsic "acc.ofFrac", [ e ]))
               | None -> emit ctx (move (immL 0) a)
-              if c * lo <> 0 then emit ctx (add (immL ((c * lo) &&& 0xffffff)) a)
+              if c * lo + d0 <> 0 then emit ctx (add (immL ((c * lo + d0) &&& 0xffffff)) a)
               importHere ctx region.name region.abiSymbol (move (immL 0) x0)
               emit ctx (add x0 a)
               emit ctx (move a1 (R reg))
-              groups[key] <- (region, inv, c, reg)
-              yield reg, c ]
+              groups[key] <- (region, inv, c, d0, reg)
+              let sp = match region.bank with XMemory -> Space.X | YMemory -> Space.Y
+              let accs =
+                [ for e, s in order do
+                    match accessAt.TryGetValue e with
+                    | true, (k, d) when k = key -> yield e, d, s
+                    | _ -> () ]
+              let totalInGroup = accessAt.Values |> Seq.filter (fun (k, _) -> k = key) |> Seq.length
+              let allUncond =
+                accs.Length = totalInGroup && totalInGroup > 0
+                && (accs |> List.forall (fun (e, _, _) -> unconditional.Contains e))
+                && (accs |> List.map (fun (_, _, s) -> s) |> List.pairwise |> List.forall (fun (s1, s2) -> s1 < s2))
+              if allUncond && (c = 1 || c = -1) && (accs |> List.forall (fun (_, d, _) -> d = 0)) then
+                for idx in 0 .. accs.Length - 1 do
+                  let e, _, _ = accs[idx]
+                  let ea =
+                    if idx = accs.Length - 1 then (if c = 1 then PostInc reg else PostDec reg)
+                    else Ind reg
+                  ctx.affineAt[e] <- { space = sp; ea = ea }
+                yield reg, c, false
+              elif allUncond && c > 1 && accs.Length = c && (accs |> List.map (fun (_, d, _) -> d)) = [ 0 .. c - 1 ] then
+                for e, _, _ in accs do
+                  ctx.affineAt[e] <- { space = sp; ea = PostInc reg }
+                yield reg, c, false
+              else
+                for KeyValue(e, (k, d)) in accessAt do
+                  if k = key then
+                    ctx.affineAt[e] <- { space = sp; ea = if d = 0 then Ind reg else Disp(reg, Operand.num d) }
+                yield reg, c, true ]
         else
           if groups.Count > 0 then
             consumed.Clear(); accessAt.Clear()
             skipped <- Set.empty
             scan body
           []
-      for KeyValue(e, (key, d)) in accessAt do
-        let region, _, _, reg = groups[key]
-        ctx.affineAt[e] <- { space = (match region.bank with XMemory -> Space.X | YMemory -> Space.Y)
-                             ea = if d = 0 then Ind reg else Disp(reg, Operand.num d) }
       let counter =
         if counted then
           let h = alloc ctx TFrac
@@ -2902,7 +3104,7 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
       ctx.deepest <- max ctx.deepest ctx.depth
       thenRun ctx body (fun () -> genStmt ctx body)     // the body runs again
       ctx.depth <- ctx.depth - 2
-      let stepped = not regs.IsEmpty || counter.IsSome || not affineRegs.IsEmpty
+      let stepped = not regs.IsEmpty || counter.IsSome || (affineRegs |> List.exists (fun (_, _, s) -> s))
       // DO needs an instruction to end on: the body's end cannot be a branch target
       let last = if ctx.items.Count > first then Some ctx.items[ctx.items.Count - 1] else None
       match last with
@@ -2911,8 +3113,11 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
       for reg in regs do
         emit ctx (update (inc (R reg)))
         if longRegs.Contains reg then emit ctx (update (inc (R reg)))
-      for reg, c in affineRegs do
-        if c = 1 then emit ctx (update (inc (R reg))) else emit ctx (lua (Disp(reg, Operand.num c)) (R reg))
+      for reg, c, needsStep in affineRegs do
+        if needsStep then
+          if c = 1 then emit ctx (update (inc (R reg)))
+          elif c = -1 then emit ctx (update (dec (R reg)))
+          else emit ctx (lua (Disp(reg, Operand.num c)) (R reg))
       match counter with
       | Some h ->
         emit ctx (move (at h 0) a)
@@ -2925,7 +3130,7 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
       ctx.counters <- savedCounters
       ctx.inductions <- savedInductions
       for e in accessAt.Keys do ctx.affineAt.Remove e |> ignore
-      ctx.freeRegs <- (affineRegs |> List.map fst) @ ctx.freeRegs
+      ctx.freeRegs <- (affineRegs |> List.map (fun (r, _, _) -> r)) @ ctx.freeRegs
       for w, c, taken in stepLocals do
         ctx.freeRegs <- taken @ ctx.freeRegs
         let k = c * count

@@ -272,28 +272,65 @@ and [<Sealed>] Expr(node: Node, ty: IrTy, range: Range option) =
         | NValue _ -> e
         | NLambda(v, b) ->
           let v', renames' = bind v
-          rebuild (NLambda(v', go renames' b))
-        | NApplication(a, b) -> rebuild (NApplication(go renames a, go renames b))
-        | NCall(o, m, args) -> rebuild (NCall(Option.map (go renames) o, m, List.map (go renames) args))
-        | NPropertyGet(o, m, args) -> rebuild (NPropertyGet(Option.map (go renames) o, m, List.map (go renames) args))
-        | NPropertySet(o, m, idx, x) -> rebuild (NPropertySet(Option.map (go renames) o, m, List.map (go renames) idx, go renames x))
+          let b' = go renames' b
+          if obj.ReferenceEquals(v, v') && obj.ReferenceEquals(b, b') then e else rebuild (NLambda(v', b'))
+        | NApplication(a, b) ->
+          let a', b' = go renames a, go renames b
+          if obj.ReferenceEquals(a, a') && obj.ReferenceEquals(b, b') then e else rebuild (NApplication(a', b'))
+        | NCall(o, m, args) ->
+          let o' = Option.map (go renames) o
+          let args' = List.map (go renames) args
+          let sameO = match o, o' with Some x, Some y -> obj.ReferenceEquals(x, y) | _ -> true
+          if sameO && List.forall2 (fun (x: Expr) y -> obj.ReferenceEquals(x, y)) args args' then e
+          else rebuild (NCall(o', m, args'))
+        | NPropertyGet(o, m, args) ->
+          let o' = Option.map (go renames) o
+          let args' = List.map (go renames) args
+          let sameO = match o, o' with Some x, Some y -> obj.ReferenceEquals(x, y) | _ -> true
+          if sameO && List.forall2 (fun (x: Expr) y -> obj.ReferenceEquals(x, y)) args args' then e
+          else rebuild (NPropertyGet(o', m, args'))
+        | NPropertySet(o, m, idx, x) ->
+          let o' = Option.map (go renames) o
+          let idx' = List.map (go renames) idx
+          let x' = go renames x
+          let sameO = match o, o' with Some a, Some b -> obj.ReferenceEquals(a, b) | _ -> true
+          if sameO && obj.ReferenceEquals(x, x') && List.forall2 (fun (a: Expr) b -> obj.ReferenceEquals(a, b)) idx idx' then e
+          else rebuild (NPropertySet(o', m, idx', x'))
         | NLet(v, x, b) ->
           let x' = go renames x
           let v', renames' = bind v
-          rebuild (NLet(v', x', go renames' b))
-        | NSequential(a, b) -> rebuild (NSequential(go renames a, go renames b))
-        | NIfThenElse(c, t, f) -> rebuild (NIfThenElse(go renames c, go renames t, go renames f))
+          let b' = go renames' b
+          if obj.ReferenceEquals(v, v') && obj.ReferenceEquals(x, x') && obj.ReferenceEquals(b, b') then e
+          else rebuild (NLet(v', x', b'))
+        | NSequential(a, b) ->
+          let a', b' = go renames a, go renames b
+          if obj.ReferenceEquals(a, a') && obj.ReferenceEquals(b, b') then e else rebuild (NSequential(a', b'))
+        | NIfThenElse(c, t, f) ->
+          let c', t', f' = go renames c, go renames t, go renames f
+          if obj.ReferenceEquals(c, c') && obj.ReferenceEquals(t, t') && obj.ReferenceEquals(f, f') then e
+          else rebuild (NIfThenElse(c', t', f'))
         | NVarSet(v, x) ->
           let v' = match Map.tryFind v renames with Some v' -> v' | None -> v
-          rebuild (NVarSet(v', go renames x))
+          let x' = go renames x
+          if obj.ReferenceEquals(v, v') && obj.ReferenceEquals(x, x') then e else rebuild (NVarSet(v', x'))
         | NFor(v, lo, hi, b) ->
           let lo', hi' = go renames lo, go renames hi
           let v', renames' = bind v
-          rebuild (NFor(v', lo', hi', go renames' b))
-        | NWhile(c, b) -> rebuild (NWhile(go renames c, go renames b))
-        | NUnionCaseTest(o, c) -> rebuild (NUnionCaseTest(go renames o, c))
-        | NTuple es -> rebuild (NTuple(List.map (go renames) es))
-        | NOther(n, es) -> rebuild (NOther(n, List.map (go renames) es))
+          let b' = go renames' b
+          if obj.ReferenceEquals(v, v') && obj.ReferenceEquals(lo, lo') && obj.ReferenceEquals(hi, hi') && obj.ReferenceEquals(b, b') then e
+          else rebuild (NFor(v', lo', hi', b'))
+        | NWhile(c, b) ->
+          let c', b' = go renames c, go renames b
+          if obj.ReferenceEquals(c, c') && obj.ReferenceEquals(b, b') then e else rebuild (NWhile(c', b'))
+        | NUnionCaseTest(o, c) ->
+          let o' = go renames o
+          if obj.ReferenceEquals(o, o') then e else rebuild (NUnionCaseTest(o', c))
+        | NTuple es ->
+          let es' = List.map (go renames) es
+          if List.forall2 (fun (a: Expr) b -> obj.ReferenceEquals(a, b)) es es' then e else rebuild (NTuple es')
+        | NOther(n, es) ->
+          let es' = List.map (go renames) es
+          if List.forall2 (fun (a: Expr) b -> obj.ReferenceEquals(a, b)) es es' then e else rebuild (NOther(n, es'))
       go Map.empty this
 
   /// A readable form, for messages.
