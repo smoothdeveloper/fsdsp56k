@@ -59,6 +59,7 @@ type Facts() =
   let loaded = Dictionary<Reg, int>()     // a whole accumulator loaded from a word (a1 = v, a0 = 0, a2 its sign)
   let mutable next = 0
   let consts = Dictionary<int64, int>()
+  let signExts = Dictionary<int, int>()
 
   member _.Fresh() =
     next <- next + 1
@@ -78,6 +79,14 @@ type Facts() =
     | _ ->
       let id = this.Fresh()
       consts[v] <- id
+      id
+
+  member this.SignExt(v: int) =
+    match signExts.TryGetValue v with
+    | true, id -> id
+    | _ ->
+      let id = this.Fresh()
+      signExts[v] <- id
       id
 
   member _.Known(s: Slot) = ids.ContainsKey s
@@ -103,6 +112,7 @@ type Facts() =
   member _.Clear() =
     ids.Clear()
     loaded.Clear()
+    signExts.Clear()
 
   /// A data register holding value v, other than `except`.
   member _.Holder(v: int, except: Reg) =
@@ -116,7 +126,8 @@ let applyMoves (f: Facts) (alu: Alu option) (moves: Move array) =
   let reads =
     moves |> Array.map (fun m ->
       match m with
-      | Load(space, ea, _) -> workset space ea |> Option.map f.Id
+      | Load(space, ea, _) when space <> Space.L ->
+        Some(match workset space ea with Some s -> f.Id s | None -> f.Fresh())
       | Copy(src, _) when isWord src || src = A2 || src = B2 -> Some(f.Id(SReg src))
       | Store(src, _, _) when isWord src || src = A2 || src = B2 -> Some(f.Id(SReg src))
       // only long immediates and zero: a short one lands in the MSBs of a data register
@@ -146,6 +157,7 @@ let applyMoves (f: Facts) (alu: Alu option) (moves: Move array) =
       for r in Lower.eaWrites ea do f.WriteReg r
       match dst, reads[i] with
       | (A | B), Some v ->
+        f.Set(SReg(if dst = A then A2 else B2), f.SignExt v)
         f.Set(SReg(if dst = A then A1 else B1), v)
         f.Set(SReg(if dst = A then A0 else B0), f.Const 0L)
         f.SetLoaded(dst, v)
@@ -164,6 +176,7 @@ let applyMoves (f: Facts) (alu: Alu option) (moves: Move array) =
       f.WriteReg dst
       match dst, reads[i] with
       | (A | B), Some v ->
+        f.Set(SReg(if dst = A then A2 else B2), f.SignExt v)
         f.Set(SReg(if dst = A then A1 else B1), v)
         f.Set(SReg(if dst = A then A0 else B0), f.Const 0L)
         f.SetLoaded(dst, v)
@@ -174,13 +187,16 @@ let applyMoves (f: Facts) (alu: Alu option) (moves: Move array) =
 /// The registers a data ALU instruction outside the parallel class writes (None: not one).
 let aluWrites (instr: Instr) =
   match instr with
+  | AluImm(CmpI, _, _) -> Some []
   | AluImm(_, _, d) | ShiftImm(_, _, _, d) | ShiftReg(_, _, _, d) | MulImm(_, _, _, _, d)
   | MulSu(_, _, _, _, _, d) | Dmac(_, _, _, _, d) | MulI(_, _, _, _, d) | Div(_, d) | Inc d | Dec d -> Some [ Acc.reg d ]
   | IfCc(alu, _, _) -> Some(List.ofArray (Lower.aluWrites alu))
   | Tcc(_, alu, agu) -> Some([ for _, d in Option.toList alu -> Acc.reg d ] @ [ for _, r in Option.toList agu -> R r ])
   | Norm(r, d) -> Some [ Acc.reg d; R r ]
   | Clb(_, d) | Normf(_, d) -> Some [ Acc.reg d ]
-  | Nop -> Some []
+  | Lua(_, d) -> Some [ d ]
+  | BitOp(Btst, _, _) | CtrlImm(_, _, (Ccr | Mr | Omr)) | Rep(Count _) | Nop -> Some []
+  | BitOp(_, _, BitReg r) -> Some(List.ofArray (Lower.storage r))
   | _ -> None
 
 /// Value numbering over straight-line stretches: moves that change nothing are dropped, loads
@@ -188,7 +204,7 @@ let aluWrites (instr: Instr) =
 /// `accCopies`: an accumulator loaded from a word a data register holds is copied from the
 /// register instead (done last: earlier, the register's read would keep copyForward from
 /// removing the register's own load).
-let forwardWith (accCopies: bool) (items: (Item * int) array) =
+let forwardWith (accCopies: bool) (keepTriples: bool) (items: (Item * int) array) =
   let f = Facts()
   let out = ResizeArray<Item * int>()
   let mutable i = 0
@@ -201,8 +217,8 @@ let forwardWith (accCopies: bool) (items: (Item * int) array) =
     | _ -> None
   while i < items.Length do
     let it, line = items[i]
-    // an Acc's three words reloaded into the accumulator they were stored from
-    let triple =
+    // an Acc's three words reloaded into the accumulator they were stored from (or the other one)
+    let isTload, triple, otherTriple =
       if i + 2 < items.Length then
         match single (fst items[i]), single (fst items[i + 1]), single (fst items[i + 2]) with
         | Some(Load(s1, e1, ((A | B) as acc))), Some(Load(s2, e2, lo)), Some(Load(s3, e3, ext))
@@ -210,12 +226,33 @@ let forwardWith (accCopies: bool) (items: (Item * int) array) =
           match workset s1 e1, workset s2 e2, workset s3 e3 with
           | Some m1, Some m2, Some m3 ->
             let hi = if acc = A then A1 else B1
+            let other = if acc = A then B else A
+            let ohi = if other = A then A1 else B1
+            let olo = if other = A then A0 else B0
+            let oext = if other = A then A2 else B2
             let same r m = match f.Get(SReg r), f.Get m with | Some a, Some b -> a = b | _ -> false
-            same hi m1 && same lo m2 && same ext m3
-          | _ -> false
-        | _ -> false
-      else false
+            let inOther =
+              if not keepTriples && same ohi m1 && same olo m2 && same oext m3 then
+                Some(other, if acc = A then Acc.A else Acc.B)
+              else None
+            true, same hi m1 && same lo m2 && same ext m3, inOther
+          | _ -> false, false, None
+        | _ -> false, false, None
+      else false, false, None
     if triple then i <- i + 3
+    elif otherTriple.IsSome then
+      let src, dst = otherTriple.Value
+      let alu = Some(Binary(AluOp.Tfr, src, dst))
+      applyMoves f alu [||]
+      out.Add(Op(Par(alu, [||])), line)
+      i <- i + 3
+    elif keepTriples && isTload then
+      for j in i .. i + 2 do
+        match fst items[j] with
+        | Op(Par(alu, moves)) -> applyMoves f alu moves
+        | _ -> ()
+        out.Add items[j]
+      i <- i + 3
     else
       match it with
       | Label _ | Dc _ | Ds _ | Org _ | Equ _ ->
@@ -234,15 +271,15 @@ let forwardWith (accCopies: bool) (items: (Item * int) array) =
       | Op(Par(alu, moves)) ->
         let keep =
           match alu, moves with
-          | None, [| Load(space, ea, dst) |] when isWord dst ->
+          | None, [| Load(space, ea, dst) |] when isWord dst || dst = A2 || dst = B2 ->
             match workset space ea |> Option.bind f.Get, f.Get(SReg dst) with
             | Some v, Some w when v = w -> None                                   // already there
-            | Some v, _ ->
+            | Some v, _ when isWord dst ->
               match f.Holder(v, dst) with
               | Some r -> Some(Op(Par(None, [| Copy(r, dst) |])))                  // from a register
               | None -> Some it
             | _ -> Some it
-          | None, [| Load(space, ea, ((A | B) as acc)) |] ->
+          | None, [| Load(space, ea, ((A | B) as acc)) |] when not (keepTriples && isTload) ->
             match workset space ea |> Option.bind f.Get, f.Loaded acc with
             | Some v, Some w when v = w -> None
             | Some v, _ ->
@@ -259,6 +296,10 @@ let forwardWith (accCopies: bool) (items: (Item * int) array) =
             else Some it
           | None, [| Copy(src, dst) |] when isWord src && isWord dst ->
             match f.Get(SReg src), f.Get(SReg dst) with
+            | Some v, Some w when v = w -> None
+            | _ -> Some it
+          | None, [| Copy(src, ((A | B) as acc)) |] when isWord src ->
+            match f.Get(SReg src), f.Loaded acc with
             | Some v, Some w when v = w -> None
             | _ -> Some it
           | None, [| Store(src, space, ea) |] when isWord src || src = A2 || src = B2 ->
@@ -300,7 +341,7 @@ let forwardWith (accCopies: bool) (items: (Item * int) array) =
         i <- i + 1
   out.ToArray()
 
-let forward = forwardWith false
+let forward = forwardWith false true
 
 /// Successors of each item: the next one, branch targets, a DO loop's last instruction back to
 /// the loop's first. None when the program jumps somewhere this cannot follow.
@@ -487,13 +528,24 @@ let readsOf (instr: Instr) =
   match instr with
   | Par(alu, moves) ->
     Some(Array.append (alu |> Option.map Lower.aluReads |> Option.defaultValue [||]) (Array.collect Lower.moveReads moves))
-  | MulI(_, _, _, src, d) | MulImm(_, _, src, _, d) -> Some [| src; Acc.reg d |]
-  | MulSu(_, _, _, s1, s2, d) | Dmac(_, _, s1, s2, d) -> Some [| s1; s2; Acc.reg d |]
+  | MulI(kind, _, _, src, d) | MulImm(kind, _, src, _, d) ->
+    Some(match kind with Mac | Macr -> [| src; Acc.reg d |] | _ -> [| src |])
+  | MulSu(kind, _, _, s1, s2, d) ->
+    Some(match kind with Mac | Macr -> [| s1; s2; Acc.reg d |] | _ -> [| s1; s2 |])
+  | Dmac(_, _, s1, s2, d) -> Some [| s1; s2; Acc.reg d |]
   | Div(src, d) | Normf(src, d) -> Some [| src; Acc.reg d |]
   | Clb(src, _) -> Some [| Acc.reg src |]
-  | AluImm(_, _, d) | ShiftImm(_, _, _, d) | Inc d | Dec d -> Some [| Acc.reg d |]
+  | AluImm(_, _, d) | Inc d | Dec d -> Some [| Acc.reg d |]
+  | ShiftImm((ShLsl | ShLsr), _, s, d) -> Some([| Acc.reg s; Acc.reg d |] |> Array.distinct)
+  | ShiftImm(_, _, s, _) -> Some [| Acc.reg s |]
+  | ShiftReg((ShLsl | ShLsr), r, s, d) -> Some([| r; Acc.reg s; Acc.reg d |] |> Array.distinct)
   | ShiftReg(_, r, s, _) -> Some [| r; Acc.reg s |]
-  | Nop -> Some [||]
+  | Lua(ea, _) -> Some(Lower.eaRegs ea)
+  | BitOp(_, _, BitReg r) -> Some(Lower.storage r)
+  | BitOp(Btst, _, BitMem(_, ea)) -> Some(Lower.eaRegs ea)
+  | CtrlImm(_, _, (Ccr | Mr | Omr)) | Rep(Count _) | Nop -> Some [||]
+  | Rep(FromReg r) -> Some(Lower.storage r)
+  | Rep(FromMem(_, ea)) -> Some(Lower.eaRegs ea)
   | _ -> None
 
 let writesOf (instr: Instr) =
@@ -502,8 +554,32 @@ let writesOf (instr: Instr) =
     Some(Array.append (alu |> Option.map Lower.aluWrites |> Option.defaultValue [||]) (Array.collect Lower.moveWrites moves))
   | i -> aluWrites i |> Option.map List.toArray
 
+/// Whether `instr` overwrites every part of `t`.
+let writesWhole (t: Reg) (instr: Instr) =
+  let covers (r: Reg) = parts t |> List.forall (fun p -> List.contains p (parts r))
+  let aluWhole (a: Alu) =
+    match a with
+    | Binary(AluOp.Tfr, _, d) | Unary(AluUnary.Clr, d) | Mul((Mpy | Mpyr), _, _, _, d) -> covers (Acc.reg d)
+    | _ -> false
+  match instr with
+  | Par(alu, moves) ->
+    Option.exists aluWhole alu
+    || (moves |> Array.exists (function Load(_, _, r) | Copy(_, r) | Imm(_, r) -> covers r | _ -> false))
+  | MulI((Mpy | Mpyr), _, _, _, d) | MulImm((Mpy | Mpyr), _, _, _, d)
+  | MulSu((Mpy | Mpyr), _, _, _, _, d) | Clb(_, d)
+  | ShiftImm((ShAsl | ShAsr), _, _, d) | ShiftReg((ShAsl | ShAsr), _, _, d) -> covers (Acc.reg d)
+  | _ -> false
+
+/// The first item of the subroutines (`SUB_...`), or the end when there are none: an `rts` before
+/// it returns from an entry (`INIT`, `TRIG`, `RENDER`), which returns nothing in registers; an
+/// `rts` from there on returns a subroutine's result in `a` or `x0`.
+let firstSubroutine (its: Item array) =
+  its |> Array.tryFindIndex (function Label l -> l.StartsWith "SUB_" | _ -> false) |> Option.defaultValue its.Length
+
 /// Whether `r` is overwritten before anything reads it, from item `from` on.
 let deadAfter (items: (Item * int) array) (from: int) (r: Reg) =
+  let its = Array.map fst items
+  let firstSub = firstSubroutine its
   let control (instr: Instr) =
     match instr with
     | Branch((Bra | Bcc _), _) | Jump((Jmp | Jcc _), _) | Loop(_, Count _, _) | Enddo | Nop -> true
@@ -516,6 +592,7 @@ let deadAfter (items: (Item * int) array) (from: int) (r: Reg) =
     else
       match fst items[k] with
       | Comment _ -> straight (k + 1)
+      | Op Rts -> Some(k < firstSub || not (overlap r A || overlap r X0))
       | Op instr ->
         match readsOf instr, writesOf instr with
         | Some rs, Some ws ->
@@ -529,7 +606,7 @@ let deadAfter (items: (Item * int) array) (from: int) (r: Reg) =
   | None ->
     if from < 0 || from >= items.Length then false
     else
-      match successors (Array.map fst items) with
+      match successors its with
       | None -> false
       | Some succ ->
         let seen = HashSet<int>()
@@ -543,6 +620,7 @@ let deadAfter (items: (Item * int) array) (from: int) (r: Reg) =
             else for nx in succ[k] do if seen.Add nx then todo.Push nx
           match fst items[k] with
           | Comment _ | Label _ -> step ()
+          | Op Rts -> if k >= firstSub && (overlap r A || overlap r X0) then dead <- false
           | Op instr when control instr -> step ()
           | Op instr ->
             match readsOf instr, writesOf instr with
@@ -559,6 +637,7 @@ let copyForward (items: (Item * int) array) =
   let cur = Array.copy items
   let dropped = HashSet<int>()
   let its = Array.map fst cur
+  let firstSub = firstSubroutine its
   let succ = successors its
   let control (instr: Instr) =
     match instr with
@@ -574,6 +653,7 @@ let copyForward (items: (Item * int) array) =
       else
         match (if k = put then rep else fst cur[k]) with
         | Comment _ -> straight (k + 1)
+        | Op Rts -> Some(k < firstSub || not (overlap r A || overlap r X0))
         | Op instr ->
           match readsOf instr, writesOf instr with
           | Some rs, Some ws ->
@@ -603,6 +683,7 @@ let copyForward (items: (Item * int) array) =
             else
               match (if k = put then rep else fst cur[k]) with
               | Comment _ | Label _ -> step ()
+              | Op Rts -> if k >= firstSub && (overlap r A || overlap r X0) then dead <- false
               | Op instr when control instr -> step ()
               | Op instr ->
                 match readsOf instr, writesOf instr with
@@ -1100,19 +1181,17 @@ let promote (first: int) (temps: int) (items: (Item * int) array) =
       match instr with
       | Branch((Bra | Bcc _), _) | Jump((Jmp | Jcc _), _) | Loop(_, Count _, _) | Enddo | Nop -> true
       | _ -> false
+    let firstSub = firstSubroutine its
     // what an item does to accumulator t: (reads, writes it whole, touches it at all)
     let effect (t: Reg) i =
       match its[i] with
+      | Op Rts -> let r = i >= firstSub && t = A in r, false, r
       | Op instr when control instr -> false, false, false
       | Op instr ->
         match readsOf instr, writesOf instr with
         | Some rs, Some ws ->
           let on (r: Reg) = Array.contains t (Lower.storage r)
-          let whole =
-            match instr with
-            | Par(None, moves) -> moves |> Array.exists (function Load(_, _, r) | Copy(_, r) | Imm(_, r) -> r = t | _ -> false)
-            | _ -> false
-          Array.exists on rs, whole, Array.exists on rs || Array.exists on ws
+          Array.exists on rs, writesWhole t instr, Array.exists on rs || Array.exists on ws
         | _ -> true, false, true
       | _ -> false, false, false
     let weights = tripWeights its
@@ -1175,11 +1254,11 @@ let promote (first: int) (temps: int) (items: (Item * int) array) =
 /// expressions; each definition with the uses it reaches (reaching definitions, per word) is a
 /// web, given a register when one is neither touched nor live anywhere the web is live:
 ///
-/// - a whole accumulator (a1, a0, a2 at k, k+1, k+2, three moves each way; reads of the high word
-///   alone too) in A or B: `tfr a,b`, `tfr b,a`, `move b1,x0`;
+/// - a whole accumulator (a1, a0, a2 at k, k+1, k+2, three moves each way; reads of the high or
+///   low word alone too) in A or B: `tfr a,b`, `tfr b,a`, `move b1,x0`;
 /// - a word (`move x0,x:k` or `move a,x:k`, read by `move x:k,y0` or `move x:k,a`) in x0, x1,
-///   y0 or y1: a register move does to the word what the memory move did (a limited store of an
-///   accumulator, a sign-extended load into one).
+///   y0, y1, b1 or b0: a register move does to the word what the memory move did (a limited store
+///   of an accumulator, a sign-extended load into one).
 ///
 /// Heavier webs (trip-weighted accesses) first; webs sharing a register have disjoint ranges. A
 /// move between a web's register and itself goes. Calls, returns and anything not modelled use
@@ -1230,7 +1309,7 @@ let assign (first: int) (temps: int) (items: (Item * int) array) =
       | Op(Par(None, [| Load(sp, ea, r) |])) when (temp sp ea).IsSome && (data r || r = A || r = B) ->
         let k = (temp sp ea).Value
         kind[i] <- "wload"; reg[i] <- r; word[i] <- k; uses[i] <- set [ k ]
-      | Op(Par(None, [| Store(r, sp, ea) |])) when (temp sp ea).IsSome && (data r || r = A || r = B) ->
+      | Op(Par(None, [| Store(r, sp, ea) |])) when (temp sp ea).IsSome && (data r || r = A || r = B || r = A1 || r = B1 || r = A0 || r = B0) ->
         let k = (temp sp ea).Value
         kind[i] <- "wstore"; reg[i] <- r; word[i] <- k; defs[i] <- set [ k ]
       | Op(Par(_, moves)) ->
@@ -1280,19 +1359,17 @@ let assign (first: int) (temps: int) (items: (Item * int) array) =
       match instr with
       | Branch((Bra | Bcc _), _) | Jump((Jmp | Jcc _), _) | Loop(_, Count _, _) | Enddo | Nop -> true
       | _ -> false
+    let firstSub = firstSubroutine its
     // what an item does to register t: (reads, writes it whole, touches it)
     let effect (t: Reg) i =
       match its[i] with
+      | Op Rts -> let r = i >= firstSub && (t = A || t = X0) in r, false, r
       | Op instr when control instr -> false, false, false
       | Op instr ->
         match readsOf instr, writesOf instr with
         | Some rs, Some ws ->
           let on (r: Reg) = Lower.storage r |> Array.exists (fun x -> Array.contains x (Lower.storage t))
-          let whole =
-            match instr with
-            | Par(None, moves) -> moves |> Array.exists (function Load(_, _, r) | Copy(_, r) | Imm(_, r) -> r = t | _ -> false)
-            | _ -> false
-          Array.exists on rs, whole, Array.exists on rs || Array.exists on ws
+          Array.exists on rs, writesWhole t instr, Array.exists on rs || Array.exists on ws
         | _ -> true, false, true
       | _ -> false, false, false
     let live (u: int -> bool) (d: int -> bool) =
@@ -1325,10 +1402,14 @@ let assign (first: int) (temps: int) (items: (Item * int) array) =
       |> Seq.filter (fun ms ->
         let kinds = ms |> Array.map (fun i -> kind[i]) |> Set.ofArray
         let wholeWeb =
-          // stores and reloads of a whole accumulator at k, reads of its high word into a data register
+          // stores and reloads of a whole accumulator at k, reads of its high or low word into a data register
           kinds.Contains "tstore" && Set.isSubset kinds (set [ "tstore"; "tload"; "wload" ])
           && (let k = word[ms |> Array.find (fun i -> kind[i] = "tstore")]
-              ms |> Array.forall (fun i -> word[i] = k && (kind[i] <> "wload" || data reg[i])))
+              ms |> Array.forall (fun i ->
+                match kind[i] with
+                | "tstore" | "tload" -> word[i] = k
+                | "wload" -> (word[i] = k || word[i] = k + 1) && data reg[i]
+                | _ -> false))
         let wordWeb = kinds.Contains "wstore" && Set.isSubset kinds (set [ "wstore"; "wload" ])
         not (ms |> Array.exists unreached.Contains) && (wholeWeb || wordWeb))
       |> Seq.sortByDescending (fun ms -> ms |> Array.sumBy (fun i -> weights[i]))
@@ -1340,11 +1421,37 @@ let assign (first: int) (temps: int) (items: (Item * int) array) =
       let isDef i = kind[i] = "tstore" || kind[i] = "wstore"
       let sIn, sOut = live (fun i -> Array.contains i ms && not (isDef i)) (fun i -> Array.contains i ms && isDef i)
       let range = [ 0 .. n - 1 ] |> List.filter (fun i -> sIn[i] || sOut[i] || own.Contains i)
+      let rec nextOp k =
+        if k >= n then None
+        else
+          match (match rewrite.TryGetValue k with true, v -> v | _ -> Some its[k]) with
+          | None | Some(Comment _) -> nextOp (k + 1)
+          | Some it -> Some it
       let isTriple = ms |> Array.exists (fun i -> kind[i] = "tstore")
-      let candidates = if isTriple then [ B; A ] else [ Y1; X1; Y0; X0 ]
+      let canTfrB =
+        not isTriple
+        && ms |> Array.forall (fun i -> (kind[i] = "wstore" && reg[i] = A1) || (kind[i] = "wload" && data reg[i]))
+        && (let maxStore = ms |> Array.filter (fun i -> kind[i] = "wstore") |> Array.map (fun i -> weights[i]) |> Array.max
+            ms |> Array.forall (fun i -> weights[i] <= maxStore))
+      let hasSquare =
+        not isTriple
+        && ms |> Array.exists (fun i ->
+          kind[i] = "wload" &&
+          match nextOp (i + 1) with
+          | Some(Op(Par(Some(Mul(_, _, s1, s2, _)), [||]))) -> s1 = reg[i] && s2 = reg[i]
+          | _ -> false)
+      let candidates =
+        (if isTriple then [ B; A ] elif canTfrB then [ Y1; X1; Y0; X0; B ] else [ Y1; X1; Y0; X0 ])
+        |> List.sortByDescending (fun t ->
+          if isTriple || (hasSquare && (t = X0 || t = Y0)) then
+            1L + (ms |> Array.sumBy (fun i -> if reg[i] = t then weights[i] else 0L))
+          elif ms |> Array.forall (fun i -> reg[i] = t) then 1L
+          else 0L)
       let fits t =
         let tIn, tOut = liveOf t
-        let clear = taken.TryGetValue t |> function | true, s -> range |> List.forall (fun i -> not (s.Contains i)) | _ -> true
+        let clear =
+          parts t |> List.forall (fun p ->
+            taken.TryGetValue p |> function | true, s -> range |> List.forall (fun i -> not (s.Contains i)) | _ -> true)
         clear &&
         range |> List.forall (fun i ->
           if own.Contains i then
@@ -1367,15 +1474,26 @@ let assign (first: int) (temps: int) (items: (Item * int) array) =
           | "tload" ->
             local[i] <- (if reg[i] = t then None else Some(Op(Par(Some(Binary(AluOp.Tfr, t, (if reg[i] = A then Acc.A else Acc.B))), [||]))))
             local[i + 1] <- None; local[i + 2] <- None
-          | "wload" when isTriple -> local[i] <- Some(Op(Par(None, [| Copy(hi t, reg[i]) |])))
+          | "wload" when isTriple ->
+            let k = word[ms |> Array.find (fun j -> kind[j] = "tstore")]
+            local[i] <- Some(Op(Par(None, [| Copy((if word[i] = k + 1 then lo t else hi t), reg[i]) |])))
+          | "wload" when t = B -> local[i] <- Some(Op(Par(None, [| Copy(B1, reg[i]) |])))
           | "wload" -> local[i] <- (if reg[i] = t then None else Some(Op(Par(None, [| Copy(t, reg[i]) |]))))
+          | "wstore" when t = B ->
+            let useMove =
+              match nextOp (i + 1) with
+              | Some(Op(Par(Some _, [||]))) -> true
+              | Some(Op(Par(None, [| Copy(s, d) |]))) when data s && data d -> true
+              | _ -> false
+            local[i] <- Some(Op(if useMove then Par(None, [| Copy(A1, B1) |]) else Par(Some(Binary(AluOp.Tfr, A, Acc.B)), [||])))
           | "wstore" -> local[i] <- (if reg[i] = t then None else Some(Op(Par(None, [| Copy(reg[i], t) |]))))
           | _ -> ()
         let encodes = local.Values |> Seq.forall (function Some(Op instr) -> Lower.encodes instr | _ -> true)
         if encodes then
           for KeyValue(k, v) in local do rewrite[k] <- v
-          if not (taken.ContainsKey t) then taken[t] <- HashSet()
-          for i in range do taken[t].Add i |> ignore
+          for p in parts t do
+            if not (taken.ContainsKey p) then taken[p] <- HashSet()
+            for i in range do taken[p].Add i |> ignore
     if rewrite.Count = 0 then items
     else
       [| for i in 0 .. n - 1 do
@@ -2018,7 +2136,7 @@ let runWith (p: Passes) (first: int) (temps: int) (items: Item array) (lines: in
     step p.copyForward copyForward
     step p.deadTemps (deadTempsFrom first temps)
   for _ in 1 .. 2 do
-    step p.accCopies (forwardWith true)
+    step p.accCopies (forwardWith true true)
     step p.copyForward copyForward
     step p.deadTemps (deadTempsFrom first temps)
   step p.joins (joinAccumulators first temps)
@@ -2026,9 +2144,11 @@ let runWith (p: Passes) (first: int) (temps: int) (items: Item array) (lines: in
   step p.promote (promote first temps)
   step p.assign (assign first temps)
   for _ in 1 .. 2 do
-    step p.forward forward
+    step p.forward (forwardWith p.accCopies false)
     step p.copyForward copyForward
+    step p.deadTemps (deadTempsFrom first temps)
   step p.hoist (hoistFrom first temps)
+  step p.copyForward copyForward
   step p.walk walk
   step p.pack pack
   step p.rotate (rotate >> (if p.pack then pack else id))

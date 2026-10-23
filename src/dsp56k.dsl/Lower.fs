@@ -44,6 +44,7 @@ let moveWrites m =
 
 let aluReads a =
   match a with
+  | Binary(AluOp.Tfr, s, _) -> storage s
   | Binary(_, s, d) -> Array.append (storage s) [| Acc.reg d |]
   | Unary(AluUnary.Clr, _) -> [||]
   | Unary(_, d) -> [| Acc.reg d |]

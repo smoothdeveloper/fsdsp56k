@@ -1650,6 +1650,71 @@ module WorksetWalk =
   let kernel = Kernel.define "probe-workset-walk" <@ init @> <@ trig @> <@ render @>
 
 
+/// Live-range allocation across a 32-sample loop: a five-word biquad loop where `z1`, `z2` and the
+/// feedback sample live in data registers and `b1`/`b0` (with `a` the only accumulator), a `btst`
+/// phase-wrap branch across which register facts survive, and a leaf-on-left `Acc` sum that avoids
+/// a 3-word accumulator spill.
+[<ReflectedDefinition>]
+module LiveRanges =
+  type S =
+    { mutable z1  : Frac
+      mutable z2  : Frac
+      mutable b0  : Frac
+      mutable b1  : Frac
+      mutable b2  : Frac
+      mutable a1  : Frac
+      mutable a2  : Frac
+      mutable ph  : Frac }
+
+  let init (_: Banks.P) (s: S) =
+    s.z1 <- Frac.zero
+    s.z2 <- Frac.zero
+    s.b0 <- Frac.ofRaw 0x100000
+    s.b1 <- Frac.ofRaw 0x080000
+    s.b2 <- Frac.ofRaw 0x040000
+    s.a1 <- Frac.ofRaw 0x180000
+    s.a2 <- Frac.ofRaw -0x060000
+    s.ph <- Frac.zero
+
+  let trig (_: Banks.P) (s: S) =
+    s.z1 <- Frac.zero
+    s.z2 <- Frac.zero
+
+  let render (p: Banks.P) (s: S) (out: Output) =
+    let c = Cursor.linear Scratch.x Frac.zero
+    for _ in 0 .. 31 do
+      let next = Acc.hi (Acc.ofFrac s.ph + p.a)
+      s.ph <- if Frac.bit 23 next then Acc.hi (Acc.andHi 0x7fffff (Acc.ofFrac next)) else next
+      let x = Acc.sat (Acc.ofFrac s.ph + (p.b * p.c - s.ph * p.d))
+      let mutable acc = x * s.b0
+      acc <- Acc.mac  acc s.z1 s.b1
+      acc <- Acc.mac  acc s.z2 s.b2
+      acc <- Acc.mac  acc s.z1 s.a1
+      acc <- Acc.mac  acc s.z2 s.a2
+      let y = Acc.sat (acc <<< 1)
+      s.z2 <- s.z1
+      s.z1 <- y
+      c.Put y
+    let r  = Cursor.linear Scratch.x Frac.zero
+    let b0 = s.b0
+    let b1 = s.b1
+    let mutable z1 = s.z1
+    let mutable z2 = s.z2
+    for _ in 0 .. 31 do
+      let fed = Acc.sat (Acc.ofFrac (r.Next()) + z1 * s.a1 + z2 * s.a2)
+      let mutable acc = fed * b0
+      acc <- Acc.mac acc z1 b1
+      acc <- Acc.mac acc z2 s.b2
+      let y = Acc.sat (acc <<< 1)
+      z2 <- z1
+      z1 <- y
+      out.Write y
+    s.z1 <- z1
+    s.z2 <- z2
+
+  let kernel = Kernel.define "probe-live-ranges" <@ init @> <@ trig @> <@ render @>
+
+
 let probeMachine =
   { Mds.machine "org.fsdsp56k.probe" "PROBE" "GND" "PR" with
       parameters = [| for n in [| "A"; "B"; "C"; "D" |] -> Mds.param n Mds.UnipolarQ23 |] }
@@ -2251,6 +2316,21 @@ let tests =
           Expect.isLessThanOrEqual after.ours.renderWorst 1100L "walked state words, within cycle ceiling"
         | Error e, _ | _, Error e -> failtest e
         conformance WorksetWalk.kernel 70
+      }
+      test "live-range allocation across biquad and btst loops: compiled program equals the .NET kernel" {
+        needNative ()
+        match Optimize.compile Optimize.Peephole Kernel.mds LiveRanges.kernel with
+        | Error e -> failtest e
+        | Ok c ->
+          let lines = c.items |> Array.map dsp56k.Print.item
+          let at (label: string) = Array.findIndex ((=) label) lines
+          let render = lines[at "RENDER:" + 1 ..]
+          let doIdxs = [| for i in 0 .. render.Length - 1 do if render[i].TrimStart().StartsWith "do " then i |]
+          Expect.equal doIdxs.Length 2 "two 32-sample loops in RENDER"
+          let secondLoop = render[doIdxs[1] + 1 ..]
+          Expect.isFalse (secondLoop |> Array.exists (fun l -> l.Contains "x:(r6" || l.Contains "x:(r2")) "biquad loop keeps z2 and fed in b1/b0 without X workset spills"
+          Expect.isFalse (render |> Array.exists (fun l -> l.Contains "a0,x:" || l.Contains "a2,x:")) "no 3-word accumulator spill in RENDER"
+        conformance LiveRanges.kernel 74
       }
       test "register locals read in both branches of an if: compiled program equals the .NET kernel" {
         needNative ()

@@ -9,10 +9,10 @@ probe-auto-size	machinedrum	ok	1890	978390f83b42f294
 probe-auto-sub	machinedrum	ok	134	33128424d5dbc065
 probe-banks	machinedrum	ok	96	ce5026a92f7d0a38
 probe-bit-test	machinedrum	ok	145	63e6eb81f21da1ba
-probe-bool-let	machinedrum	ok	144	c48e00a8f94115c5
+probe-bool-let	machinedrum	ok	144	93a2d2d760da1766
 probe-branch-registers	machinedrum	ok	89	88e71ee76d8805fb
 probe-clb-normf	machinedrum	ok	53	193119d5d17499c0
-probe-clb-normf-edges	machinedrum	ok	158	1d84a574d71d0334
+probe-clb-normf-edges	machinedrum	ok	158	4e28b8d45320f68e
 probe-computed-index	machinedrum	ok	173	37eeec698e969311
 probe-computed-past	machinedrum	ok	21	bd9e68a466445963
 probe-control	machinedrum	ok	94	f365b2abebaca5d8
@@ -22,23 +22,24 @@ probe-divide	machinedrum	ok	66	8e8613223bb82818
 probe-divide-carry	machinedrum	ok	66	b393b11b7a3daafa
 probe-fir	machinedrum	ok	88	f4ffb883efde6d21
 probe-four-acc	machinedrum	ok	191	240c212d7e2017a7
-probe-hand-inline	machinedrum	ok	61	790aca58571f7206
+probe-hand-inline	machinedrum	ok	55	ff43d9b98386d9d9
 probe-hand-missing	machinedrum	error	-	01a689a608c186c1	badMissing: [<HandWritten "dsp56k.tests.HandTests.Routines.missing">]: no module value dsp56k.tests.HandTests.Routines.missing (its full name, as workshop.hand.shape, or a value of the helper's module)
 probe-hand-omr	machinedrum	error	-	8bb58de88f7f5b21	badOmr (hand-written, dsp56k.tests.HandTests.Routines.writesOmr) changes omr: r6, r7 and the control registers are the host's and the compiler's (output goes through (r7)+)
 probe-hand-r6	machinedrum	error	-	6900ca28a3d3dae5	badR6 (hand-written, dsp56k.tests.HandTests.Routines.writesR6) changes r6: r6, r7 and the control registers are the host's and the compiler's (output goes through (r7)+)
 probe-hand-rts	machinedrum	error	-	ecb0e6d5d539c2ce	badRts (hand-written, dsp56k.tests.HandTests.Routines.returnsEarly) returns from inside (an rts before its end): written at each call it cannot, mark the helper [<Subroutine>] too
-probe-hand-sub	machinedrum	ok	42	5661ca940607f6cf
+probe-hand-sub	machinedrum	ok	36	3cb86414fcc134c0
 probe-hand-type	machinedrum	error	-	3c4857761fce9de5	badType: [<HandWritten "dsp56k.tests.HandTests.Routines.notRoutine">] names Int32, not DSL items (an Item array)
-probe-hand-wrong	machinedrum	ok	38	b2c4e92f4410af8b
+probe-hand-wrong	machinedrum	ok	32	086c49a45ec62ec9
 probe-helper-records	machinedrum	ok	72	ea6c85db72ee412e
 probe-index	machinedrum	ok	27	9b7ecf3c629dd341
-probe-index-arg	machinedrum	ok	57	d145008f24b264fc
+probe-index-arg	machinedrum	ok	57	df6192c2db161b4b
+probe-live-ranges	machinedrum	ok	194	95a154134b49d6ef
 probe-long-array	machinedrum	ok	146	4bca515e2645acd0
-probe-long-sat	machinedrum	ok	85	a93ed417a5ec55bf
+probe-long-sat	machinedrum	ok	85	9e404adcad63d9f0
 probe-many-arrays	machinedrum	ok	205	c750e79049eccb97
 probe-memory	machinedrum	ok	115	4d39ce814aa4da3a
 probe-mulsu-dmac	machinedrum	ok	57	3398177a383e9896
-probe-order	machinedrum	ok	157	d1bbf1afabdaff83
+probe-order	machinedrum	ok	147	980cc74e19d3ef6e
 probe-piped	machinedrum	ok	32	962bfd9a19a9e066
 probe-region-induction	machinedrum	ok	116	e014675fc088d78c
 probe-region-shared-index	machinedrum	ok	88	7f281bc137a539c0
@@ -46,17 +47,17 @@ probe-region-shared-let	machinedrum	ok	57	49d597132f16765b
 probe-ring-taps	machinedrum	ok	243	18257c2388cbb287
 probe-scaled-index	machinedrum	error	-	599a999915510cfe	the loop index i can index state arrays (s.field[i + c]) or be read as Frac.ofRaw i; not <expression>
 probe-shape-events	machinedrum	ok	112	1be1dc754eea684c
-probe-shape-selects	machinedrum	ok	130	ba6ec434a38f8906
+probe-shape-selects	machinedrum	ok	130	0b24ca5c6f23bb06
 probe-shape-units	machinedrum	ok	64	a5163dcd4b0d2c1f
 probe-shifts	machinedrum	ok	136	fc048022acf0c1f7
 probe-size-14100	machinedrum	ok	1788	173bc2ad60c0b394
 probe-size-3400	machinedrum	ok	450	a8542ebefb4d74fc
 probe-size-8100	machinedrum	ok	1038	38d56890bfaef8d5
 probe-size-small	machinedrum	ok	30	347015f8740b6210
-probe-state-ring	machinedrum	ok	150	a1500bcd2b64f5bc
+probe-state-ring	machinedrum	ok	149	6bec3b0d7cc38030
 probe-state-ring-off	machinedrum	error	-	e3268e71cb3bfb09	ring at Y+$9: a 6-word ring starts on a multiple of 8 in the workset (move the field)
 probe-stereo	machinedrum	error	-	0ff33fe26e5970df	probe-stereo: WritePair needs a stereo target, Machinedrum MDS has 1 channel(s)
-probe-subroutine-frames	machinedrum	ok	173	b6e94340b9f35b59
+probe-subroutine-frames	machinedrum	ok	167	34a45b3706160ab4
 probe-subroutines	machinedrum	ok	202	267f2edafd7ab6d6
 probe-subroutines-deep	machinedrum	error	-	9bd55f1bd0ab30b9	probe-subroutines-deep: the call to refresh takes 15 system stack levels (a call one, a DO loop two), a machine may take 12
 probe-table-constant	machinedrum	ok	61	f60f384ef9f1814e
@@ -65,9 +66,9 @@ probe-unroll	machinedrum	ok	221	8b8a07d1810818cb
 probe-unroll-deep	machinedrum	error	-	b429f3326a5b8c0c	probe-unroll-deep: the call to level1 takes 14 system stack levels (a call one, a DO loop two), a machine may take 12
 probe-unroll-flat	machinedrum	ok	250	fd9f345e20d14cef
 probe-unsized	machinedrum	error	-	9bdc6a85771203d8	probe-unsized: state field history is an array: give its length, [<Length n>]
-probe-unswitch	machinedrum	ok	74	1d725920adb7ab7b
-probe-unswitch-each	machinedrum	ok	53	bcd93e8128c9d8fe
-probe-unswitch-kept	machinedrum	ok	53	8219c61bfb5caf10
+probe-unswitch	machinedrum	ok	74	e705b56562fed507
+probe-unswitch-each	machinedrum	ok	53	0c877f3a0745fa31
+probe-unswitch-kept	machinedrum	ok	53	054045163cdbec84
 probe-wide	machinedrum	error	-	51c91938102b1889	probe-wide: RENDER writes 64 words, the block is 32 frames (one word each)
 probe-workset-walk	machinedrum	ok	68	980d1effb9a89a60
 probe-x-and-y-state	machinedrum	ok	176	9bf5da50146904ea
@@ -76,10 +77,10 @@ probe-x-full	machinedrum	ok	109	0fa3b2e070fe42ff
 probe-x-over	machinedrum	error	-	4a6ec08369eb90a1	probe-x-over: the [<XMemory>] state (64 words), locals and spills need more than 64 X words and the Y words after the state (Y+64 to Y+63)
 probe-x-state	machinedrum	ok	99	df2a79b89a541991
 probe-y-only	machinedrum	ok	16	67b23ab1411cb12f
-sine	machinedrum	ok	79	2729f1404449317f
-tx6-bd	machinedrum	ok	675	ec8cf5197d195d2e
+sine	machinedrum	ok	79	ef77c252597abbe3
+tx6-bd	machinedrum	ok	675	c343337df947e8a2
 tx6-ch	machinedrum	ok	762	e74eb353b42e192a
-tx6-cp	machinedrum	ok	1015	975802060dd35f9b
+tx6-cp	machinedrum	ok	985	dc889d1688de8086
 tx6-cy	machinedrum	ok	721	6014153d1831dd96
 tx6-ht	machinedrum	ok	697	3036bffa5fbd20f6
 tx6-lt	machinedrum	ok	760	b63da244a9876c03

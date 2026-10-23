@@ -1341,7 +1341,7 @@ and binAcc (ctx: Ctx) (l: Expr) (r: Expr) (op: BinOp) =
     genAcc ctx l
     let k = imm constant.Value
     emit ctx (match op with BAdd -> add k a | BSub -> sub k a | BCmp -> cmp k a)
-  | Some(AOfWord w) when ctx.bHeld ->
+  | Some(AOfWord w) when not (conflict (touches false l) (touches false r)) ->
     genAcc ctx l
     match w with
     | WReg s when s = X0 || s = X1 || s = Y0 || s = Y1 -> emit ctx (item s)
@@ -1366,12 +1366,21 @@ and binAcc (ctx: Ctx) (l: Expr) (r: Expr) (op: BinOp) =
     | BSub -> emit ctx (sub b a); emit ctx (neg a)
     | BCmp -> emit ctx (cmp a b)
   | _ ->
-    genAcc ctx r
-    let t = alloc ctx TAcc
-    emitAll ctx (storeA t)
-    genAcc ctx l
-    emitAll ctx (loadAccLeaf (AHome t) B)
-    emit ctx (item b)
+    match accLeaf ctx l with
+    | Some _ when op = BAdd && not (conflict (touches false l) (touches false r)) ->
+      binAcc ctx r l BAdd
+    | Some _ when not ctx.bHeld && not (held l) && not (conflict (touches false l) (touches false r)) ->
+      thenRun ctx l (fun () -> genAcc ctx r)
+      emit ctx (tfr a b)
+      emitAll ctx (loadAccLeaf (accLeaf ctx l).Value A)
+      emit ctx (item b)
+    | _ ->
+      genAcc ctx r
+      let t = alloc ctx TAcc
+      emitAll ctx (storeA t)
+      genAcc ctx l
+      emitAll ctx (loadAccLeaf (AHome t) B)
+      emit ctx (item b)
 
 /// A word operand is aligned with a1. Constants use the same immediate form as binAcc.
 and binAccWord (ctx: Ctx) (l: Expr) (f: Expr) (op: BinOp) =
@@ -1758,10 +1767,20 @@ and store (ctx: Ctx) (h: Home) (e: Expr) =
   | TAcc when h.reg.IsSome -> storeHeld ctx h.reg.Value e
   | TAcc -> genAcc ctx e; emitAll ctx (storeA h)
   | TLong ->
-    match e with
-    | Call(None, mi, [x]) when intrinsic (resolve mi [x]) = Some "long.ofAcc" -> genAcc ctx x
-    | _ -> genLong ctx e
-    emitAll ctx (storeA h)
+    let rec storeLong (e: Expr) =
+      match e with
+      | Let(v, value, body) -> withLet ctx v value body (fun () -> storeLong body)
+      | Sequential(s, rest) -> thenRun ctx rest (fun () -> genStmt ctx s); storeLong rest
+      | Call(None, mi, [x]) when intrinsic (resolve mi [x]) = Some "long.ofAcc" ->
+        genAcc ctx x
+        emitAll ctx (storeA h)
+      | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone && not (isSub ctx mi) && (reflected mi).IsSome ->
+        let body = inlined mi args
+        lined ctx body (fun () -> storeLong body)
+      | _ ->
+        genLong ctx e
+        emitAll ctx (storeA h)
+    storeLong e
   | TArray _ | TLongArray _ -> fail "an array state field is written element by element, s.field[k] <- v"
   | TOther t -> fail $"{t} values cannot be stored"
 
