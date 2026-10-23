@@ -49,6 +49,15 @@ let private measure selectedTarget create path result warmup trials =
   System.Console.WriteLine
     $"{selectedTarget} {fixture.kernel}: exact output/state/buffers; {milliseconds} ms render, {speed}x real time"
 
+/// Each block's output and state words, one block a line: what a sweep grader compares itself.
+let private captureTo create path result =
+  let fixture = read path "utf8" |> parseFixture
+  let blocks, _ = capture (create fixture.kernel) fixture.steps
+  let line (block: Block) =
+    String.concat " " (block.output |> Array.map string) + "\t" + String.concat " " (block.state |> Array.map string)
+  write result (String.concat "\n" (blocks |> Array.map line) + "\n")
+  System.Console.WriteLine $"Capture: {fixture.kernel}, {blocks.Length} blocks"
+
 #if FABLE_COMPILER
 [<Import("readFileSync", "node:fs")>]
 let readBinary (path: string) : obj = jsNative
@@ -62,6 +71,9 @@ let run () =
   | [| "--wasm"; wasm; path; result; warmup; trials |] ->
     finish (PortableRustWasm.instantiate (readBinary wasm)) (fun exports ->
       measure "fable-rust-wasm" (PortableRustWasm.create exports) path result warmup trials)
+  | [| "--wasm"; wasm; "--capture"; path; result |] ->
+    finish (PortableRustWasm.instantiate (readBinary wasm)) (fun exports ->
+      captureTo (PortableRustWasm.create exports) path result)
 #endif
 #if !FABLE_COMPILER
   | [| "--native"; library; path; result; warmup; trials |] ->
@@ -74,9 +86,11 @@ let run () =
     let expected, buffers = capture (fun () -> PortableAdapters.create fixture.kernel) fixture.steps
     write path (writeFixture { fixture with expected = expected; buffers = buffers })
     System.Console.WriteLine $"Reference: {fixture.kernel}, {expected.Length} blocks"
+  | [| "--capture"; path; result |] ->
+    captureTo (fun name () -> PortableAdapters.create name) path result
   | [| path; result; warmup; trials |] ->
     measure target (fun name () -> PortableAdapters.create name) path result warmup trials
-  | _ -> failwith "Usage: runner [--wasm module.wasm | --native library] fixture.json result.json warmup trials | runner --reference fixture.json"
+  | _ -> failwith "Usage: runner [--wasm module.wasm | --native library] fixture.json result.json warmup trials | runner --reference fixture.json | runner [--wasm module.wasm] --capture fixture.json blocks.tsv"
 
 #if FABLE_COMPILER
 run()
