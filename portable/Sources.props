@@ -4,6 +4,16 @@
     <Compile Include="../out/portable/sources/Sine.fs" Link="Sine.fs" />
     <Compile Include="../out/portable/sources/Pluck.fs" Link="Pluck.fs" />
     <Compile Include="../out/portable/sources/InputThru.fs" Link="InputThru.fs" />
+    <Compile Include="../out/portable/sources/Tx6BdTables.fs" Link="Tx6BdTables.fs" />
+    <Compile Include="../out/portable/sources/Tx6Bd.fs" Link="Tx6Bd.fs" />
+    <Compile Include="../out/portable/sources/Tx6TomTables.fs" Link="Tx6TomTables.fs" />
+    <Compile Include="../out/portable/sources/Tx6Tom.fs" Link="Tx6Tom.fs" />
+    <Compile Include="../out/portable/sources/Tx6MetalTables.fs" Link="Tx6MetalTables.fs" />
+    <Compile Include="../out/portable/sources/Tx6Metal.fs" Link="Tx6Metal.fs" />
+    <Compile Include="../out/portable/sources/Tx6SdTables.fs" Link="Tx6SdTables.fs" />
+    <Compile Include="../out/portable/sources/Tx6Sd.fs" Link="Tx6Sd.fs" />
+    <Compile Include="../out/portable/sources/Tx6CpTables.fs" Link="Tx6CpTables.fs" />
+    <Compile Include="../out/portable/sources/Tx6Cp.fs" Link="Tx6Cp.fs" />
     <Compile Include="Host.fs" />
     <Compile Include="Adapters.fs" />
   </ItemGroup>
