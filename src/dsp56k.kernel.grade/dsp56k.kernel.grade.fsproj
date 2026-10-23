@@ -13,6 +13,7 @@
     <Compile Include="Html.fs" />
     <Compile Include="Audio.fs" />
     <Compile Include="Portable.fs" />
+    <Compile Include="Sweep.fs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../dsp56k/dsp56k.fsproj" />

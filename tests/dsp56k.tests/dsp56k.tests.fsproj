@@ -38,6 +38,7 @@
     <Compile Include="KernelIrTests.fs" />
     <Compile Include="IrFrontEndTests.fs" />
     <Compile Include="TypedTreeFrontEndTests.fs" />
+    <Compile Include="SweepTests.fs" />
     <Compile Include="Main.fs" />
   </ItemGroup>
   <ItemGroup>

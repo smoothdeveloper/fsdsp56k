@@ -28,6 +28,12 @@ let private skipFor (what: string) =
 let needFixture name =
   if not (Directory.Exists(fixture name)) then skipFor $"fixture {name} missing: run scripts/fetch-fixtures.sh"
 
+/// The portable .NET runner (Portable.Net.dll) that portable/grade.fsx builds.
+let portableNet = repoRoot </> "portable" </> "bin" </> "Release" </> "net10.0" </> "Portable.Net.dll"
+
+let needPortable () =
+  if not (File.Exists portableNet) then skipFor "portable runner missing: dotnet fsi portable/grade.fsx"
+
 let needNative () =
   if not (dsp56k.Native.load ()) then skipFor "native oracle missing: cargo build --release in native/ (or set FSDSP56K_NATIVE)"
 
