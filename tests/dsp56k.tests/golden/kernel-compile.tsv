@@ -1,13 +1,13 @@
 input-thru	machinedrum	ok	53	53bbcacca906e4e8
 main-tap	machinedrum	ok	56	cdc8fa43eba3b164
-pluck	machinedrum	ok	170	25a7b08e232ba2e1
+pluck	machinedrum	ok	169	05d248fa6b886e7f
 probe-address-twice	machinedrum	ok	67	e5438ebb72aaf30b
 probe-arithmetic	machinedrum	ok	72	1cfac0cefc6c1668
 probe-auto-hot	machinedrum	ok	164	8bf70e3914c468be
 probe-auto-inline	machinedrum	ok	134	b851f692abcd921b
-probe-auto-size	machinedrum	ok	1891	ccc0000172ae2719
+probe-auto-size	machinedrum	ok	1890	978390f83b42f294
 probe-auto-sub	machinedrum	ok	134	33128424d5dbc065
-probe-banks	machinedrum	ok	97	5e5fd1be8c5ed144
+probe-banks	machinedrum	ok	96	ce5026a92f7d0a38
 probe-bit-test	machinedrum	ok	145	63e6eb81f21da1ba
 probe-bool-let	machinedrum	ok	144	c48e00a8f94115c5
 probe-branch-registers	machinedrum	ok	89	88e71ee76d8805fb
@@ -15,7 +15,7 @@ probe-clb-normf	machinedrum	ok	53	193119d5d17499c0
 probe-clb-normf-edges	machinedrum	ok	158	1d84a574d71d0334
 probe-computed-index	machinedrum	ok	173	37eeec698e969311
 probe-computed-past	machinedrum	ok	21	bd9e68a466445963
-probe-control	machinedrum	ok	97	fcd7bdf1ad055ad2
+probe-control	machinedrum	ok	94	f365b2abebaca5d8
 probe-counted-loops	machinedrum	ok	110	4ca6e408a4919503
 probe-crowded-registers	machinedrum	error	-	63454ec9fd4eeab4	y1[i]: no address register is free for the loop over i (r1..r5 hold c1 (r1), c2 (r2), c3 (r3), c4 (r4), c5 (r5)). End a cursor before the loop, or index with a word counted when running: s.y1[Frac.index (Frac.ofRaw i)] (r0 and n0, no register held)
 probe-divide	machinedrum	ok	66	8e8613223bb82818
@@ -30,21 +30,21 @@ probe-hand-rts	machinedrum	error	-	ecb0e6d5d539c2ce	badRts (hand-written, dsp56k
 probe-hand-sub	machinedrum	ok	42	5661ca940607f6cf
 probe-hand-type	machinedrum	error	-	3c4857761fce9de5	badType: [<HandWritten "dsp56k.tests.HandTests.Routines.notRoutine">] names Int32, not DSL items (an Item array)
 probe-hand-wrong	machinedrum	ok	38	b2c4e92f4410af8b
-probe-helper-records	machinedrum	ok	73	3fcbc039c94bc02c
+probe-helper-records	machinedrum	ok	72	ea6c85db72ee412e
 probe-index	machinedrum	ok	27	9b7ecf3c629dd341
-probe-index-arg	machinedrum	ok	59	75ff415a74f2c2b2
+probe-index-arg	machinedrum	ok	57	d145008f24b264fc
 probe-long-array	machinedrum	ok	146	4bca515e2645acd0
 probe-long-sat	machinedrum	ok	85	a93ed417a5ec55bf
 probe-many-arrays	machinedrum	ok	205	c750e79049eccb97
-probe-memory	machinedrum	ok	116	ad7ddf16df5ece1a
+probe-memory	machinedrum	ok	115	4d39ce814aa4da3a
 probe-mulsu-dmac	machinedrum	ok	57	3398177a383e9896
 probe-order	machinedrum	ok	157	d1bbf1afabdaff83
-probe-piped	machinedrum	ok	33	c9594c3996f4e859
+probe-piped	machinedrum	ok	32	962bfd9a19a9e066
 probe-region-induction	machinedrum	ok	116	e014675fc088d78c
 probe-region-shared-index	machinedrum	ok	88	7f281bc137a539c0
-probe-ring-taps	machinedrum	ok	250	c3578d0433285fc3
+probe-ring-taps	machinedrum	ok	243	18257c2388cbb287
 probe-scaled-index	machinedrum	error	-	599a999915510cfe	the loop index i can index state arrays (s.field[i + c]) or be read as Frac.ofRaw i; not <expression>
-probe-shape-events	machinedrum	ok	113	5fadbb8b41aa651e
+probe-shape-events	machinedrum	ok	112	1be1dc754eea684c
 probe-shape-selects	machinedrum	ok	130	ba6ec434a38f8906
 probe-shape-units	machinedrum	ok	64	a5163dcd4b0d2c1f
 probe-shifts	machinedrum	ok	136	fc048022acf0c1f7
@@ -72,14 +72,14 @@ probe-x-and-y-state	machinedrum	ok	176	9bf5da50146904ea
 probe-x-beyond	machinedrum	error	-	dcf9075ddecb5767	probe-x-beyond: the [<XMemory>] state needs X+64, the target has 64 words
 probe-x-full	machinedrum	ok	109	0fa3b2e070fe42ff
 probe-x-over	machinedrum	error	-	4a6ec08369eb90a1	probe-x-over: the [<XMemory>] state (64 words), locals and spills need more than 64 X words and the Y words after the state (Y+64 to Y+63)
-probe-x-state	machinedrum	ok	101	cf7cafeb9d0f9fe0
+probe-x-state	machinedrum	ok	99	df2a79b89a541991
 probe-y-only	machinedrum	ok	16	67b23ab1411cb12f
-sine	machinedrum	ok	82	436aff521f6b270d
-tx6-bd	machinedrum	ok	682	5fa71056bf0718b9
-tx6-ch	machinedrum	ok	763	0d40ad1410f12fc3
-tx6-cp	machinedrum	ok	1024	4c41a697ccfb463d
-tx6-cy	machinedrum	ok	722	8469ef403a5d2cd4
-tx6-ht	machinedrum	ok	700	fcd8614df49003f8
-tx6-lt	machinedrum	ok	763	f924ed1ec063b229
-tx6-oh	machinedrum	ok	763	a2cc1377b910db4e
-tx6-sd	machinedrum	ok	675	7c4bc6e8633420ab
+sine	machinedrum	ok	79	2729f1404449317f
+tx6-bd	machinedrum	ok	675	ec8cf5197d195d2e
+tx6-ch	machinedrum	ok	762	e74eb353b42e192a
+tx6-cp	machinedrum	ok	1015	975802060dd35f9b
+tx6-cy	machinedrum	ok	721	6014153d1831dd96
+tx6-ht	machinedrum	ok	697	3036bffa5fbd20f6
+tx6-lt	machinedrum	ok	760	b63da244a9876c03
+tx6-oh	machinedrum	ok	762	b64b69cdc0b8edc1
+tx6-sd	machinedrum	ok	670	53d07f865d3ebe1c

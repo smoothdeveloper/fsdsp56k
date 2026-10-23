@@ -811,10 +811,11 @@ let rec wordLeaf (ctx: Ctx) (e: Expr) : Word option =
       | Some r -> Some(WReg r)
       | None -> Some(WMem(at ctx.vars[v] 0))
     | StateElement ctx (m, []) -> Some(WMem m)
-    // a1 or a0 of an accumulator kept in memory: the word itself
-    | Call(None, mi, [ x ]) when (intrinsic mi = Some "acc.hi" || intrinsic mi = Some "acc.lo") && (accLeaf ctx x).IsSome ->
-      let word = if intrinsic mi = Some "acc.hi" then 0 else 1
+    // a1 or a0 of an accumulator kept in memory or B: the word itself
+    | Call(None, mi, [ x ]) when (let n = intrinsic (resolve mi [ x ]) in n = Some "acc.hi" || n = Some "acc.lo") && (accLeaf ctx x).IsSome ->
+      let word = if intrinsic (resolve mi [ x ]) = Some "acc.hi" then 0 else 1
       match (accLeaf ctx x).Value with
+      | AHome { reg = Some B } -> Some(WReg(if word = 0 then B1 else B0))
       | AHome h when h.reg.IsNone -> Some(WMem(at h word))
       | AOfLong(hi, lo) -> Some(WMem(if word = 0 then hi else lo))
       | AOfWord w when word = 0 -> Some w
@@ -1202,6 +1203,8 @@ let rec genAcc (ctx: Ctx) (e: Expr) : unit =
     | Call(None, mi, args) ->
       let mi = resolve mi args
       match intrinsic mi, args with
+      | Some "acc.ofFrac", [Intr "acc.hi" [x]] -> emit ctx (move (accPart ctx x 1) a)
+      | Some "acc.ofFrac", [Intr "acc.lo" [x]] -> emit ctx (move (accPart ctx x 0) a)
       | Some "acc.ofFrac", [f] -> genWord ctx f; emit ctx (move x0 a)
       | Some "acc.ofLong", [l] -> genLong ctx l
       | _ when (mulForm e).IsSome ->
@@ -1341,7 +1344,7 @@ and binAcc (ctx: Ctx) (l: Expr) (r: Expr) (op: BinOp) =
   | Some(AOfWord w) when ctx.bHeld ->
     genAcc ctx l
     match w with
-    | WReg s -> emit ctx (item s)
+    | WReg s when s = X0 || s = X1 || s = Y0 || s = Y1 -> emit ctx (item s)
     | _ ->
       emitAll ctx (loadWord w x0)
       emit ctx (item x0)
@@ -1377,7 +1380,7 @@ and binAccWord (ctx: Ctx) (l: Expr) (f: Expr) (op: BinOp) =
   let register r = if op = BSub then sub r a else add r a
   match w with
   | WImm k -> emit ctx (if op = BSub then sub (imm k) a else add (imm k) a)
-  | WReg r -> emit ctx (register r)
+  | WReg r when r = X0 || r = X1 || r = Y0 || r = Y1 -> emit ctx (register r)
   | _ ->
     emitAll ctx (loadWord w x0)
     emit ctx (register x0)
@@ -1778,16 +1781,16 @@ and storeHeld (ctx: Ctx) (r: Reg) (e: Expr) =
       let register s = if subtract then sub s r else add s r
       let immediate k = if subtract then sub (imm k) r else add (imm k) r
       let operand =
-        match accLeaf ctx f with
-        | Some(AOfWord w) -> Some w
-        | Some(AConst c) when c &&& 0xffffffL = 0L && c >= -0x800000000000L && c <= 0x7fffff000000L ->
+        match wordLeaf ctx f, accLeaf ctx f with
+        | Some w, _ | _, Some(AOfWord w) -> Some w
+        | _, Some(AConst c) when c &&& 0xffffffL = 0L && c >= -0x800000000000L && c <= 0x7fffff000000L ->
           Some(WImm(int ((c >>> 24) &&& 0xffffffL)))
         | _ -> None
       match operand with
       | Some w when self l ->
         match w with
         | WImm k -> onto (immediate k)
-        | WReg s -> onto (register s)
+        | WReg s when s = X0 || s = X1 || s = Y0 || s = Y1 -> onto (register s)
         | _ ->
           emitAll ctx (loadWord w x0)
           onto (register x0)
@@ -1810,14 +1813,12 @@ and storeHeld (ctx: Ctx) (r: Reg) (e: Expr) =
       match e with
       | Intr "acc.add" [l; f] -> word false l f || word false f l || acc add l f || acc add f l
       | Intr "acc.sub" [l; f] -> word true l f || acc sub l f
-      | Intr "acc.addFrac" [l; f] when self l ->
-        match wordLeaf ctx f with
-        | Some(WImm k) -> onto (add (imm k) r); true
-        | _ -> false
-      | Intr "acc.subFrac" [l; f] when self l ->
-        match wordLeaf ctx f with
-        | Some(WImm k) -> onto (sub (imm k) r); true
-        | _ -> false
+      | Intr "acc.addFrac" [l; f] -> word false l f
+      | Intr "acc.subFrac" [l; f] -> word true l f
+      | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone && not (isSub ctx mi) && (reflected mi).IsSome ->
+        let body = inlined mi args
+        lined ctx body (fun () -> storeHeld ctx r body)
+        true
       | _ -> false
     if not done' then
       genAcc ctx e
@@ -1826,16 +1827,20 @@ and storeHeld (ctx: Ctx) (r: Reg) (e: Expr) =
 /// A Frac into a memory word: an accumulator stored directly when it is one.
 and storeWord (ctx: Ctx) (e: Expr) (dst: Mem) =
   match e with
-  | _ when (match wordLeaf ctx e with Some(WMem _) | Some(WReg _) -> true | _ -> false) ->
-    match wordLeaf ctx e with
-    | Some(WReg r) -> emit ctx (move r dst)
-    | Some w ->
+  | _ when (wordLeaf ctx e).IsSome ->
+    match (wordLeaf ctx e).Value with
+    | WReg r -> emit ctx (move r dst)
+    | w ->
       emitAll ctx (loadWord w x0)
       emit ctx (move x0 dst)
-    | None -> ()
+  | Let(v, value, body) -> withLet ctx v value body (fun () -> storeWord ctx body dst)
+  | Sequential(s, rest) -> thenRun ctx rest (fun () -> genStmt ctx s); storeWord ctx rest dst
   | Call(None, mi, [x]) when intrinsic (resolve mi [x]) = Some "acc.sat" -> emit ctx (move (accPart ctx x 2) dst)
   | Call(None, mi, [x]) when intrinsic (resolve mi [x]) = Some "acc.hi" -> emit ctx (move (accPart ctx x 1) dst)
   | Call(None, mi, [x]) when intrinsic (resolve mi [x]) = Some "acc.lo" -> emit ctx (move (accPart ctx x 0) dst)
+  | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone && not (isSub ctx mi) && (reflected mi).IsSome ->
+    let body = inlined mi args
+    lined ctx body (fun () -> storeWord ctx body dst)
   | _ ->
     match wordLeaf ctx e with
     | Some(WReg r) -> emit ctx (move r dst)
@@ -1863,6 +1868,12 @@ and accPart (ctx: Ctx) (x: Expr) (part: int) =
 and storeWordReg (ctx: Ctx) (e: Expr) (dst: Reg) =
   match e with
   | _ when (wordLeaf ctx e).IsSome -> emitAll ctx (loadWord (wordLeaf ctx e).Value dst)
+  | Let(v, value, body) -> withLet ctx v value body (fun () -> storeWordReg ctx body dst)
+  | Sequential(s, rest) -> thenRun ctx rest (fun () -> genStmt ctx s); storeWordReg ctx rest dst
+  | ComputedElement ctx (f, w, c, []) ->
+    indexInN0 ctx w (f.offset + c)
+    emit ctx (move r6 r0)
+    emit ctx (move (computedMem f.bank) dst)
   | Call(Some(Var c), mi, []) when ctx.cursors.ContainsKey c && (intrinsic mi = Some "cursor.next" || intrinsic mi = Some "cursor.peek") ->
     emit ctx (move (cursorMem ctx.cursors[c] (intrinsic mi = Some "cursor.next")) dst)
   | Call(Some(Var c), mi, []) when ctx.cursors.ContainsKey c && (intrinsic mi = Some "cursor.up" || intrinsic mi = Some "cursor.down") ->
@@ -1870,6 +1881,27 @@ and storeWordReg (ctx: Ctx) (e: Expr) (dst: Reg) =
   | Intr "acc.sat" [x] -> emit ctx (move (accPart ctx x 2) dst)
   | Intr "acc.hi" [x] -> emit ctx (move (accPart ctx x 1) dst)
   | Intr "acc.lo" [x] -> emit ctx (move (accPart ctx x 0) dst)
+  | Intr "table.read" [t; i] -> tableRead ctx t i 1 0 dst
+  | Intr "table.row" [t; w; i; c] -> tableRead ctx t i (constInt ctx "a table width" w) (constInt ctx "a table column" c) dst
+  | Intr "region.read" [_; _] when ctx.affineAt.ContainsKey e -> emit ctx (move ctx.affineAt[e] dst)
+  | Intr "region.read" [r; i] when (inducted ctx r i).IsSome -> emit ctx (move (inducted ctx r i).Value dst)
+  | Intr "region.read" [r; i] ->
+    let region = constRegion ctx r
+    indexInN0 ctx i 0
+    regionInR0 ctx region
+    emit ctx (move (computedMem region.bank) dst)
+  | Intr "region.address" [r] ->
+    let region : Region = constRegion ctx r
+    importHere ctx region.name region.abiSymbol (move (immL 0) dst)
+  | Intr "cell.read" [c] ->
+    let cell : Cell =
+      match tryConst' ctx c with
+      | Some(:? Cell as c) -> c
+      | _ -> fail $"a cell must be a constant, got {c}"
+    importHere ctx cell.name cell.abiSymbol (move (xm (absL 0)) dst)
+  | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone && not (isSub ctx mi) && (reflected mi).IsSome ->
+    let body = inlined mi args
+    lined ctx body (fun () -> storeWordReg ctx body dst)
   | _ ->
     match wordLeaf ctx e with
     | Some w -> emitAll ctx (loadWord w dst)
