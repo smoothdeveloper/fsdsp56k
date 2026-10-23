@@ -88,9 +88,11 @@ let run () =
     System.Console.WriteLine $"Reference: {fixture.kernel}, {expected.Length} blocks"
   | [| "--capture"; path; result |] ->
     captureTo (fun name () -> PortableAdapters.create name) path result
+  | [| "--kernels" |] ->
+    for name in PortableAdapters.names do System.Console.WriteLine name
   | [| path; result; warmup; trials |] ->
     measure target (fun name () -> PortableAdapters.create name) path result warmup trials
-  | _ -> failwith "Usage: runner [--wasm module.wasm | --native library] fixture.json result.json warmup trials | runner --reference fixture.json | runner [--wasm module.wasm] --capture fixture.json blocks.tsv"
+  | _ -> failwith "Usage: runner [--wasm module.wasm | --native library] fixture.json result.json warmup trials | runner --reference fixture.json | runner --kernels | runner [--wasm module.wasm] --capture fixture.json blocks.tsv"
 
 #if FABLE_COMPILER
 run()

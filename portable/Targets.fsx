@@ -13,6 +13,16 @@ type Configuration =
     javascript : string
     dotnet     : string }
 
+/// The paths grade.fsx and sweep.fsx share, under the checkout `root`.
+let configure root =
+  let output = Path.Combine(root, "out", "portable")
+  { root       = root
+    project    = Path.Combine(__SOURCE_DIRECTORY__, "portable.net.fsproj")
+    output     = output
+    manifest   = Path.Combine(__SOURCE_DIRECTORY__, "Cargo.toml")
+    javascript = Path.Combine(output, "js")
+    dotnet     = Path.Combine(__SOURCE_DIRECTORY__, "bin", "Release", "net10.0", "Portable.Net.dll") }
+
 let private runId = DateTimeOffset.UtcNow.ToString("yyyyMMddTHHmmssfffZ")
 let private measurements configuration =
   Path.Combine(configuration.output, "measurements", runId)
