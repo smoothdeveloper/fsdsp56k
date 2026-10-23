@@ -502,52 +502,190 @@ let writesOf (instr: Instr) =
     Some(Array.append (alu |> Option.map Lower.aluWrites |> Option.defaultValue [||]) (Array.collect Lower.moveWrites moves))
   | i -> aluWrites i |> Option.map List.toArray
 
-/// Whether `r` is overwritten before anything reads it, from item `from` on, in straight-line code.
+/// Whether `r` is overwritten before anything reads it, from item `from` on.
 let deadAfter (items: (Item * int) array) (from: int) (r: Reg) =
-  let rec go k =
-    if k >= items.Length then false
+  let control (instr: Instr) =
+    match instr with
+    | Branch((Bra | Bcc _), _) | Jump((Jmp | Jcc _), _) | Loop(_, Count _, _) | Enddo | Nop -> true
+    | _ -> false
+  let overlap (a: Reg) (b: Reg) =
+    let pa = parts a
+    parts b |> List.exists (fun x -> List.contains x pa)
+  let rec straight k =
+    if k >= items.Length then None
     else
       match fst items[k] with
-      | Comment _ -> go (k + 1)
+      | Comment _ -> straight (k + 1)
       | Op instr ->
         match readsOf instr, writesOf instr with
         | Some rs, Some ws ->
-          if rs |> Array.exists (fun x -> List.contains r (parts x) || List.contains x (parts r)) then false
-          elif ws |> Array.exists (fun x -> parts x = parts r || x = r) then true
-          else go (k + 1)
-        | _ -> false
-      | _ -> false
-  go from
+          if rs |> Array.exists (overlap r) then Some false
+          elif ws |> Array.exists (fun x -> parts x = parts r || x = r) then Some true
+          else straight (k + 1)
+        | _ -> None
+      | _ -> None
+  match straight from with
+  | Some res -> res
+  | None ->
+    if from < 0 || from >= items.Length then false
+    else
+      match successors (Array.map fst items) with
+      | None -> false
+      | Some succ ->
+        let seen = HashSet<int>()
+        let todo = Stack<int>()
+        if seen.Add from then todo.Push from
+        let mutable dead = true
+        while todo.Count > 0 && dead do
+          let k = todo.Pop()
+          let step () =
+            if succ[k].Length = 0 then dead <- false
+            else for nx in succ[k] do if seen.Add nx then todo.Push nx
+          match fst items[k] with
+          | Comment _ | Label _ -> step ()
+          | Op instr when control instr -> step ()
+          | Op instr ->
+            match readsOf instr, writesOf instr with
+            | Some rs, Some ws ->
+              if rs |> Array.exists (overlap r) then dead <- false
+              elif ws |> Array.exists (fun x -> parts x = parts r || x = r) then ()
+              else step ()
+            | _ -> dead <- false
+          | _ -> dead <- false
+        dead
 
 /// `move s,x0` `move x0,d` with x0 dead afterwards: `move s,d`, when that encodes.
 let copyForward (items: (Item * int) array) =
-  let out = ResizeArray<Item * int>()
-  let mutable i = 0
-  while i < items.Length do
-    let fused =
-      if i + 1 < items.Length then
-        match fst items[i], fst items[i + 1] with
-        | Op(Par(None, [| first |])), Op(Par(None, [| second |])) ->
-          let combined =
-            match first, second with
-            | Load(sp, ea, r), Copy(r', d) when r = r' && (r = X0 || r = Y0) && d <> A2 && d <> B2 -> Some(r, Load(sp, ea, d))
-            | Copy(src, r), Copy(r', d) when r = r' && (r = X0 || r = Y0) && not ((src = A || src = B) && (d = A || d = B)) && d <> A2 && d <> B2 -> Some(r, Copy(src, d))
-            | Copy(src, r), Store(r', sp, ea) when r = r' && (r = X0 || r = Y0) -> Some(r, Store(src, sp, ea))
-            | Imm(op, r), Copy(r', d) when r = r' && (r = X0 || r = Y0) && op.force = Long && d <> A2 && d <> B2 -> Some(r, Imm(op, d))
-            | _ -> None
-          match combined with
-          | Some(r, m) when Lower.encodes (Par(None, [| m |])) && deadAfter items (i + 2) r -> Some(Op(Par(None, [| m |])))
+  let cur = Array.copy items
+  let dropped = HashSet<int>()
+  let its = Array.map fst cur
+  let succ = successors its
+  let control (instr: Instr) =
+    match instr with
+    | Branch((Bra | Bcc _), _) | Jump((Jmp | Jcc _), _) | Loop(_, Count _, _) | Enddo | Nop -> true
+    | _ -> false
+  let overlap (a: Reg) (b: Reg) =
+    let pa = parts a
+    parts b |> List.exists (fun x -> List.contains x pa)
+  let deadAfterAt put drop after (rep: Item) (r: Reg) =
+    let rec straight k =
+      if k >= cur.Length then None
+      elif k = drop || dropped.Contains k then straight (k + 1)
+      else
+        match (if k = put then rep else fst cur[k]) with
+        | Comment _ -> straight (k + 1)
+        | Op instr ->
+          match readsOf instr, writesOf instr with
+          | Some rs, Some ws ->
+            if rs |> Array.exists (overlap r) then Some false
+            elif ws |> Array.exists (fun x -> parts x = parts r || x = r) then Some true
+            else straight (k + 1)
           | _ -> None
         | _ -> None
-      else None
-    match fused with
-    | Some it ->
-      out.Add(it, snd items[i])
-      i <- i + 2
+    match straight (after + 1) with
+    | Some res -> res
     | None ->
-      out.Add items[i]
-      i <- i + 1
-  out.ToArray()
+      match succ with
+      | None -> false
+      | Some succ ->
+        if succ[after].Length = 0 then false
+        else
+          let seen = HashSet<int>()
+          let todo = Stack<int>()
+          for nx in succ[after] do if seen.Add nx then todo.Push nx
+          let mutable dead = true
+          while todo.Count > 0 && dead do
+            let k = todo.Pop()
+            let step () =
+              if succ[k].Length = 0 then dead <- false
+              else for nx in succ[k] do if seen.Add nx then todo.Push nx
+            if k = drop || dropped.Contains k then step ()
+            else
+              match (if k = put then rep else fst cur[k]) with
+              | Comment _ | Label _ -> step ()
+              | Op instr when control instr -> step ()
+              | Op instr ->
+                match readsOf instr, writesOf instr with
+                | Some rs, Some ws ->
+                  if rs |> Array.exists (overlap r) then dead <- false
+                  elif ws |> Array.exists (fun x -> parts x = parts r || x = r) then ()
+                  else step ()
+                | _ -> dead <- false
+              | _ -> dead <- false
+          dead
+  let data (r: Reg) = r = X0 || r = X1 || r = Y0 || r = Y1
+  let renameAlu (fromReg: Reg) (toReg: Reg) (instr: Instr) =
+    let swap x = if x = fromReg then toReg else x
+    match instr with
+    | Par(Some(Binary((AluOp.Add | AluOp.Sub | AluOp.Cmp) as op, s, d)), [||]) when s = fromReg ->
+      Some(Par(Some(Binary(op, toReg, d)), [||]))
+    | Par(Some(Mul(kind, neg, s1, s2, d)), [||]) when s1 = fromReg || s2 = fromReg ->
+      let m = Par(Some(Mul(kind, neg, swap s1, swap s2, d)), [||])
+      if Lower.encodes m then Some m else None
+    | MulI(kind, neg, imm, s, d) when s = fromReg ->
+      Some(MulI(kind, neg, imm, toReg, d))
+    | _ -> None
+  for i in 0 .. cur.Length - 1 do
+    if not (dropped.Contains i) then
+      match fst cur[i] with
+      | Op(Par(None, [| first |])) ->
+        let target =
+          match first with
+          | Load(_, _, r) | Copy(_, r) | Imm(_, r) when r = X0 || r = Y0 -> Some r
+          | _ -> None
+        match target with
+        | None -> ()
+        | Some r ->
+          let between = ResizeArray<Reg * Reg>()
+          let mutable k = i + 1
+          let mutable searching = true
+          while searching && k < cur.Length do
+            if dropped.Contains k then k <- k + 1
+            else
+              match fst cur[k] with
+              | Comment _ -> k <- k + 1
+              | Op(Par(None, [| second |])) ->
+                let combined =
+                  match first, second with
+                  | Load(sp, ea, r), Copy(r', d) when r = r' && d <> A2 && d <> B2 -> Some(r, Load(sp, ea, d))
+                  | Copy(src, r), Copy(r', d) when r = r' && not ((src = A || src = B) && (d = A || d = B)) && d <> A2 && d <> B2 -> Some(r, Copy(src, d))
+                  | Copy(src, r), Store(r', sp, ea) when r = r' && between.Count = 0 -> Some(r, Store(src, sp, ea))
+                  | Imm(op, r), Copy(r', d) when r = r' && op.force = Long && d <> A2 && d <> B2 -> Some(r, Imm(op, d))
+                  | _ -> None
+                let placeAtK = between.Count > 0 && (match first with Copy _ -> true | _ -> false)
+                let clear (m: Move) =
+                  let mr = Lower.moveReads m
+                  let mw = Lower.moveWrites m
+                  between |> Seq.forall (fun (s', d') ->
+                    not (mr |> Array.exists (overlap d'))
+                    && not (mw |> Array.exists (overlap d'))
+                    && (placeAtK || not (mw |> Array.exists (overlap s'))))
+                let put = if placeAtK then k else i
+                let drop = if placeAtK then i else k
+                match combined with
+                | Some(r, m) when clear m && Lower.encodes (Par(None, [| m |])) && deadAfterAt put drop k (Op(Par(None, [| m |]))) r ->
+                  cur[put] <- (Op(Par(None, [| m |])), snd cur[put])
+                  dropped.Add drop |> ignore
+                  searching <- false
+                | _ ->
+                  match second with
+                  | Copy(s', d') when between.Count = 0 && data s' && data d' && s' <> r && d' <> r ->
+                    between.Add(s', d')
+                    k <- k + 1
+                  | _ -> searching <- false
+              | Op instr ->
+                match first with
+                | Copy(src, _) when data src && src <> r && (between |> Seq.forall (fun (_, d') -> not (overlap src d'))) ->
+                  match renameAlu r src instr with
+                  | Some instr' when deadAfterAt k i k (Op instr') r ->
+                    cur[k] <- (Op instr', snd cur[k])
+                    dropped.Add i |> ignore
+                    searching <- false
+                  | _ -> searching <- false
+                | _ -> searching <- false
+              | _ -> searching <- false
+      | _ -> ()
+  cur |> Array.mapi (fun i x -> i, x) |> Array.choose (fun (i, x) -> if dropped.Contains i then None else Some x)
 
 /// (Superseded by the liveness version above; kept for reference.)
 let deadTempsGlobal (temps: int) (items: (Item * int) array) =

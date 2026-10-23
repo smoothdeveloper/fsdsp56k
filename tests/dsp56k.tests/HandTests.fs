@@ -252,14 +252,14 @@ let tests =
       test "all F#" {
         let o = stage []
         has o "correctness: the compiled program matches the .NET kernel, output and state"
-        has o "RENDER mean 2460"
+        has o "RENDER mean 2395"
         Expect.isFalse (o |> Array.exists (fun l -> l.Contains "hand-written")) "no routine"
       }
       test "shape by hand" {
         let o = stage [ "HAND_SHAPE" ]
         has o "correctness: the compiled program matches the .NET kernel, output and state"
-        has o "RENDER mean 2140"
-        has o "shape workshop.hand.shape 2460.0 2140.0 320.0 320 matches .NET"
+        has o "RENDER mean 2107"
+        has o "shape workshop.hand.shape 2395.0 2107.0 288.0 288 matches .NET"
         has o "shape workshop.hand.shape 1024/1024 26 11 15.0"
       }
       test "a routine gone wrong fails the grade, and the table shows which" {
@@ -270,7 +270,7 @@ let tests =
         Expect.equal code 1 out
         let o = normalized out
         Expect.isTrue (o |> Array.exists (fun l -> l.StartsWith "correctness FAILS: output differs")) out
-        Expect.contains o "shape workshop.hand.shape 2460.0 2140.0 320.0 320 matches .NET" "its F# instead matches"
+        Expect.contains o "shape workshop.hand.shape 2395.0 2107.0 288.0 288 matches .NET" "its F# instead matches"
         Expect.contains o "shape workshop.hand.shape 211/1024 26 11 15.0" "on its own, 211 calls of 1024 right"
         Expect.contains o "first difference ($7fffff, $000001): expected $000004, got $000001" "the first arguments it is wrong on"
       }
@@ -282,16 +282,16 @@ let tests =
       test "shape and follow by hand" {
         let o = stage [ "HAND_SHAPE"; "HAND_FOLLOW" ]
         has o "correctness: the compiled program matches the .NET kernel, output and state"
-        has o "RENDER mean 2076"
-        has o "follow workshop.hand.follow 2140.0 2076.0 64.0 64 matches .NET"
-        has o "shape workshop.hand.shape 2460.0 2076.0 384.0 384 matches .NET"
+        has o "RENDER mean 2075"
+        has o "follow workshop.hand.follow 2107.0 2075.0 32.0 32 matches .NET"
+        has o "shape workshop.hand.shape 2427.0 2075.0 352.0 352 matches .NET"
         has o "follow workshop.hand.follow 1024/1024 21 4 17.0"
         let listing = IO.Path.Combine(ToolTests.scratch (), "workshop.asm")
         let code, out = ToolTests.tool [| "grade"; workshop; "--define"; "HAND_SHAPE"; "--define"; "HAND_FOLLOW"; "--listing"; listing |]
         Expect.equal code 0 out
         let code, out = ToolTests.tool [| "check"; listing |]
         Expect.equal code 0 out
-        Expect.stringContains out "71 instructions, 0 disagree with the oracle" "the listing, as source the oracle agrees with"
+        Expect.stringContains out "70 instructions, 0 disagree with the oracle" "the listing, as source the oracle agrees with"
       }
     ]
   ]
