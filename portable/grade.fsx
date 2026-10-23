@@ -1,4 +1,5 @@
-/// Opt-in direct-target benchmark. Existing DSP grading remains unchanged.
+/// Opt-in direct-target benchmark on each portable kernel's full sweep (portable/sweep.fsx grades it
+/// word for word first). Existing DSP grading remains unchanged.
 #load "../src/dsp56k.kernel.intrinsics/Intrinsics.fs"
 #load "Host.fs"
 #load "Targets.fsx"
@@ -19,8 +20,6 @@ let run executable arguments =
   child.WaitForExit()
   if child.ExitCode <> 0 then failwith $"{executable} exited {child.ExitCode}"
 
-let dotnet = Path.Combine(__SOURCE_DIRECTORY__, "bin", "Release", "net10.0", "Portable.Net.dll")
-let javascript = Path.Combine(output, "js", "grade.mjs")
 let args = fsi.CommandLineArgs[1..]
 let legacy = args |> Array.filter (fun value -> Targets.names |> Array.exists (fun name -> value = "--" + name))
 for index, value in Array.indexed args do
@@ -30,28 +29,13 @@ for index, value in Array.indexed args do
 let targets =
   Targets.selected args
     (if legacy.Length = 0 then [| "dotnet"; "javascript" |] else legacy |> Array.map (fun value -> value[2..]))
-let configuration: Targets.Configuration =
-  { root       = root
-    project    = Path.Combine(__SOURCE_DIRECTORY__, "portable.net.fsproj")
-    output     = output
-    manifest   = Path.Combine(__SOURCE_DIRECTORY__, "Cargo.toml")
-    javascript = Path.Combine(output, "js")
-    dotnet     = dotnet }
-
-let step action words blocks = { action = action; words = words; blocks = blocks }
-let scenario first second =
-  [| step "parameters" first 0; step "init" [||] 0; step "trig" [||] 0
-     step "render" [||] 256; step "parameters" second 0; step "render" [||] 128
-     step "trig" [||] 0; step "render" [||] 128 |]
-let cases =
-  [| "sine", scenario [| 0x1800; 0x500000 |] [| 0x3500; 0x100000 |]
-     "pluck", scenario [| 0x1800; 0x7f0000; 0x500000 |] [| 0x3500; 0x700000; 0x300000 |]
-     "input-thru", scenario [| 0; 0x500000 |] [| 1; 0x700000 |] |]
+let configuration = Targets.configure root
+let dotnet        = configuration.dotnet
 
 run "dotnet" [ "fsi"; "portable/prepare.fsx" ]
 Targets.timedBuild configuration "dotnet" "dotnet"
   [ "build"; "portable/portable.net.fsproj"; "-c"; "Release"; "--ignore-failed-sources"; "-p:NuGetAudit=false" ]
-if targets |> Array.exists (fun target -> target = "javascript" || target.StartsWith "dotnet-wasm") then
+if targets |> Array.exists (fun target -> target = "javascript" || target = "rust-wasm" || target.StartsWith "dotnet-wasm") then
   Targets.timedBuild configuration "javascript" "pnpm" [ "--dir"; "portable"; "build" ]
 if targets |> Array.exists (fun target -> target = "rust-native" || target = "rust-wasm") then
   let arguments =
@@ -59,15 +43,19 @@ if targets |> Array.exists (fun target -> target = "rust-native" || target = "ru
     @ (if Array.contains "rust-wasm" targets then [] else [ "--emit-only" ])
   Targets.timedBuild configuration "fable-rust" "dotnet" arguments
 Targets.build configuration targets
+Targets.timedBuild configuration "tests" "dotnet" [ "build"; "tests/dsp56k.tests"; "-v"; "q"; "-nologo" ]
+run "dotnet" [ "fsi"; "portable/sweep.fsx"; "--targets"; String.concat "," targets ]
+let sweeps =
+  File.ReadAllLines(Path.Combine(output, "sweeps.tsv"))[1..] |> Array.map _.Split('\t')
+let cases  = sweeps |> Array.map (fun row -> row[0]) |> Array.distinct
+let toolchain = sweeps |> Array.map (fun row -> row[7]) |> Array.distinct |> Array.exactlyOne
 let rows = ResizeArray<string>()
-rows.Add "kernel\ttarget\truntime\tblocks\tmedian_render_ms\tworst_render_ms\taudio_ms\treal_time_factor\toutput_checks\tstate_checks\tbuffer_checks"
+rows.Add "kernel\ttarget\truntime\tblocks\tmedian_render_ms\tworst_render_ms\taudio_ms\treal_time_factor\toutput_checks\tstate_checks\tbuffer_checks\tscenario\ttoolchain_commit"
 let mutable completed = 0
-for kernel, steps in cases do
-  let fixture: Fixture =
-    { version = 1; kernel = kernel; frames = 32; channels = 1; sampleRate = 44100
-      steps = steps; expected = [||]; buffers = [||] }
+for kernel in cases do
   let path = Path.Combine(output, kernel + ".fixture.json")
-  File.WriteAllText(path, JsonSerializer.Serialize fixture)
+  // the buffers the runners check besides output and state words: from the portable .NET build, which
+  // sweep.fsx has just graded word for word against the kernel
   run "dotnet" [ dotnet; "--reference"; path ]
   for target in targets do
     completed <- completed + 1
@@ -78,7 +66,7 @@ for kernel, steps in cases do
     rows.Add(String.concat "\t"
       [ m.kernel; m.target; m.runtime; string m.blocks; string m.medianRenderMs
         string m.worstRenderMs; string m.audioMs; string m.realTimeFactor
-        string m.outputChecks; string m.stateChecks; string m.bufferChecks ])
+        string m.outputChecks; string m.stateChecks; string m.bufferChecks; "sweep"; toolchain ])
 File.WriteAllLines(Path.Combine(output, "grades.tsv"), rows)
 printfn "Report: out/portable/grades.tsv"
 
