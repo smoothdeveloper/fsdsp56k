@@ -1595,6 +1595,31 @@ module RegionSharedIndex =
   let kernel = Kernel.define "probe-region-shared-index" <@ RegionInduction.init @> <@ RegionInduction.trig @> <@ render @>
 
 
+/// Two X regions read and written in a DO loop through one let-bound index (`let t = Frac.ofRaw i`,
+/// then `s1.write t (s1.read t)` and `s2.write t (s2.read t)`): each access keeps its own region's
+/// stepped register, the scratch words on one and the input ring on the other, where keying the
+/// accesses by their shared index expression gave all four the last region's.
+[<ReflectedDefinition>]
+module RegionSharedLet =
+  let s1 = Scratch.x
+  let s2 = Input.ring
+
+  let init (_: Banks.P) (_: RegionInduction.S) = ()
+
+  let trig (_: Banks.P) (_: RegionInduction.S) =
+    for i in 0 .. 31 do
+      let t = Frac.ofRaw i
+      Region.write s1 t (Region.read s1 t)
+      Region.write s2 t (Region.read s2 t)
+
+  let render (_: Banks.P) (_: RegionInduction.S) (out: Output) =
+    for i in 0 .. 31 do
+      let t = Frac.ofRaw i
+      out.Write(Acc.sat (Acc.ofFrac (Region.read s2 t) - Region.read s1 t))
+
+  let kernel = Kernel.define "probe-region-shared-let" <@ init @> <@ trig @> <@ render @>
+
+
 let probeMachine =
   { Mds.machine "org.fsdsp56k.probe" "PROBE" "GND" "PR" with
       parameters = [| for n in [| "A"; "B"; "C"; "D" |] -> Mds.param n Mds.UnipolarQ23 |] }
@@ -2148,6 +2173,30 @@ let tests =
           Expect.equal (r.dsp.outputs[0][1] &&& 0xffffff) 0x100000 "word 1: 0.25 - 0.125"
           Expect.isLessThanOrEqual r.ours.renderWorst 850 "stepped address registers, within cycle ceiling"
         conformance RegionSharedIndex.kernel 68
+      }
+      test "two X regions through one let-bound index keep their own registers: compiled program equals the .NET kernel" {
+        needNative ()
+        match Optimize.compile Optimize.Direct Kernel.mds RegionSharedLet.kernel with
+        | Error e -> failtest e
+        | Ok c ->
+          let lines = c.items |> Array.map dsp56k.Print.item
+          let at (label: string) = Array.findIndex ((=) label) lines
+          let registers (body: string array) =
+            body |> Array.collect (fun l -> [| for m in Text.RegularExpressions.Regex.Matches(l, @"x:\((r\d)\)") -> m.Groups[1].Value |])
+                 |> Array.countBy id
+          let trig   = registers lines[at "TRIG:" + 1 .. at "RENDER:" - 1]
+          let render = registers lines[at "RENDER:" + 1 ..]
+          Expect.equal (Array.map snd trig) [| 2; 2 |] $"TRIG: a read and a write on each region's own register, {trig}"
+          Expect.equal (Array.map snd render) [| 1; 1 |] $"RENDER: a read on each region's own register, {render}"
+          Expect.isFalse (lines |> Array.exists (fun l -> l.Contains "(r0+n0)")) "no region word through r0+n0"
+        let steps = [ Words [| 0; 0; 0; 0 |]; Init; Trig; Render 1 ]
+        match grade RegionSharedLet.kernel probeMachine None { name = "one block"; steps = steps } |> Result.map keep with
+        | Error e -> failtest e
+        | Ok r ->
+          Expect.isEmpty r.correctness (text r)
+          Expect.equal (r.dsp.outputs[0][5] &&& 0xffffff) (Input.ring.words[5] &&& 0xffffff) "word 5: the input ring's, less the cleared scratch word"
+          Expect.isLessThanOrEqual r.ours.renderWorst 240 "stepped address registers, within cycle ceiling"
+        conformance RegionSharedLet.kernel 69
       }
       test "register locals read in both branches of an if: compiled program equals the .NET kernel" {
         needNative ()
