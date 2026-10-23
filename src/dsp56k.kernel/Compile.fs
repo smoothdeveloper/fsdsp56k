@@ -151,7 +151,7 @@ type Ctx =
     mutable counters : Map<Var, Home>         // loop index -> the word counting it, when read
     mutable inductions : Map<Var * string, int> // (a local stepped by a constant, a region) -> the
                                               // address register at region + local, in a DO loop
-    affineAt : Dictionary<Expr, Mem>          // region index expressions (by reference) affine in a
+    affineAt : Dictionary<Expr, Mem>          // region read/write calls (by reference) affine in a
                                               // DO loop's index -> the word through its register
     taps : Dictionary<Var, Home>              // lets of a ring tap group, read already into their homes
     mutable freeData : Reg list               // X1, Y1 when no local holds them
@@ -1450,8 +1450,8 @@ and genWord (ctx: Ctx) (e: Expr) : unit =
       | Some "acc.sat", [x] -> emit ctx (move (accPart ctx x 2) x0)
       | Some "frac.ofBool", [c] -> genWord ctx (selection ctx (Expr.IfThenElse(c, Expr.Value(box (Frac.ofRaw 1), TyFrac), Ir.zero TyFrac)))
       | Some "table.read", [t; i] -> tableRead ctx t i 1 0 x0
-      | Some "region.read", [_; i] when ctx.affineAt.ContainsKey i ->
-        emit ctx (move ctx.affineAt[i] x0)
+      | Some "region.read", [_; _] when ctx.affineAt.ContainsKey e ->
+        emit ctx (move ctx.affineAt[e] x0)
       | Some "region.read", [r; i] when (inducted ctx r i).IsSome ->
         emit ctx (move (inducted ctx r i).Value x0)
       | Some "region.read", [r; i] ->
@@ -2100,8 +2100,8 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
     store ctx (stateHome (field ctx p.Name)) value
   | ComputedElement ctx (f, w, c, [ value ]) ->
     computedStore ctx w (f.offset + c) (fun () -> emit ctx (move r6 r0)) (computedMem f.bank) value
-  | Intr "region.write" [ _; i; value ] when ctx.affineAt.ContainsKey i ->
-    storeWord ctx value ctx.affineAt[i]
+  | Intr "region.write" [ _; _; value ] when ctx.affineAt.ContainsKey e ->
+    storeWord ctx value ctx.affineAt[e]
   | Intr "region.write" [ r; i; value ] when (inducted ctx r i).IsSome ->
     storeWord ctx value (inducted ctx r i).Value
   | Intr "region.write" [ r; i; value ] ->
@@ -2221,21 +2221,21 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
         | _ -> None
     let consumed = HashSet<Expr>(HashIdentity.Reference)
     let groups = Dictionary<string, Region * Expr option * int * int>()   // key -> region, inv, stride, register (-1: none yet)
-    let accessAt = Dictionary<Expr, string * int>(HashIdentity.Reference) // index -> group key, displacement
-    let take (r: Expr) (i: Expr) =
+    let accessAt = Dictionary<Expr, string * int>(HashIdentity.Reference) // access -> group key, displacement
+    let take (e: Expr) (r: Expr) (i: Expr) =
       match constObject ctx r, affine Map.empty i with
       | Some(:? Region as region), Some(inv, c, d) when c <> 0 ->
         let key = $"{region.name}|{c}|%A{inv}"
         if not (groups.ContainsKey key) then groups[key] <- (region, inv, c, -1)
-        accessAt[i] <- (key, d)
+        accessAt[e] <- (key, d)
         consumed.Add i |> ignore
         true
       | _ -> false
     // a taken index is not looked into (the written value is)
     body |> visit (fun e ->
       match e with
-      | Intr "region.read" [ r; i ] -> not (take r i)
-      | Intr "region.write" [ r; i; _ ] -> take r i |> ignore; true
+      | Intr "region.read" [ r; i ] -> not (take e r i)
+      | Intr "region.write" [ r; i; _ ] -> take e r i |> ignore; true
       | _ when consumed.Contains e -> false
       | _ -> true)
     // lets read only by those indexes (or by other such lets) are not computed
@@ -2271,8 +2271,8 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
         consumed.Clear(); accessAt.Clear(); groups.Clear()
         rewritten |> visit (fun e ->
           match e with
-          | Intr "region.read" [ r; i ] -> not (take r i)
-          | Intr "region.write" [ r; i; _ ] -> take r i |> ignore; true
+          | Intr "region.read" [ r; i ] -> not (take e r i)
+          | Intr "region.write" [ r; i; _ ] -> take e r i |> ignore; true
           | _ when consumed.Contains e -> false
           | _ -> true)
         rewritten
@@ -2367,15 +2367,14 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
               yield reg, c ]
         else
           if groups.Count > 0 then
-            consumed.Clear()
+            consumed.Clear(); accessAt.Clear()
             skipped <- Set.empty
             scan body
           []
-      for KeyValue(i, (key, d)) in accessAt do
-        if consumed.Contains i then
-          let region, _, _, reg = groups[key]
-          ctx.affineAt[i] <- { space = (match region.bank with XMemory -> Space.X | YMemory -> Space.Y)
-                               ea = if d = 0 then Ind reg else Disp(reg, Operand.num d) }
+      for KeyValue(e, (key, d)) in accessAt do
+        let region, _, _, reg = groups[key]
+        ctx.affineAt[e] <- { space = (match region.bank with XMemory -> Space.X | YMemory -> Space.Y)
+                             ea = if d = 0 then Ind reg else Disp(reg, Operand.num d) }
       let counter =
         if counted then
           let h = alloc ctx TFrac
@@ -2441,7 +2440,7 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
       ctx.indexed <- savedIndexed
       ctx.counters <- savedCounters
       ctx.inductions <- savedInductions
-      for i in accessAt.Keys do ctx.affineAt.Remove i |> ignore
+      for e in accessAt.Keys do ctx.affineAt.Remove e |> ignore
       ctx.freeRegs <- (affineRegs |> List.map fst) @ ctx.freeRegs
       for w, c, taken in stepLocals do
         ctx.freeRegs <- taken @ ctx.freeRegs

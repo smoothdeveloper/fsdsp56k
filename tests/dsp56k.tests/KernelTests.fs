@@ -1576,6 +1576,25 @@ module AutoSubs =
   let sizeKernel   = Kernel.define "probe-auto-size" <@ initBig @> <@ initBig @> <@ renderBig @>
 
 
+/// Two regions indexed by the same loop-bound let (`let n = h + 2k`): `drop` substitutes one
+/// index expression into both accesses, and each keeps its own region's stepped register
+/// (`x:(r1)` and `y:(r4)`).
+[<ReflectedDefinition>]
+module RegionSharedIndex =
+  let render (p: Banks.P) (_: RegionInduction.S) (out: Output) =
+    for k in 0 .. 15 do
+      let n = RegionInduction.inc Frac.zero (Acc.hi (Acc.ofFrac (Frac.ofRaw k) <<< 1))
+      Region.write Scratch.x n (Acc.hi (Acc.ofFrac p.a + Frac.ofRaw k))
+      Region.write Scratch.y n (Acc.hi (Acc.ofFrac p.b - Frac.ofRaw k))
+    let h = Acc.hi (Acc.andHi 0x1 (Acc.ofFrac p.c))
+    for k in 0 .. 15 do
+      let n = RegionInduction.inc h (Acc.hi (Acc.ofFrac (Frac.ofRaw k) <<< 1))
+      out.Write(Acc.sat (Region.read Scratch.x n * p.c + Region.read Scratch.y n * p.d))
+      out.Write(Acc.sat (Acc.ofFrac (Region.read Scratch.x n) - Region.read Scratch.y n))
+
+  let kernel = Kernel.define "probe-region-shared-index" <@ RegionInduction.init @> <@ RegionInduction.trig @> <@ render @>
+
+
 let probeMachine =
   { Mds.machine "org.fsdsp56k.probe" "PROBE" "GND" "PR" with
       parameters = [| for n in [| "A"; "B"; "C"; "D" |] -> Mds.param n Mds.UnipolarQ23 |] }
@@ -2111,6 +2130,24 @@ let tests =
           let text = c.items |> Array.map dsp56k.dsl.Transcribe.item
           Expect.isFalse (text |> Array.exists (fun l -> l.Contains "(idx r0)")) "no (r0+n0) access left"
           Expect.isTrue (text |> Array.exists (fun l -> l.StartsWith "lua")) "a register stepped by lua"
+      }
+      test "two regions indexed by the same loop-bound let keep their own registers: compiled program equals the .NET kernel" {
+        needNative ()
+        match Optimize.compile Optimize.Direct Kernel.mds RegionSharedIndex.kernel with
+        | Error e -> failtest e
+        | Ok c ->
+          let lines = c.items |> Array.map dsp56k.Print.item
+          Expect.exists lines (fun l -> l.Contains "x:(r1)") "Scratch.x on r1"
+          Expect.exists lines (fun l -> l.Contains "y:(r4)") "Scratch.y on r4"
+        let steps = [ Words [| 0x200000; 0x100000; 0x400000; 0x300000 |]; Init; Render 1 ]
+        match grade RegionSharedIndex.kernel probeMachine None { name = "one block"; steps = steps } |> Result.map keep with
+        | Error e -> failtest e
+        | Ok r ->
+          Expect.isEmpty r.correctness (text r)
+          Expect.equal (r.dsp.outputs[0][0] &&& 0xffffff) 0x160000 "word 0: 0.25*0.5 + 0.125*0.375"
+          Expect.equal (r.dsp.outputs[0][1] &&& 0xffffff) 0x100000 "word 1: 0.25 - 0.125"
+          Expect.isLessThanOrEqual r.ours.renderWorst 850 "stepped address registers, within cycle ceiling"
+        conformance RegionSharedIndex.kernel 68
       }
       test "register locals read in both branches of an if: compiled program equals the .NET kernel" {
         needNative ()
