@@ -710,13 +710,36 @@ let deadTempsGlobal (temps: int) (items: (Item * int) array) =
 /// where nothing else in the loop writes the register and the straight code before the load does
 /// not read it: done once, before the loop (a parameter, a state word only read there, a
 /// constant such as the zero a silent block writes).
-let hoist (items: (Item * int) array) =
+let hoistFrom (first: int) (temps: int) (items: (Item * int) array) =
   let control (instr: Instr) =
     match instr with
     | Branch _ | Jump _ | Loop _ | Rep _ | Enddo -> true
     | _ -> false
   let overlaps (r: Reg) (ws: Reg array) = ws |> Array.exists (fun w -> Lower.storage w |> Array.exists (fun x -> Array.contains x (Lower.storage r)))
+  let renameUse (fromReg: Reg) (toReg: Reg) (instr: Instr) =
+    let swap r = if r = fromReg then toReg else r
+    match instr with
+    | Par(Some(Binary((AluOp.Add | AluOp.Sub | AluOp.Cmp) as op, s, d)), [||]) when s = fromReg ->
+      Some(Par(Some(Binary(op, toReg, d)), [||]))
+    | Par(Some(Mul(kind, neg, s1, s2, d)), [||]) when s1 = fromReg || s2 = fromReg ->
+      let m = Par(Some(Mul(kind, neg, swap s1, swap s2, d)), [||])
+      if Lower.encodes m then Some m else None
+    | MulI(kind, neg, imm, s, d) when s = fromReg ->
+      Some(MulI(kind, neg, imm, toReg, d))
+    | Par(None, [| Store(s, sp, ea) |]) when s = fromReg ->
+      let m = Par(None, [| Store(toReg, sp, ea) |])
+      if Lower.encodes m then Some m else None
+    | Par(None, [| Copy(s, d) |]) when s = fromReg && d <> toReg ->
+      let m = Par(None, [| Copy(toReg, d) |])
+      if Lower.encodes m then Some m else None
+    | _ -> None
   let once (its: (Item * int) array) =
+    let derivesWorksetAddr =
+      its |> Array.exists (fun (it, _) ->
+        match it with
+        | Op(Lua(Disp(6, _), _)) -> true
+        | Op(Par(_, moves)) -> moves |> Array.exists (function Copy(R 6, _) -> true | _ -> false)
+        | _ -> false)
     let candidate (i: int) (e: int) (k: int) =
       let data (r: Reg) = r = X0 || r = X1 || r = Y0 || r = Y1
       // a workset word (its space and index), or an immediate (None): nothing in memory to watch
@@ -724,31 +747,31 @@ let hoist (items: (Item * int) array) =
         match fst its[k] with
         | Op(Par(None, [| Load(space, ea, dst) |])) when data dst ->
           match workset space ea with
-          | Some(SMem(_, w)) -> Some(dst, Some(space, w))
+          | Some(SMem(_, w)) -> Some(dst, Some(space, w), fun d -> Op(Par(None, [| Load(space, ea, d) |])))
           | _ -> None
         // not a word the loader patches: it stays at its label
-        | Op(Par(None, [| Imm(_, dst) |])) when data dst && not (k > 0 && (match fst its[k - 1] with Comment t -> t.StartsWith machinedrum.Abi.markerPrefix | _ -> false)) ->
-          Some(dst, None)
+        | Op(Par(None, [| Imm(op, dst) |])) when data dst && not (k > 0 && (match fst its[k - 1] with Comment t -> t.StartsWith machinedrum.Abi.markerPrefix | _ -> false)) ->
+          Some(dst, None, fun d -> Op(Par(None, [| Imm(op, d) |])))
         | _ -> None
       match source with
-      | Some(dst, word) ->
+      | Some(dst, word, rebuild) ->
           // every pass reaches the load: what comes before it branches only forward to it or
           // short of it, and does not read the register
           let inside (t: Operand) =
             match t.expr with
             | Sym l -> its |> Array.tryFindIndex (fun (x, _) -> x = Label l) |> Option.exists (fun at -> at > i && at <= k)
             | _ -> false
-          let before =
+          let before (r: Reg) =
             [ i + 1 .. k - 1 ] |> List.forall (fun j ->
               match fst its[j] with
               | Comment _ | Label _ -> true
               | Op(Branch((Bcc _ | Bra), t)) -> inside t
               | Op instr when not (control instr) ->
                 match readsOf instr with
-                | Some rs -> not (overlaps dst rs)
+                | Some rs -> not (overlaps r rs)
                 | None -> false
               | _ -> false)
-          let others =
+          let invariantWord =
             [ i + 1 .. e - 1 ] |> List.forall (fun j ->
               j = k ||
               match fst its[j] with
@@ -759,45 +782,116 @@ let hoist (items: (Item * int) array) =
                     match word with
                     | None -> true
                     | Some(space, w) ->
+                      let unaliased =
+                        (space = Space.X && w >= first && w < temps)
+                        || (space = Space.Y && w >= 1 && w < 9)
+                        || not derivesWorksetAddr
                       moves |> Array.forall (fun m ->
                         match m with
                         | Store(_, sp, ea') when sp = space ->
                           match workset sp ea', ea' with
                           | Some(SMem(_, w')), _ -> w' <> w
                           | None, PostInc 7 -> true
+                          | None, _ when unaliased -> true
                           | _ -> false
                         | _ -> true)
                   | _ -> true
                 match writesOf instr with
-                | Some ws -> stores && not (overlaps dst ws) && not (Array.contains (R 6) ws)
+                | Some ws -> stores && not (Array.contains (R 6) ws)
                 // a subroutine may write the word
                 | None -> control instr && (match instr with Branch((Bsr | Bscc _), _) | Jump((Jsr | Jscc _), _) -> false | _ -> true)
               | _ -> true)
-          before && others
-      | None -> false
+          let noWrites (r: Reg) =
+            [ i + 1 .. e - 1 ] |> List.forall (fun j ->
+              j = k ||
+              match fst its[j] with
+              | Op instr ->
+                match writesOf instr with
+                | Some ws -> not (overlaps r ws)
+                | None -> control instr
+              | _ -> true)
+          if not invariantWord then None
+          elif before dst && noWrites dst then Some(fst its[k], None)
+          elif dst = X0 || dst = Y0 then
+            let alt = if dst = X0 then Y0 else X0
+            let altFree =
+              before alt && noWrites alt
+              && ([ i + 1 .. e - 1 ] |> List.forall (fun j ->
+                    match fst its[j] with
+                    | Op instr when not (control instr) ->
+                      match readsOf instr with Some rs -> not (overlaps alt rs) | None -> false
+                    | _ -> true))
+              && deadAfter its (e + 1) alt
+            if not altFree then None
+            else
+              let mutable u = k + 1
+              while u < e && (match fst its[u] with Comment _ -> true | _ -> false) do u <- u + 1
+              if u >= e then None
+              else
+                match fst its[u] with
+                | Op instr ->
+                  match renameUse dst alt instr with
+                  | Some instr' ->
+                    let quietAfterU =
+                      [ u + 1 .. e - 1 ] |> List.forall (fun j ->
+                        match fst its[j] with
+                        | Comment _ -> true
+                        | Op ins when not (control ins) ->
+                          match readsOf ins, writesOf ins with
+                          | Some rs, Some ws -> not (overlaps dst rs) && not (overlaps dst ws)
+                          | _ -> false
+                        | _ -> false)
+                    let rec deadBefore limit j =
+                      if j >= limit then false
+                      else
+                        match fst its[j] with
+                        | Comment _ -> deadBefore limit (j + 1)
+                        | Op ins when not (control ins) ->
+                          match readsOf ins, writesOf ins with
+                          | Some rs, Some ws ->
+                            if overlaps dst rs then false
+                            elif ws |> Array.exists (fun x -> parts x = parts dst || x = dst) then true
+                            else deadBefore limit (j + 1)
+                          | _ -> false
+                        | _ -> false
+                    let dstDead =
+                      deadBefore e (u + 1)
+                      || (quietAfterU && deadBefore k (i + 1) && deadAfter its (e + 1) dst)
+                    if dstDead then Some(rebuild alt, Some(u, Op instr')) else None
+                  | None -> None
+                | _ -> None
+          else None
+      | None -> None
     its |> Array.indexed |> Array.tryPick (fun (i, (it, _)) ->
       match it with
       | Op(Loop(_, _, { expr = Sym name })) ->
         match its |> Array.tryFindIndex (fun (x, _) -> x = Label name) with
         | Some e when e > i ->
-          [ i + 1 .. e - 1 ] |> List.tryFind (candidate i e) |> Option.map (fun k ->
-            // before the loop's label and relocation marker
-            let mutable p = i
-            if p > 0 && fst its[p - 1] = machinedrum.Abi.relocateMarker then p <- p - 1
-            if p > 0 && (match fst its[p - 1] with Label l -> l.EndsWith "_DO" | _ -> false) then p <- p - 1
-            k, p)
+          [ i + 1 .. e - 1 ] |> List.tryPick (fun k ->
+            candidate i e k |> Option.map (fun (hoisted, rewrite) ->
+              // before the loop's label and relocation marker
+              let mutable p = i
+              if p > 0 && fst its[p - 1] = machinedrum.Abi.relocateMarker then p <- p - 1
+              if p > 0 && (match fst its[p - 1] with Label l -> l.EndsWith "_DO" | _ -> false) then p <- p - 1
+              k, p, hoisted, rewrite))
         | _ -> None
       | _ -> None)
   let mutable cur = items
   let mutable go = true
   while go do
     match once cur with
-    | Some(k, p) ->
-      let moved = cur[k]
-      let rest = cur |> Array.removeAt k
+    | Some(k, p, hoisted, rewrite) ->
+      let moved = hoisted, snd cur[k]
+      let cur' =
+        match rewrite with
+        | Some(u, it') -> cur |> Array.mapi (fun idx x -> if idx = u then (it', snd x) else x)
+        | None -> cur
+      let rest = cur' |> Array.removeAt k
       cur <- rest |> Array.insertAt p moved
     | None -> go <- false
   cur
+
+let hoist (items: (Item * int) array) = hoistFrom 0 0 items
 
 /// Lower.pack with each item's source line kept (a merged instruction takes the first's), across
 /// the comments quoting the F# (they follow the merged instruction).
@@ -1448,7 +1542,7 @@ let runWith (p: Passes) (first: int) (temps: int) (items: Item array) (lines: in
   for _ in 1 .. 2 do
     step p.forward forward
     step p.copyForward copyForward
-  step p.hoist hoist
+  step p.hoist (hoistFrom first temps)
   step p.pack pack
   step p.rotate (rotate >> (if p.pack then pack else id))
   cur <- thawHand regions cur
