@@ -132,9 +132,12 @@ type Ctx =
     layout   : Layout
     items    : ResizeArray<Item>
     lines    : ResizeArray<int>     // the F# line each item came from (0: none)
+    origins  : ResizeArray<int>     // the provenance origin id each item came from (> 0)
     mutable line   : int        // the latest debug range's line, in any file (source comments)
     mutable sourceLine : int    // the latest line in the entry's own file: what `lines` records
+    mutable origin : int        // the latest provenance origin id (> 0)
     mutable sourceFile : string option   // the entry's file (its definition's debug range)
+    sink     : Sink             // opaque diagnostics sink for compilation/optimisation facts
     mutable vars   : Map<Var, Home>
     mutable consts : Map<Var, obj>
     mutable next   : int        // first free local word: X+0 .. are the [<XMemory>] state, words
@@ -227,6 +230,7 @@ let emit (ctx: Ctx) (it: Item) =
   if ctx.bHeld && not ctx.bWrite && writesB it then raise BTaken
   ctx.items.Add it
   ctx.lines.Add ctx.sourceLine
+  ctx.origins.Add (if ctx.origin > 0 then ctx.origin elif ctx.sourceLine > 0 then ctx.sourceLine else Origin.synthetic)
 
 let emitAll (ctx: Ctx) (its: Item seq) = for it in its do emit ctx it
 
@@ -244,6 +248,7 @@ let mutable sourceComments = true
 /// sourceComments is on). Items record the line of the entry's own file: code inlined from a
 /// helper in another file keeps the line of its call.
 let at' (ctx: Ctx) (e: Expr) =
+  if e.Range.IsSome && e.Origin > 0 then ctx.origin <- e.Origin
   match debugRange e with
   | Some(file, line) ->
     if ctx.sourceFile |> Option.forall ((=) file) then ctx.sourceLine <- line
@@ -261,12 +266,15 @@ let at' (ctx: Ctx) (e: Expr) =
 /// enclosing line again afterwards: an inlined helper's body takes its own lines in Compiled.lines, not those of its call.
 /// No comment is emitted, so the code is the same as without it.
 let lined (ctx: Ctx) (e: Expr) (gen: unit -> unit) =
+  let savedOrigin = ctx.origin
+  if e.Range.IsSome && e.Origin > 0 then ctx.origin <- e.Origin
   match debugRange e with
   | Some(file, line) when ctx.sourceFile |> Option.forall ((=) file) ->
     let saved = ctx.sourceLine
     ctx.sourceLine <- line
-    try gen () finally ctx.sourceLine <- saved
-  | _ -> gen ()
+    try gen () finally ctx.sourceLine <- saved; ctx.origin <- savedOrigin
+  | _ ->
+    try gen () finally ctx.origin <- savedOrigin
 
 let fresh (ctx: Ctx) what =
   ctx.labels <- ctx.labels + 1
@@ -1332,7 +1340,7 @@ let fuseSpine (ctx: Ctx) (root: Expr) : Expr =
                 match c1Info, nextLoop with
                 | Some(c1Idx, reg1, st1), Some loop2Idx ->
                   match items[loop2Idx] with
-                  | SStmt(ForIntegerRangeLoop(i2, lo2, hi2, body2)) when not (ctx.unrolled.Contains i2) ->
+                  | SStmt(ForIntegerRangeLoop(i2, lo2, hi2, body2) as loop2Expr) when not (ctx.unrolled.Contains i2) ->
                     match tryConst ctx lo2, tryConst ctx hi2 with
                     | Some(:? int as l2), Some(:? int as h2) when l2 = l1 && h2 = h1 && not (mentions i2 body2) ->
                       let c2Candidates =
@@ -1474,6 +1482,7 @@ let fuseSpine (ctx: Ctx) (root: Expr) : Expr =
                                             when c = c2 && intrinsic putMi2 = Some "cursor.put" ->
                                           yield idx, val2, putCall2
                                         | _ -> () ]
+                                let mergedOrigin = Origin.merge loop1Expr.Origin loop2Expr.Origin
                                 let caseA =
                                   match putPositions with
                                   | [ (putIdx, val2, putCall2) ]
@@ -1496,7 +1505,7 @@ let fuseSpine (ctx: Ctx) (root: Expr) : Expr =
                                           SStmt(Expr.Call(Expr.Var c1, putMi1, [ ordered (replaceCursorRead c2 rep val2) ]).WithRange(putCall2.Range))
                                         let b2Suffix = List.ofArray b2Items[putIdx + 1 ..]
                                         let fusedBody = ofSpine (b1Prefix' @ b2PrefixReplaced @ [ putReplaced ] @ b2Suffix)
-                                        let fusedLoop = SStmt(Expr.ForIntegerRangeLoop(i1, lo1, hi1, fusedBody).WithRange(loop1Expr.Range))
+                                        let fusedLoop = SStmt(Expr.ForIntegerRangeLoop(i1, lo1, hi1, fusedBody).WithRange(loop1Expr.Range).WithOrigin(mergedOrigin))
                                         Some(
                                           Array.concat
                                             [ items[0 .. loop1Idx - 1]
@@ -1520,7 +1529,7 @@ let fuseSpine (ctx: Ctx) (root: Expr) : Expr =
                                     let b1Prefix', rep = chooseReplacement true
                                     let b2Replaced = b2Items |> Array.map (replaceInItem c2 rep) |> List.ofArray
                                     let fusedBody = ofSpine (b1Prefix' @ b2Replaced)
-                                    let fusedLoop = SStmt(Expr.ForIntegerRangeLoop(i1, lo1, hi1, fusedBody).WithRange(loop1Expr.Range))
+                                    let fusedLoop = SStmt(Expr.ForIntegerRangeLoop(i1, lo1, hi1, fusedBody).WithRange(loop1Expr.Range).WithOrigin(mergedOrigin))
                                     let beforeLoop1 =
                                       [| for k in 0 .. loop1Idx - 1 do if k <> c1Idx then yield items[k] |]
                                     Some(
@@ -1554,8 +1563,9 @@ let fuseSpine (ctx: Ctx) (root: Expr) : Expr =
 let snapshot (ctx: Ctx) =
   let count = ctx.items.Count
   let bindings = ctx.bindings.Count
+  let restoreSink = Sink.snapshot ctx.sink
   let line, vars, consts, next, high, cursors, freeRegs, conts = ctx.line, ctx.vars, ctx.consts, ctx.next, ctx.high, ctx.cursors, ctx.freeRegs, ctx.conts
-  let sourceLine = ctx.sourceLine
+  let sourceLine, origin = ctx.sourceLine, ctx.origin
   let released, deadLocals = List.ofSeq ctx.released, List.ofSeq ctx.deadLocals
   let trackHome, indexed, counters, freeData, tables = ctx.trackHome, ctx.indexed, ctx.counters, ctx.freeData, ctx.tables.Count
   let inductions = ctx.inductions
@@ -1567,8 +1577,10 @@ let snapshot (ctx: Ctx) =
     ctx.items.RemoveRange(count, ctx.items.Count - count)
     ctx.bindings.RemoveRange(bindings, ctx.bindings.Count - bindings)
     ctx.lines.RemoveRange(count, ctx.lines.Count - count)
+    ctx.origins.RemoveRange(count, ctx.origins.Count - count)
+    restoreSink ()
     ctx.tables.RemoveRange(tables, ctx.tables.Count - tables)
-    ctx.line <- line; ctx.sourceLine <- sourceLine; ctx.vars <- vars; ctx.consts <- consts; ctx.next <- next; ctx.high <- high
+    ctx.line <- line; ctx.sourceLine <- sourceLine; ctx.origin <- origin; ctx.vars <- vars; ctx.consts <- consts; ctx.next <- next; ctx.high <- high
     ctx.cursors <- cursors; ctx.freeRegs <- freeRegs; ctx.conts <- conts
     ctx.released.Clear(); ctx.released.UnionWith released
     ctx.deadLocals.Clear(); ctx.deadLocals.UnionWith deadLocals
@@ -3544,7 +3556,8 @@ and compileSub (ctx: Ctx) (sub: Sub) =
 /// A subroutine compiled from its F#.
 and compileFSharpSub (ctx: Ctx) (sub: Sub) =
   sub.compiled <- true
-  let ps, body = parametersOf (reflected sub.mi).Value
+  let def = (reflected sub.mi).Value
+  let ps, body = parametersOf def
   ctx.vars <- Map.empty; ctx.consts <- Map.empty; ctx.cursors <- Map.empty
   ctx.indexed <- Map.empty; ctx.counters <- Map.empty; ctx.conts <- []; ctx.pending <- []
   ctx.released.Clear(); ctx.deadLocals.Clear()
@@ -3554,7 +3567,7 @@ and compileFSharpSub (ctx: Ctx) (sub: Sub) =
   sub.start <- ctx.next
   ctx.depth <- 0; ctx.deepest <- 0
   ctx.inSub <- Some sub
-  ctx.line <- 0; ctx.sourceLine <- 0
+  ctx.line <- 0; ctx.sourceLine <- 0; ctx.origin <- def.Origin
   emit ctx (Label sub.label)
   let mutable nf, na = 0, 0
   let mutable body = body
@@ -3597,7 +3610,7 @@ and handSub (ctx: Ctx) (sub: Sub) (r: Hand.Routine) =
   Hand.check sub.mi.Name r items free ctx.layout false
   sub.start <- max (sub.sites |> Seq.map _.next |> Seq.max) (defaultArg (ctx.floors.TryFind (subKey sub.mi)) 0)
   sub.deepest <- Hand.depth items
-  ctx.line <- 0; ctx.sourceLine <- 0
+  ctx.line <- 0; ctx.sourceLine <- 0; ctx.origin <- Origin.ofRange { file = r.name; line = 1 }
   emit ctx (Label sub.label)
   emit ctx (Comment $"hand: {r.name}")
   emitAll ctx (Hand.relocated $"HAND_{sub.label}" (Hand.relabel (fun l -> $"{l}_{sub.label}") (Hand.withoutRts items)))
@@ -3687,6 +3700,8 @@ type Compiled =
     layout   : Layout
     items    : Item array
     lines    : int array        // per item, the F# line it came from (0: none)
+    origins  : int array        // per item, the provenance origin id (> 0) pointing back to F# source ranges
+    facts    : Fact list        // diagnostic facts written to the sink during compilation and optimisation
     source   : string option    // the kernel's F# file, from the quotations' debug ranges
     xWorkset : int              // X words used: the [<XMemory>] state (layout.xWorkset), then locals and spills
     yWorkset : int              // Y words used: layout.yWorkset, then locals spilled past the X workset
@@ -3707,7 +3722,7 @@ let entry (ctx: Ctx) (name: string) (mi: Member) =
       body rest
     | e -> e
   ctx.next <- ctx.layout.xWorkset
-  ctx.line <- 0; ctx.sourceLine <- 0
+  ctx.line <- 0; ctx.sourceLine <- 0; ctx.origin <- def.Origin
   ctx.trackHome <- None
   let rec reads (e: Expr) =
     match e with
@@ -3732,7 +3747,7 @@ let entry (ctx: Ctx) (name: string) (mi: Member) =
     let h = alloc ctx TFrac
     ctx.trackHome <- Some h
     emit ctx (move r1 (at h 0))
-  ctx.line <- 0; ctx.sourceLine <- 0
+  ctx.line <- 0; ctx.sourceLine <- 0; ctx.origin <- norm.Origin
   genStmt ctx (ordered norm)
   emit ctx rts
 
@@ -3864,11 +3879,13 @@ let helperUses (k: IrKernel) =
 /// words from at least the given word.
 exception Refloor of Map<string, int>
 
-let rec generateWith (handOff: Set<string>) (chosen: Set<string>) (floors: Map<string, int>) (unswitchMax: int option) (target: Target) (ik: IrKernel) : Result<Compiled * int list, string> =
+let rec generateWithSink (sink: Sink) (handOff: Set<string>) (chosen: Set<string>) (floors: Map<string, int>) (unswitchMax: int option) (target: Target) (ik: IrKernel) : Result<Compiled * int list, string> =
   try
     let layout = layoutOf target ik.name ik.parameters (defaultArg ik.state [||])
+    let restoreSink = Sink.snapshot sink
     let ctx =
-      { target = target; kernel = ik; layout = layout; items = ResizeArray(); lines = ResizeArray(); line = 0; sourceLine = 0; sourceFile = None
+      { target = target; kernel = ik; layout = layout; items = ResizeArray(); lines = ResizeArray(); origins = ResizeArray()
+        line = 0; sourceLine = 0; origin = Origin.synthetic; sourceFile = None; sink = sink
         vars = Map.empty; consts = Map.empty; next = layout.xWorkset; high = layout.xWorkset; labels = 0
         cursors = Map.empty; freeRegs = [ 1; 2; 3; 4; 5 ]; tables = ResizeArray(); conts = []; released = Collections.Generic.HashSet(); trackHome = None
         indexed = Map.empty; counters = Map.empty; inductions = Map.empty; affineAt = Dictionary(HashIdentity.Reference); taps = Dictionary(); freeData = [ X1; Y1 ]; scores = Dictionary(); deadLocals = HashSet()
@@ -3890,7 +3907,9 @@ let rec generateWith (handOff: Set<string>) (chosen: Set<string>) (floors: Map<s
       [ for s in ctx.subs.Values do
           let highest = s.sites |> Seq.map _.next |> Seq.max
           if highest > s.start then yield subKey s.mi, highest ]
-    if not low.IsEmpty then raise (Refloor(low |> List.fold (fun m (mi, n) -> Map.add mi n m) floors))
+    if not low.IsEmpty then
+      restoreSink ()
+      raise (Refloor(low |> List.fold (fun m (mi, n) -> Map.add mi n m) floors))
     // system stack levels: a call one, a DO loop two, what the subroutine itself takes
     let rec need (s: Sub) : int =
       let inner =
@@ -3910,18 +3929,24 @@ let rec generateWith (handOff: Set<string>) (chosen: Set<string>) (floors: Map<s
       fail $"{ik.name}: RENDER writes {n} words, the block is {target.blockText}"
     | _ -> ()
     ctx.line <- 0; ctx.sourceLine <- 0
+    ctx.origin <- reflected ik.render |> Option.map _.Origin |> Option.defaultValue Origin.synthetic
     for t in ctx.tables do
       emit ctx (Label(tableLabel t))
       for row in Array.chunkBySize 8 t.words do
         emit ctx (Dc(row |> Array.map (fun w -> Num(int64 w))))
     let source = reflected ik.render |> Option.bind debugRange |> Option.map fst
+    let facts = Sink.toList sink
     Ok({ kernel = ik; target = target; layout = ctx.layout; items = ctx.items.ToArray(); lines = ctx.lines.ToArray()
+         origins = ctx.origins.ToArray(); facts = facts
          source = source; xWorkset = min ctx.high target.xLimit
          yWorkset = ctx.layout.yWorkset + max 0 (ctx.high - target.xLimit)
          bindings = ctx.bindings.ToArray() }, List.ofSeq ctx.unswitchCosts)
   with
   | KernelError m -> Error m
-  | Refloor floors' when floors'.Count <= 64 && floors' <> floors -> generateWith handOff chosen floors' unswitchMax target ik
+  | Refloor floors' when floors'.Count <= 64 && floors' <> floors -> generateWithSink sink handOff chosen floors' unswitchMax target ik
+
+let generateWith (handOff: Set<string>) (chosen: Set<string>) (floors: Map<string, int>) (unswitchMax: int option) (target: Target) (ik: IrKernel) : Result<Compiled * int list, string> =
+  generateWithSink Sink.none handOff chosen floors unswitchMax target ik
 
 /// The compiled kernel, its size not checked, each loop unswitched only when its copy takes at
 /// most `unswitchMax` words (None: any); and what each unswitched loop's copy took.
@@ -3929,13 +3954,13 @@ let rec generateWith (handOff: Set<string>) (chosen: Set<string>) (floors: Map<s
 /// than a thread pool thread's stack holds. It runs on its own thread with a 256 MB stack.
 /// `chosen`: helpers (by key) called as subroutines besides the [<Subroutine>] ones; `handOff`:
 /// [<HandWritten>] helpers (by key) compiled from their F# reference instead of their routine.
-let generateIrWith (handOff: Set<string>) (chosen: Set<string>) (unswitchMax: int option) (target: Target) (k: IrKernel) =
+let generateIrWithSink (sink: Sink) (handOff: Set<string>) (chosen: Set<string>) (unswitchMax: int option) (target: Target) (k: IrKernel) =
   let mutable result = Unchecked.defaultof<Result<Compiled * int list, string>>
   let mutable failure : System.Runtime.ExceptionServices.ExceptionDispatchInfo option = None
   let t =
     System.Threading.Thread(
       (fun () ->
-        try result <- generateWith handOff chosen Map.empty unswitchMax target k
+        try result <- generateWithSink sink handOff chosen Map.empty unswitchMax target k
         with e -> failure <- Some(System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture e)),
       256 * 1024 * 1024)
   t.Start()
@@ -3943,6 +3968,9 @@ let generateIrWith (handOff: Set<string>) (chosen: Set<string>) (unswitchMax: in
   // what it raised, as raised (callers catch KernelError)
   failure |> Option.iter (fun f -> f.Throw())
   result
+
+let generateIrWith (handOff: Set<string>) (chosen: Set<string>) (unswitchMax: int option) (target: Target) (k: IrKernel) =
+  generateIrWithSink Sink.none handOff chosen unswitchMax target k
 
 /// As generateIrWith, every hand routine used.
 let generateIrChoosing (chosen: Set<string>) (unswitchMax: int option) (target: Target) (k: IrKernel) =

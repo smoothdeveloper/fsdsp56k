@@ -225,6 +225,8 @@ type GradeArgs =
   | Calls of int
   | Seed of int
   | Listing of path: string
+  | Lint_Layer of layer: string
+  | Kudos
   interface IArgParserTemplate with
     member a.Usage =
       match a with
@@ -235,6 +237,8 @@ type GradeArgs =
       | Calls _ -> "argument sets each hand-written helper is called with on its own (default 1024)."
       | Seed _ -> "seed of those arguments (default 1)."
       | Listing _ -> "write the graded program as Motorola-syntax source, for asm, check and machinedrum pack."
+      | Lint_Layer _ -> "restrict lints and kudos to one layer: ir or asm (default: both)."
+      | Kudos -> "emit verified-outcome kudos and the per-kernel authoring score summary."
 
 type Command =
   | [<CliPrefix(CliPrefix.None)>] Asm of ParseResults<AsmArgs>

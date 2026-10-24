@@ -1394,7 +1394,7 @@ let pack (items: (Item * int) array) =
         | _ -> None
       match merged with
       | Some m ->
-        out.Add(m, (if snd cur[i] > 0 then snd cur[i] else snd cur[j]))
+        out.Add(m, Ir.Origin.merge (snd cur[i]) (snd cur[j]))
         for k in i + 1 .. j - 1 do out.Add cur[k]
         changed <- true
         i <- j + 1
@@ -2631,7 +2631,7 @@ let walkWith (yLimit: int) (items: (Item * int) array) =
                                 | _ -> false
                               | None -> false
                             if endValid && Lower.encodes (Par(alu, moves')) then
-                              foldCur[pIdx] <- (Op(Par(alu, moves')), snd foldCur[pIdx])
+                              foldCur[pIdx] <- (Op(Par(alu, moves')), Ir.Origin.merge (snd foldCur[pIdx]) (snd foldCur[uIdx]))
                               dropped.Add uIdx |> ignore
                           | None -> ()
                       | _ -> ()
@@ -2742,8 +2742,9 @@ let freezeHand (items: (Item * int) array) =
       out.Add items[i]
       i <- i + 1
   for k in 0 .. regions.Count - 1 do
-    out.Add(Label(handStub k), 0)
-    out.Add(Op Rts, 0)
+    let orig = if regions[k].Length > 0 && snd (regions[k][0]) > 0 then snd (regions[k][0]) else Ir.Origin.synthetic
+    out.Add(Label(handStub k), orig)
+    out.Add(Op Rts, orig)
   out.ToArray(), regions.ToArray()
 
 /// The hand-written stretches back where their stubs' calls are, each exactly once, the stubs gone.
@@ -2767,59 +2768,89 @@ let thawHand (regions: (Item * int) array array) (items: (Item * int) array) =
     if seen.Count <> regions.Length then Kernel.fail "an optimizer pass dropped hand-written code"
     out.ToArray()
 
+/// Verifies that every emitted instruction (`Op _`) carries a positive provenance origin id; raises
+/// `KernelError` if a pass dropped one.
+let checkOrigins (passName: string) (items: (Item * int) array) =
+  for i in 0 .. items.Length - 1 do
+    match items[i] with
+    | Op _, orig when orig <= 0 ->
+      Kernel.fail $"optimizer pass '{passName}' dropped provenance origin at item {i} ({Print.item (fst items[i])})"
+    | _ -> ()
+
+/// Runs a pass and verifies that no emitted instruction lost its provenance origin.
+let runPassChecked (passName: string) (pass: (Item * int) array -> (Item * int) array) (items: (Item * int) array) =
+  checkOrigins $"{passName} (input)" items
+  let next = pass items
+  checkOrigins passName next
+  next
+
 /// The passes of `p`; the compiler's temporaries are X words `first` up to `temps` and Y words
 /// `yFirst` up to `yTemps`.
-let runWithY (p: Passes) (first: int) (temps: int) (yFirst: int) (yTemps: int) (items: Item array) (lines: int array) =
-  let frozen, regions = freezeHand (Array.zip items lines)
+let runWithYSink (sink: Ir.Sink) (p: Passes) (first: int) (temps: int) (yFirst: int) (yTemps: int) (items: Item array) (lines: int array) =
+  let zipped = Array.zip items lines
+  let enforceOrigins = zipped |> Array.forall (fun (it, o) -> match it with Op _ -> o > 0 | _ -> true)
+  let frozen, regions = freezeHand zipped
   let mutable cur = frozen
   let yf, yt = if first < 64 then yFirst, yTemps else 0, 0
   let yLim = if first >= 64 && yTemps > yFirst then yFirst else 64
   // a pass's rewrite, kept when it is no worse (when the passes are guarded)
-  let step (on: bool) (pass: (Item * int) array -> (Item * int) array) =
+  let step (name: string) (on: bool) (pass: (Item * int) array -> (Item * int) array) =
     if on then
       let next = pass cur
-      if not p.monotone || staticCost next <= staticCost cur then cur <- next
+      if enforceOrigins then checkOrigins name next
+      if not p.monotone || staticCost next <= staticCost cur then
+        if next.Length <> cur.Length || next <> cur then
+          let orig = next |> Array.tryPick (fun (it, o) -> match it with Op _ when o > 0 -> Some o | _ -> None) |> Option.defaultValue Ir.Origin.synthetic
+          Ir.Sink.record sink orig Ir.AsmLayer $"opt.{name}" $"{cur.Length}->{next.Length}"
+        cur <- next
   for _ in 1 .. 3 do
-    step p.forward forward
-    step p.copyForward copyForward
-    step p.deadTemps (deadTempsFromY first temps yf yt)
+    step "forward" p.forward forward
+    step "copyForward" p.copyForward copyForward
+    step "deadTemps" p.deadTemps (deadTempsFromY first temps yf yt)
   for _ in 1 .. 2 do
-    step p.accCopies (forwardWith true true)
-    step p.copyForward copyForward
-    step p.deadTemps (deadTempsFromY first temps yf yt)
-  step p.joins (joinAccumulatorsY first temps yf yt)
-  if p.joins then step p.deadTemps (deadTempsFromY first temps yf yt)
-  step p.promote (promoteY first temps yf yt)
-  step p.assign (assignY first temps yf yt)
+    step "accCopies" p.accCopies (forwardWith true true)
+    step "copyForward" p.copyForward copyForward
+    step "deadTemps" p.deadTemps (deadTempsFromY first temps yf yt)
+  step "joins" p.joins (joinAccumulatorsY first temps yf yt)
+  if p.joins then step "deadTemps" p.deadTemps (deadTempsFromY first temps yf yt)
+  step "promote" p.promote (promoteY first temps yf yt)
+  step "assign" p.assign (assignY first temps yf yt)
   for _ in 1 .. 2 do
-    step p.forward (forwardWith p.accCopies false)
-    step p.copyForward copyForward
-    step p.deadTemps (deadTempsFromY first temps yf yt)
-  step p.joins (joinAccumulatorsY first temps yf yt)
+    step "forward" p.forward (forwardWith p.accCopies false)
+    step "copyForward" p.copyForward copyForward
+    step "deadTemps" p.deadTemps (deadTempsFromY first temps yf yt)
+  step "joins" p.joins (joinAccumulatorsY first temps yf yt)
   if p.joins then
-    step p.deadTemps (deadTempsFromY first temps yf yt)
-    step p.forward (forwardWith p.accCopies false)
-    step p.copyForward (copyForwardWith true)
-    step p.deadTemps (deadTempsFromY first temps yf yt)
-  step p.hoist (hoistFromY first temps yf yt)
-  step p.copyForward (copyForwardWith true)
-  step p.walk (walkWith yLim)
-  step p.pack pack
-  step p.rotate (rotate >> (if p.pack then pack else id))
+    step "deadTemps" p.deadTemps (deadTempsFromY first temps yf yt)
+    step "forward" p.forward (forwardWith p.accCopies false)
+    step "copyForward" p.copyForward (copyForwardWith true)
+    step "deadTemps" p.deadTemps (deadTempsFromY first temps yf yt)
+  step "hoist" p.hoist (hoistFromY first temps yf yt)
+  step "copyForward" p.copyForward (copyForwardWith true)
+  step "walk" p.walk (walkWith yLim)
+  step "pack" p.pack pack
+  step "rotate" p.rotate (rotate >> (if p.pack then pack else id))
   cur <- thawHand regions cur
   cur <- fixLoops cur
+  if enforceOrigins then checkOrigins "fixLoops" cur
   Array.map fst cur, Array.map snd cur
+
+let runWithY (p: Passes) (first: int) (temps: int) (yFirst: int) (yTemps: int) (items: Item array) (lines: int array) =
+  runWithYSink Ir.Sink.none p first temps yFirst yTemps items lines
 
 let runWith (p: Passes) (first: int) (temps: int) (items: Item array) (lines: int array) =
   runWithY p first temps 0 0 items lines
 
 /// The passes of `level`; the compiler's temporaries are X words `first` up to `temps` and Y
 /// words `yFirst` up to `yTemps`.
-let runFromY (level: Level) (first: int) (temps: int) (yFirst: int) (yTemps: int) (items: Item array) (lines: int array) =
+let runFromYSink (sink: Ir.Sink) (level: Level) (first: int) (temps: int) (yFirst: int) (yTemps: int) (items: Item array) (lines: int array) =
   match level with
   | Direct -> items, lines
-  | Peephole -> runWithY Passes.all first temps yFirst yTemps items lines
-  | Chosen p -> runWithY p first temps yFirst yTemps items lines
+  | Peephole -> runWithYSink sink Passes.all first temps yFirst yTemps items lines
+  | Chosen p -> runWithYSink sink p first temps yFirst yTemps items lines
+
+let runFromY (level: Level) (first: int) (temps: int) (yFirst: int) (yTemps: int) (items: Item array) (lines: int array) =
+  runFromYSink Ir.Sink.none level first temps yFirst yTemps items lines
 
 /// The passes of `level`; the compiler's temporaries are X words `first` up to `temps`.
 let runFrom (level: Level) (first: int) (temps: int) (items: Item array) (lines: int array) =
@@ -2873,17 +2904,21 @@ let subroutineCandidates (policy: Subroutines) (ik: Ir.IrKernel) =
       | _ -> None)
   |> List.sort
 
-/// Compile, run the passes of `level`, choose subroutines (`policy`), and keep the program within
-/// `limit` words: when it is larger, the loops whose unswitching added the most are kept whole
-/// (tested on each pass), the largest first, until it fits or none is unswitched; then, unless the
-/// policy is Off, helpers RENDER calls are made subroutines too. None: no limit.
-let compileChoosingWith (handOff: Set<string>) (policy: Subroutines) (limit: int option) (level: Level) (target: Kernel.Target) (k: Kernel.Kernel) =
-  let ik = FromQuotation.kernel k
+/// Compile an `IrKernel` with a diagnostics sink, run the passes of `level`, choose subroutines (`policy`),
+/// and keep the program within `limit` words.
+let compileIrChoosingWithSink (sink: Ir.Sink) (handOff: Set<string>) (policy: Subroutines) (limit: int option) (level: Level) (target: Kernel.Target) (ik: Ir.IrKernel) =
   let attempt (chosen: Set<string>) (unswitchMax: int option) =
-    Compile.generateIrWith handOff chosen unswitchMax target ik
+    let attemptSink = if Ir.Sink.isActive sink then Ir.Sink.create () else Ir.Sink.none
+    Compile.generateIrWithSink attemptSink handOff chosen unswitchMax target ik
     |> Result.map (fun (c, costs) ->
-      let items, lines = runFromY level c.layout.xWorkset c.xWorkset c.layout.yWorkset c.yWorkset c.items c.lines
-      { c with items = items; lines = lines }, costs)
+      let items, origins = runFromYSink attemptSink level c.layout.xWorkset c.xWorkset c.layout.yWorkset c.yWorkset c.items c.origins
+      let lines =
+        origins |> Array.map (fun o ->
+          match Ir.Origin.primary o with
+          | Some r when c.source |> Option.forall ((=) r.file) && r.file <> "<synthetic>" -> r.line
+          | _ -> 0)
+      let facts = if Ir.Sink.isActive attemptSink then Ir.Sink.toList attemptSink else c.facts
+      { c with items = items; origins = origins; lines = lines; facts = facts }, costs)
   let fits (c: Compile.Compiled) =
     match limit, Compile.size c with
     | Some l, Ok s -> s.total <= l
@@ -2900,11 +2935,15 @@ let compileChoosingWith (handOff: Set<string>) (policy: Subroutines) (limit: int
         match (try attempt (chosen.Add key) unswitchMax with e -> Error e.Message) with
         | Ok(c, _) when words c <= words best - need -> chosen.Add key, c
         | _ -> chosen, best) (chosen, best)
+  let finish (res: Result<Compile.Compiled, string>) =
+    res |> Result.map (fun c ->
+      Ir.Sink.recordAll sink c.facts
+      c)
   match attempt Set.empty None with
   | Error e -> Error e
   | Ok(c0, costs) ->
     let chosen, c = if policy = Off then Set.empty, c0 else choose policy None (Set.empty, c0)
-    if fits c then Ok c
+    if fits c then finish (Ok c)
     else
       // each distinct cost, largest first: loops costing more than the next one down kept whole
       let rec smaller (thresholds: int list) (best: Compile.Compiled) =
@@ -2920,8 +2959,15 @@ let compileChoosingWith (handOff: Set<string>) (policy: Subroutines) (limit: int
       | Ok c' when not (fits c') && policy <> Off ->
         // size pressure: helpers RENDER calls as subroutines too
         let unswitchMax = if costs.IsEmpty then None else Some -1
-        Ok(snd (choose Size unswitchMax (chosen, c')))
-      | r -> r
+        finish (Ok(snd (choose Size unswitchMax (chosen, c'))))
+      | r -> finish r
+
+/// Compile, run the passes of `level`, choose subroutines (`policy`), and keep the program within
+/// `limit` words: when it is larger, the loops whose unswitching added the most are kept whole
+/// (tested on each pass), the largest first, until it fits or none is unswitched; then, unless the
+/// policy is Off, helpers RENDER calls are made subroutines too. None: no limit.
+let compileChoosingWith (handOff: Set<string>) (policy: Subroutines) (limit: int option) (level: Level) (target: Kernel.Target) (k: Kernel.Kernel) =
+  compileIrChoosingWithSink Ir.Sink.none handOff policy limit level target (FromQuotation.kernel k)
 
 /// `compileChoosingWith`, every hand routine used.
 let compileChoosing (policy: Subroutines) (limit: int option) (level: Level) (target: Kernel.Target) (k: Kernel.Kernel) =
@@ -2937,7 +2983,13 @@ let compile (level: Level) (target: Kernel.Target) (k: Kernel.Kernel) =
   compileWithin (Kernel.programLimit target |> Option.map fst) level target k
   |> Result.bind Compile.checkSize
 
+/// `compile` with an explicit diagnostics sink.
+let compileWithSink (sink: Ir.Sink) (level: Level) (target: Kernel.Target) (k: Kernel.Kernel) =
+  compileIrChoosingWithSink sink Set.empty (subroutinesPolicy ()) (Kernel.programLimit target |> Option.map fst) level target (FromQuotation.kernel k)
+  |> Result.bind Compile.checkSize
+
 /// `compile`, the [<HandWritten>] helpers of `handOff` (by key) compiled from their F# reference.
 let compileHandOff (handOff: Set<string>) (level: Level) (target: Kernel.Target) (k: Kernel.Kernel) =
   compileChoosingWith handOff (subroutinesPolicy ()) (Kernel.programLimit target |> Option.map fst) level target k
   |> Result.bind Compile.checkSize
+

@@ -115,6 +115,145 @@ type Var(name: string, ty: IrTy, isMutable: bool, typeKey: int) =
 /// Where an expression came from in the F# source (the debug range of a quotation), for the comments in the listing.
 type Range = { file: string; line: int }
 
+/// Provenance origin identifiers pointing back to one or more F# source ranges (merged when passes fuse nodes or instructions).
+module Origin =
+  let private gate = obj ()
+  let private byId = Dictionary<int, Range list>()
+  let private byRanges = Dictionary<string, int>()
+  let mutable private nextOrigin = 100_000
+
+  let private sync (f: unit -> 'T) =
+#if FABLE_COMPILER
+    f ()
+#else
+    lock gate f
+#endif
+
+  let private keyOf (rs: Range list) =
+    rs |> List.map (fun r -> $"{r.file}:{r.line}") |> String.concat "|"
+
+  let private intern (rs: Range list) =
+    match rs with
+    | [] -> 0
+    | _ ->
+      let k = keyOf rs
+      sync (fun () ->
+        match byRanges.TryGetValue k with
+        | true, id -> id
+        | _ ->
+          nextOrigin <- nextOrigin + 1
+          let id = nextOrigin
+          byRanges[k] <- id
+          byId[id] <- rs
+          id)
+
+  let none = 0
+  let synthetic = intern [ { file = "<synthetic>"; line = 1 } ]
+  let ofRange (r: Range) = intern [ r ]
+
+  let ranges (id: int) : Range list =
+    if id <= 0 then []
+    elif id < 100_000 then [ { file = ""; line = id } ]
+    else
+      sync (fun () ->
+        match byId.TryGetValue id with
+        | true, rs -> rs
+        | _ -> [ { file = ""; line = 1 } ])
+
+  let primary (id: int) : Range option =
+    match ranges id with
+    | r :: _ -> Some r
+    | [] -> None
+
+  let line (id: int) : int =
+    if id <= 0 then 0
+    elif id < 100_000 then id
+    else
+      match primary id with
+      | Some r -> r.line
+      | None -> 0
+
+  let merge (a: int) (b: int) : int =
+    if a <= 0 then b
+    elif b <= 0 || a = b then a
+    else
+      let ra = ranges a
+      let rb = ranges b |> List.filter (fun r -> not (List.contains r ra))
+      intern (ra @ rb)
+
+/// Detection layer of a diagnostic fact (`ir` or `asm`).
+[<Struct>]
+type Layer =
+  | IrLayer
+  | AsmLayer
+
+module Layer =
+  let name (l: Layer) = match l with IrLayer -> "ir" | AsmLayer -> "asm"
+  let tryParse (s: string) =
+    match s.Trim().ToLowerInvariant() with
+    | "ir" -> Some IrLayer
+    | "asm" -> Some AsmLayer
+    | _ -> None
+
+/// One diagnostic fact written to the plain sink during compilation or optimisation.
+[<Struct>]
+type Fact =
+  { origin : int
+    layer  : Layer
+    id     : string
+    data   : string }
+
+/// Opaque diagnostics sink passed explicitly or on a context record.
+type Sink = private Sink of ResizeArray<Fact> option
+
+module Sink =
+  /// No-op sink that discards all recorded facts without allocating.
+  let none = Sink None
+
+  /// Creates an active sink that collects recorded facts in order.
+  let create () = Sink(Some(ResizeArray<Fact>()))
+
+  /// True when the sink is collecting facts (not `Sink.none`).
+  let isActive (Sink s) = s.IsSome
+
+  /// Records a diagnostic fact into the sink (no-op on `Sink.none`).
+  let record (Sink s) (origin: int) (layer: Layer) (id: string) (data: string) =
+    match s with
+    | Some buf -> buf.Add { origin = origin; layer = layer; id = id; data = data }
+    | None -> ()
+
+  /// Appends a sequence of facts into the sink (no-op on `Sink.none`).
+  let recordAll (Sink s) (facts: Fact seq) =
+    match s with
+    | Some buf -> buf.AddRange facts
+    | None -> ()
+
+  /// Captures a rollback checkpoint so speculative compilation attempts can rewind recorded facts.
+  let snapshot (Sink s) : unit -> unit =
+    match s with
+    | Some buf ->
+      let mark = buf.Count
+      fun () -> if buf.Count > mark then buf.RemoveRange(mark, buf.Count - mark)
+    | None -> id
+
+  /// Iterates over the recorded facts in order.
+  let iter (f: Fact -> unit) (Sink s) =
+    match s with
+    | Some buf -> for x in buf do f x
+    | None -> ()
+
+  /// Returns the recorded facts as an immutable list.
+  let toList (Sink s) : Fact list =
+    match s with
+    | Some buf -> List.ofSeq buf
+    | None -> []
+
+  /// Returns the recorded facts as a fresh array.
+  let toArray (Sink s) : Fact array =
+    match s with
+    | Some buf -> buf.ToArray()
+    | None -> [||]
+
 /// What the generator asks of a method or a property it meets in a call. Equality is the record's own identity: a front end
 /// makes one `Member` for each method and uses it everywhere.
 [<ReferenceEquality>]
@@ -177,10 +316,30 @@ and Node =
 
 /// An expression: a node, its type and, when known, where it was written. Equality is structural (the range is not part of
 /// it, as a quotation's custom attributes are not).
-and [<Sealed>] Expr(node: Node, ty: IrTy, range: Range option) =
+and [<Sealed>] Expr(node: Node, ty: IrTy, range: Range option, ?originOverride: int) =
+  let origin =
+    match originOverride with
+    | Some o when o > 0 -> o
+    | _ ->
+      match range with
+      | Some r -> Origin.ofRange r
+      | None ->
+        let firstChild (es: Expr list) =
+          match es |> List.tryFind (fun (x: Expr) -> x.Origin > 0) with
+          | Some x -> x.Origin
+          | None -> Origin.synthetic
+        match node with
+        | NVar _ | NValue _ -> Origin.synthetic
+        | NLambda(_, b) | NVarSet(_, b) | NUnionCaseTest(b, _) -> b.Origin
+        | NApplication(a, b) | NSequential(a, b) | NWhile(a, b) | NLet(_, a, b) -> firstChild [ a; b ]
+        | NIfThenElse(c, t, f) | NFor(_, c, t, f) -> firstChild [ c; t; f ]
+        | NCall(o, _, args) | NPropertyGet(o, _, args) -> firstChild (Option.toList o @ args)
+        | NPropertySet(o, _, idx, x) -> firstChild (Option.toList o @ idx @ [ x ])
+        | NTuple es | NOther(_, es) -> firstChild es
   member _.Node = node
   member _.Type = ty
   member _.Range = range
+  member _.Origin = origin
   override this.Equals(o: obj) =
     match o with
     | :? Expr as e -> obj.ReferenceEquals(this, e) || node = e.Node
@@ -189,7 +348,9 @@ and [<Sealed>] Expr(node: Node, ty: IrTy, range: Range option) =
   override this.ToString() = Expr.Show this
 
   /// The same node with another range.
-  member this.WithRange(r: Range option) = Expr(node, ty, r)
+  member _.WithRange(r: Range option) = Expr(node, ty, r)
+  /// The same node with an explicit provenance origin id.
+  member _.WithOrigin(o: int) = Expr(node, ty, range, o)
 
   // ---- construction: the type of each node follows from its parts, as a quotation's does ----
 
@@ -255,16 +416,17 @@ and [<Sealed>] Expr(node: Node, ty: IrTy, range: Range option) =
       let captured = HashSet<Var>(replacements.Values |> Seq.collect (fun r -> r.GetFreeVars()))
       let rec go (renames: Map<Var, Var>) (e: Expr) : Expr =
         let range = e.Range
+        let origin = e.Origin
         let bind (v: Var) =
           if captured.Contains v then
             let v' = v.Fresh()
             v', renames.Add(v, v')
           else v, renames.Remove v
-        let rebuild node = Expr(node, e.Type, range)
+        let rebuild node = Expr(node, e.Type, range, origin)
         match e.Node with
         | NVar v ->
           match Map.tryFind v renames with
-          | Some v' -> Expr(NVar v', e.Type, range)
+          | Some v' -> Expr(NVar v', e.Type, range, origin)
           | None ->
             match replacements.TryGetValue v with
             | true, r -> r
@@ -386,8 +548,9 @@ module ExprShape =
 
   let (|ShapeVar|ShapeLambda|ShapeCombination|) (e: Expr) =
     let range = e.Range
+    let origin = e.Origin
     let ty = e.Type
-    let make node = Expr(node, ty, range)
+    let make node = Expr(node, ty, range, origin)
     match e.Node with
     | NVar v -> ShapeVar v
     | NLambda(v, b) -> ShapeLambda(v, b)

@@ -18,6 +18,7 @@ let all =
     IrFrontEndTests.tests
     TypedTreeFrontEndTests.tests
     SweepTests.tests
+    LintTests.tests
   ]
 
 [<EntryPoint>]

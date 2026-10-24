@@ -520,6 +520,16 @@ let gradeScenario (machine: Mds.Machine) =
 /// F# compiled instead) and on its own (its routine against its F#, call by call). Exit code 1 when
 /// anything differs.
 let grade (args: ParseResults<GradeArgs>) =
+  let layerRes =
+    match args.TryGetResult GradeArgs.Lint_Layer with
+    | None -> Ok None
+    | Some s ->
+      match dsp56k.kernel.Ir.Layer.tryParse s with
+      | Some l -> Ok(Some l)
+      | None -> Error $"unknown --lint-layer '{s}': expected ir, asm or both"
+  match layerRes with
+  | Error e -> fail e
+  | Ok lintLayer ->
   let source = args.GetResult GradeArgs.Input
   match Kernels.kernelAndMachine source (args.GetResults GradeArgs.Define) (args.TryGetResult GradeArgs.Kernel) (args.TryGetResult GradeArgs.Json) with
   | Error e -> fail e
@@ -545,4 +555,25 @@ let grade (args: ParseResults<GradeArgs>) =
           report.correctness.IsEmpty
           && inside |> List.forall _.correct
           && alone |> List.forall (fun a -> a.skipped.IsSome || (a.hand = a.arguments && a.compiled |> Option.forall ((=) a.arguments)))
+        let kudosOn = args.Contains GradeArgs.Kudos
+        let directCycles =
+          if not kudosOn then None
+          else
+            match dsp56k.kernel.Grade.gradeAtWith Set.empty (dsp56k.kernel.Optimize.Chosen dsp56k.kernel.Optimize.Passes.none) harness k None scenario with
+            | Ok dr -> Some(float (dr.ours.trig + dr.ours.renderWorst))
+            | Error _ -> None
+        let netAlloc = if kudosOn then Some(dsp56k.kernel.Lint.measureNetAllocation harness.target k) else None
+        let lintOpts : dsp56k.kernel.Lint.Options =
+          { layer = lintLayer
+            kudos = kudosOn
+            bitExact = same
+            directCycles = directCycles
+            optimisedCycles = Some(float (report.ours.trig + report.ours.renderWorst))
+            declaredBudget = Some machine.maxTrackCycles
+            netAllocatedBytes = netAlloc }
+        match dsp56k.kernel.Lint.checkKernelWith lintOpts harness.target k with
+        | Ok lintReport ->
+          let text = dsp56k.kernel.Lint.formatReport lintOpts lintReport
+          if text <> "" then printfn "\n%s" text
+        | Error _ -> ()
         if same then 0 else 1
