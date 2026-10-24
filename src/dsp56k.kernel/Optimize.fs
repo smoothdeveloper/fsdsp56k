@@ -498,8 +498,8 @@ let readsOf (instr: Instr) =
     Some(Array.append (alu |> Option.map Lower.aluReads |> Option.defaultValue [||]) (Array.collect Lower.moveReads moves))
   | IfCc(alu, _, _) -> Some(Lower.aluReads alu)
   | Tcc(_, accPair, rPair) ->
-    let a = match accPair with Some(s, _) -> [| s |] | None -> [||]
-    let r = match rPair with Some(s, _) -> [| R s |] | None -> [||]
+    let a = match accPair with Some(s, d) -> [| s; Acc.reg d |] | None -> [||]
+    let r = match rPair with Some(s, d) -> [| R s; R d |] | None -> [||]
     Some(Array.append a r)
   | Norm(r, d) -> Some [| R r; Acc.reg d |]
   | MulI(kind, _, _, src, d) | MulImm(kind, _, src, _, d) ->

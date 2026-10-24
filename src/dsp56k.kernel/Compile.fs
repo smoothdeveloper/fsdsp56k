@@ -73,6 +73,9 @@ let operator (name: string) (args: obj array) : obj option =
     | _ -> None
   let cmp (f: int -> bool) =
     match args with
+    | [| :? Frac as a; :? Frac as b |] -> o (f (compare a.Raw b.Raw))
+    | [| :? Acc as a; :? Acc as b |] -> o (f (compare a.Raw b.Raw))
+    | [| :? Long as a; :? Long as b |] -> o (f (compare a.Raw b.Raw))
     | [| :? IComparable as a; b |] when a.GetType() = b.GetType() -> o (f (a.CompareTo b))
     | _ -> None
   match name, args with
@@ -98,10 +101,44 @@ let operator (name: string) (args: obj array) : obj option =
   | "op_LessThanOrEqual", _ -> cmp (fun c -> c <= 0)
   | "op_GreaterThan", _ -> cmp (fun c -> c > 0)
   | "op_GreaterThanOrEqual", _ -> cmp (fun c -> c >= 0)
+  | ("Min" | "min"), [| :? Frac as a; :? Frac as b |] -> o (Frac.Min(a, b))
+  | ("Min" | "min"), [| :? Acc as a; :? Acc as b |] -> o (Acc.Min(a, b))
+  | ("Min" | "min"), [| :? Long as a; :? Long as b |] -> o (Long.Min(a, b))
+  | ("Min" | "min"), [| :? IComparable as a; b |] when a.GetType() = b.GetType() -> if a.CompareTo b <= 0 then o a else o b
+  | ("Max" | "max"), [| :? Frac as a; :? Frac as b |] -> o (Frac.Max(a, b))
+  | ("Max" | "max"), [| :? Acc as a; :? Acc as b |] -> o (Acc.Max(a, b))
+  | ("Max" | "max"), [| :? Long as a; :? Long as b |] -> o (Long.Max(a, b))
+  | ("Max" | "max"), [| :? IComparable as a; b |] when a.GetType() = b.GetType() -> if a.CompareTo b >= 0 then o a else o b
+  | ("Abs" | "abs"), [| :? int as a |] -> o (abs a)
+  | ("Abs" | "abs"), [| :? int64 as a |] -> o (abs a)
+  | ("Abs" | "abs"), [| :? float as a |] -> o (abs a)
+  | ("Abs" | "abs"), [| :? Frac as a |] -> o (Frac.abs a)
+  | ("Abs" | "abs"), [| :? Acc as a |] -> o (Acc.abs a)
+  | _ -> None
+
+let mathOp (name: string) (args: obj array) : obj option =
+  let o (v: 'T) = Some(v :> obj)
+  match name, args with
+  | "Min", [| :? int as a; :? int as b |] -> o (Math.Min(a, b))
+  | "Min", [| :? int64 as a; :? int64 as b |] -> o (Math.Min(a, b))
+  | "Min", [| :? float as a; :? float as b |] -> o (Math.Min(a, b))
+  | "Max", [| :? int as a; :? int as b |] -> o (Math.Max(a, b))
+  | "Max", [| :? int64 as a; :? int64 as b |] -> o (Math.Max(a, b))
+  | "Max", [| :? float as a; :? float as b |] -> o (Math.Max(a, b))
+  | "Clamp", [| :? int as x; :? int as lo; :? int as hi |] -> o (Math.Clamp(x, lo, hi))
+  | "Clamp", [| :? int64 as x; :? int64 as lo; :? int64 as hi |] -> o (Math.Clamp(x, lo, hi))
+  | "Clamp", [| :? float as x; :? float as lo; :? float as hi |] -> o (Math.Clamp(x, lo, hi))
+  | "Abs", [| :? int as a |] -> o (Math.Abs a)
+  | "Abs", [| :? int64 as a |] -> o (Math.Abs a)
+  | "Abs", [| :? float as a |] -> o (Math.Abs a)
   | _ -> None
 
 let invoke (mi: Member) (args: obj array) : obj | null =
-  match (if owner mi = operators then operator mi.Name args else None) with
+  let special =
+    if owner mi = operators then operator mi.Name args
+    elif owner mi = "System.Math" then mathOp mi.Name args
+    else None
+  match special with
   | Some v -> v
   | None -> mi.Invoke args
 
@@ -348,7 +385,7 @@ let rec pureHelper (depth: int) (mi: Member) =
           | Call(_, m, args) ->
             let pureCall =
               isConst m
-              || (match intrinsic m with Some n -> not (Set.contains n effects) | None -> owner m = operators)
+              || (match intrinsic m with Some n -> not (Set.contains n effects) | None -> owner m = operators || owner m = "System.Math")
               || (not m.IsGeneric && pureHelper (depth + 1) m)
             pureCall && List.forall pureExpr args
           | ExprShape.ShapeVar _ -> true
@@ -361,6 +398,8 @@ let rec tryConst (ctx: Ctx) (e: Expr) : obj option =
   match e with
   | Value(v, t) when foldable t -> someValue v
   | Var v when ctx.consts.ContainsKey v -> Some ctx.consts[v]
+  | Let(v, value, body) when not v.IsMutable && (v.Name = "_minL" || v.Name = "_minR" || v.Name = "_maxL" || v.Name = "_maxR") ->
+    tryConst ctx value |> Option.bind (fun x -> tryConst { ctx with consts = ctx.consts.Add(v, x) } body)
   | PropertyGet(None, p, []) when foldable p.ReturnType -> someValue (p.Get null)
   | PropertyGet(Some o, p, []) when foldable p.ReturnType ->
     constObject ctx o |> Option.bind (fun x -> someValue (p.Get x))
@@ -373,7 +412,7 @@ let rec tryConst (ctx: Ctx) (e: Expr) : obj option =
     constObject ctx o |> Option.map (fun x -> case.Test x :> obj)
   | Call(None, mi, args) ->
     let mi = resolve mi args
-    let pure' = isConst mi || (match intrinsic mi with Some n -> not (Set.contains n effects) | None -> owner mi = operators)
+    let pure' = isConst mi || (match intrinsic mi with Some n -> not (Set.contains n effects) | None -> owner mi = operators || owner mi = "System.Math")
     // an inlined helper on constants (`at 415`): folded too
     let pure' = pure' || (not args.IsEmpty && foldable mi.ReturnType && pureHelper 0 mi)
     if pure' && foldable mi.ReturnType then
@@ -405,6 +444,32 @@ let rec normalize (e: Expr) : Expr =
     match e with
     | Application(f, a) -> spine f (a :: args)
     | f -> f, args
+  let tryNormalizeCall (o: Expr option) (mi: Member) (args: Expr list) (orig: Expr option) =
+    let attach (res: Expr) =
+      match orig with
+      | Some e' when e'.Range.IsSome || e'.Origin > 0 -> res.WithRange(e'.Range).WithOrigin(e'.Origin)
+      | _ -> res
+    match o, args with
+    | None, [ a; b ]
+        when owner mi = operators
+             && (mi.Name = "Min" || mi.Name = "min" || mi.Name = "Max" || mi.Name = "max")
+             && (let t = a.Type in t = TyFrac || t = TyAcc || t = TyLong) ->
+      let isMin = mi.Name = "Min" || mi.Name = "min"
+      let vl = Var((if isMin then "_minL" else "_maxL"), a.Type)
+      let vr = Var((if isMin then "_minR" else "_maxR"), b.Type)
+      let op = if isMin then "op_LessThan" else "op_GreaterThan"
+      let cmp = Expr.Call(Ir.fsharpOperator op TyBool, [ Expr.Var vl; Expr.Var vr ])
+      Some(attach (Expr.Let(vl, a, Expr.Let(vr, b, Expr.IfThenElse(cmp, Expr.Var vl, Expr.Var vr)))))
+    | None, [ a ] when owner mi = operators && (mi.Name = "Abs" || mi.Name = "abs") && (a.Type = TyFrac || a.Type = TyAcc) ->
+      let intr = if a.Type = TyFrac then "frac.abs" else "acc.abs"
+      Some(attach (Expr.Call(Ir.intrinsic intr, [ a ])))
+    | None, [ lo; hi; x ] when intrinsic mi = Some "frac.clampFrom" ->
+      Some(attach (Expr.Call(Ir.intrinsic "frac.clamp", [ x; lo; hi ])))
+    | None, [ lo; hi; x ] when intrinsic mi = Some "acc.clampFrom" ->
+      Some(attach (Expr.Call(Ir.intrinsic "acc.clamp", [ x; lo; hi ])))
+    | None, [ lo; hi; x ] when intrinsic mi = Some "long.clampFrom" ->
+      Some(attach (Expr.Call(Ir.intrinsic "long.clamp", [ x; lo; hi ])))
+    | _ -> None
   match e with
   // `let b = condition`: a word, Frac.ofBool, its uses tests of the word (a constant condition
   // stays a constant, the tests folded with it)
@@ -418,6 +483,13 @@ let rec normalize (e: Expr) : Expr =
   | Call(None, mi, [ f; x ]) when mi.Name = "op_PipeLeft" && owner mi = operators -> normalize (Expr.Application(f, x))
   | Call(None, mi, [ x; y; f ]) when mi.Name = "op_PipeRight2" && owner mi = operators ->
     normalize (Expr.Application(Expr.Application(f, x), y))
+  | Call(None, mi, args)
+      when (owner mi = operators && (mi.Name = "Min" || mi.Name = "min" || mi.Name = "Max" || mi.Name = "max" || mi.Name = "Abs" || mi.Name = "abs"))
+           || (match intrinsic mi with Some("frac.clampFrom" | "acc.clampFrom" | "long.clampFrom") -> true | _ -> false) ->
+    let args' = args |> List.map normalize
+    match tryNormalizeCall None mi args' (Some e) with
+    | Some rewritten -> rewritten
+    | None -> ExprShape.RebuildShapeCombination(match e with ExprShape.ShapeCombination(s, _) -> s, args' | _ -> failwith "Call")
   | Application _ ->
     let f, args = spine e []
     let args = args |> List.map normalize
@@ -428,9 +500,13 @@ let rec normalize (e: Expr) : Expr =
     let vs, body = lambdas f []
     match body with
     | Call(o, mi, callArgs) when vs.Length = args.Length && callArgs = (vs |> List.map Expr.Var) ->
-      match o with
-      | Some o -> Expr.Call(normalize o, mi, args)
-      | None -> Expr.Call(mi, args)
+      let o' = o |> Option.map normalize
+      match tryNormalizeCall o' mi args (Some e) with
+      | Some rewritten -> rewritten
+      | None ->
+        match o' with
+        | Some o' -> Expr.Call(o', mi, args)
+        | None -> Expr.Call(mi, args)
     | _ ->
       let rec bind (f: Expr) (args: Expr list) =
         match f, args with
@@ -554,8 +630,24 @@ let rec intOfVars (e: Expr) =
     intOfVars x && intOfVars y
   | _ -> false
 
+let rec findRuntimeMath (e: Expr) : string option =
+  match e with
+  | Call(None, m, _) when owner m = "System.Math" && (m.Name = "Min" || m.Name = "Max" || m.Name = "Clamp" || m.Name = "Abs") -> Some m.Name
+  | ExprShape.ShapeVar _ -> None
+  | ExprShape.ShapeLambda(_, b) -> findRuntimeMath b
+  | ExprShape.ShapeCombination(_, xs) -> List.tryPick findRuntimeMath xs
+
+let failRuntimeMath (mathName: string) =
+  fail $"System.Math.{mathName} is only supported on compile-time constants; for runtime DSP values use min, max, abs or Frac.Min / Frac.Max / Frac.Clamp (Acc.Min / Acc.Max / Acc.Clamp, Long.Min / Long.Max / Long.Clamp)"
+
 /// A call to a kernel helper: its parameters bound to the arguments.
 let inlined (mi: Member) (args: Expr list) =
+  if owner mi = "System.Math" && (mi.Name = "Min" || mi.Name = "Max" || mi.Name = "Clamp" || mi.Name = "Abs") then
+    failRuntimeMath mi.Name
+  if isConst mi then
+    match args |> List.tryPick findRuntimeMath with
+    | Some mathName -> failRuntimeMath mathName
+    | None -> ()
   match reflected mi with
   | Some def ->
     let rec bind (body: Expr) (args: Expr list) =
@@ -941,6 +1033,15 @@ let rec wordLeaf (ctx: Ctx) (e: Expr) : Word option =
       | AHome h when h.reg.IsNone -> Some(WMem(at h word))
       | AOfLong(hi, lo) -> Some(WMem(if word = 0 then hi else lo))
       | AOfWord w when word = 0 -> Some w
+      | _ -> None
+    // the upper or lower word of a Long in memory or a pack of two pure words
+    | Call(None, mi, [ x ]) when (let n = intrinsic (resolve mi [ x ]) in n = Some "long.hi" || n = Some "long.lo") ->
+      let isHi = intrinsic (resolve mi [ x ]) = Some "long.hi"
+      match longLeaf ctx x, x with
+      | Some(AOfLong(hi, lo)), _ -> Some(WMem(if isHi then hi else lo))
+      | Some(AConst c), _ -> Some(WImm(int (if isHi then (c >>> 24) &&& 0xffffffL else c &&& 0xffffffL)))
+      | _, Intr "long.pack" [ hi; lo ] when (touches false (if isHi then lo else hi)).writes.IsEmpty ->
+        wordLeaf ctx (if isHi then hi else lo)
       | _ -> None
     | Call(None, mi, [ Var i ]) when mi.Name = "ofRaw" && mi.Declaring = TyFrac && ctx.counters.ContainsKey i ->
       Some(WMem(at ctx.counters[i] 0))
@@ -1667,6 +1768,23 @@ let mulForm (e: Expr) =
   | Intr "acc.mac" [acc; x; y] -> Some(Some acc, x, y, (MulKind.Mac, false))
   | _ -> None
 
+/// `let _minL = l in let _minR = r in if _minL < _minR then _minL else _minR` (and `_maxL`/`_maxR`),
+/// produced by `normalize` for `FSharp.Core.Operators.min` and `max`.
+let (|MinMaxExpr|_|) (e: Expr) =
+  match e with
+  | Let(vL, l, Let(vR, r, IfThenElse(Call(None, mi, [Var a; Var b]), Var c, Var d)))
+      when a = vL && b = vR && c = vL && d = vR && owner mi = operators ->
+    if vL.Name = "_minL" && vR.Name = "_minR" && mi.Name = "op_LessThan" then Some(true, l, r)
+    elif vL.Name = "_maxL" && vR.Name = "_maxR" && mi.Name = "op_GreaterThan" then Some(false, l, r)
+    else None
+  | _ -> None
+
+let isFracSelect (e: Expr) =
+  match e with
+  | MinMaxExpr _ when e.Type = TyFrac -> true
+  | Intr "frac.min" _ | Intr "frac.max" _ | Intr "frac.clamp" _ -> true
+  | _ -> false
+
 /// The largest magnitude an Acc expression can have, from what it is made of (infinity: not
 /// known). Below 1, the value is a sign-extended 48-bit a1:a0 and can be added as an X or Y pair.
 let rec accBound (ctx: Ctx) (e: Expr) : float =
@@ -1680,7 +1798,9 @@ let rec accBound (ctx: Ctx) (e: Expr) : float =
     | Intr "acc.macsu" [l; _; _] -> accBound ctx l + 2.0
     | Intr "acc.add" [l; r] | Intr "acc.sub" [l; r] -> accBound ctx l + accBound ctx r
     | Intr "acc.addFrac" [l; _] | Intr "acc.subFrac" [l; _] | Intr "acc.mac" [l; _; _] -> accBound ctx l + 1.0
-    | Intr "acc.neg" [x] -> accBound ctx x
+    | Intr "acc.neg" [x] | Intr "acc.abs" [x] -> accBound ctx x
+    | MinMaxExpr(_, l, r) | Intr "acc.min" [l; r] | Intr "acc.max" [l; r] -> max (accBound ctx l) (accBound ctx r)
+    | Intr "acc.clamp" [_; lo; hi] -> max (accBound ctx lo) (accBound ctx hi)
     | Intr "acc.clb" [_] -> 1.0
     | Intr "acc.asr" [x; n] ->
       match tryConst ctx n with
@@ -1729,6 +1849,7 @@ let rec genAcc (ctx: Ctx) (e: Expr) : unit =
   | Some l -> emitAll ctx (loadAccLeaf l A)
   | None ->
     match e with
+    | MinMaxExpr(isMin, l, r) -> genAccOrLongSelect ctx false isMin l r
     | Let(v, value, body) -> withLet ctx v value body (fun () -> genAcc ctx body)
     | IfThenElse(c, t, f) when (match tryConst ctx c with Some(:? bool) -> true | _ -> false) ->
       genAcc ctx (if (tryConst ctx c).Value :?> bool then t else f)
@@ -1739,6 +1860,7 @@ let rec genAcc (ctx: Ctx) (e: Expr) : unit =
       match intrinsic mi, args with
       | Some "acc.ofFrac", [Intr "acc.hi" [x]] -> emit ctx (move (accPart ctx x 1) a)
       | Some "acc.ofFrac", [Intr "acc.lo" [x]] -> emit ctx (move (accPart ctx x 0) a)
+      | Some "acc.ofFrac", [f] when isFracSelect f -> genFracSelectAcc ctx f
       | Some "acc.ofFrac", [f] -> genWord ctx f; emit ctx (move x0 a)
       | Some "acc.ofLong", [l] -> genLong ctx l
       | _ when (mulForm e).IsSome ->
@@ -1746,6 +1868,13 @@ let rec genAcc (ctx: Ctx) (e: Expr) : unit =
         mulInto ctx acc x y kind dsp56k.Acc.A
       | Some "acc.add", [l; r] -> binAcc ctx l r BAdd
       | Some "acc.sub", [l; r] -> binAcc ctx l r BSub
+      | Some "acc.min", [l; r] -> genAccOrLongSelect ctx false true l r
+      | Some "acc.max", [l; r] -> genAccOrLongSelect ctx false false l r
+      | Some "acc.clamp", [x; lo; hi] ->
+        let maxExpr = Expr.Call(Ir.intrinsic "acc.max", [ x; lo ])
+        let minExpr = Expr.Call(Ir.intrinsic "acc.min", [ maxExpr; hi ])
+        genAcc ctx minExpr
+      | Some "acc.abs", [x] -> genAcc ctx x; emit ctx (abs'' a)
       | Some "acc.rnd", [x] -> genAcc ctx x; emit ctx (rnd a)
       | Some "acc.divide", [x; d] ->
         let w = (operands ctx [ d ])[0]
@@ -1834,6 +1963,110 @@ let rec genAcc (ctx: Ctx) (e: Expr) : unit =
         let body = inlined mi args
         lined ctx body (fun () -> genAcc ctx body)
     | _ -> fail $"not a kernel Acc expression: {e}"
+
+and loadFracIntoA (ctx: Ctx) (x: Expr) =
+  match wordLeaf ctx x, x with
+  | Some w, _ -> emitAll ctx (loadAccLeaf (AOfWord w) A)
+  | None, Intr "acc.hi" [aExpr] -> emit ctx (move (accPart ctx aExpr 1) a)
+  | None, Intr "acc.lo" [aExpr] -> emit ctx (move (accPart ctx aExpr 0) a)
+  | None, _ ->
+    genWord ctx x
+    emit ctx (move x0 a)
+
+and cmpTransferWord (ctx: Ctx) (isMin: bool) (w: Word) =
+  let transfer (r: Reg) = if isMin then tgt r a else tlt r a
+  match w with
+  | WReg r when r = X0 || r = X1 || r = Y0 || r = Y1 ->
+    emit ctx (cmp r a)
+    emit ctx (transfer r)
+  | _ ->
+    emitAll ctx (loadWord w x0)
+    emit ctx (cmp x0 a)
+    emit ctx (transfer x0)
+
+/// A Frac min/max/clamp evaluated into A (its word in a1, sign-extended into a2, a0 zero).
+/// Nested min/max/clamp chains stay in A across back-to-back cmp + tlt/tgt pairs.
+and genFracSelectAcc (ctx: Ctx) (e: Expr) =
+  let step (isMin: bool) (l: Expr) (r: Expr) =
+    if conflict (touches false l) (touches false r) then
+      let wl = (operands ctx [ l ])[0]
+      let wr = (operands ctx [ r ])[0]
+      emitAll ctx (loadAccLeaf (AOfWord wl) A)
+      cmpTransferWord ctx isMin wr
+    else
+      match wordLeaf ctx r with
+      | Some wr ->
+        if isFracSelect l then genFracSelectAcc ctx l else loadFracIntoA ctx l
+        cmpTransferWord ctx isMin wr
+      | None ->
+        let wr = (operands ctx [ r ])[0]
+        if isFracSelect l then genFracSelectAcc ctx l else loadFracIntoA ctx l
+        cmpTransferWord ctx isMin wr
+  match e with
+  | MinMaxExpr(isMin, l, r) when e.Type = TyFrac -> step isMin l r
+  | Intr "frac.min" [l; r] -> step true l r
+  | Intr "frac.max" [l; r] -> step false l r
+  | Intr "frac.clamp" [x; lo; hi] ->
+    let maxExpr = Expr.Call(Ir.intrinsic "frac.max", [ x; lo ])
+    let minExpr = Expr.Call(Ir.intrinsic "frac.min", [ maxExpr; hi ])
+    genFracSelectAcc ctx minExpr
+  | _ -> loadFracIntoA ctx e
+
+and accWordOperand (ctx: Ctx) (isLong: bool) (e: Expr) : Word option =
+  let wordOfConst (c: int64) =
+    let hi = (c >>> 24) &&& 0xffffffL
+    let signed = if hi &&& 0x800000L <> 0L then hi - 0x1000000L else hi
+    if c &&& 0xffffffL = 0L && (c >>> 24) = signed then Some(WImm(int hi)) else None
+  if isLong then
+    match longLeaf ctx e, e with
+    | Some(AConst c), _ -> wordOfConst c
+    | _, Intr "long.pack" [hi; lo] when (match tryConst ctx lo with Some(:? Frac as f) -> f.Raw = 0 | _ -> false) ->
+      wordLeaf ctx hi
+    | _ -> None
+  else
+    match accLeaf ctx e with
+    | Some(AOfWord w) -> Some w
+    | Some(AConst c) -> wordOfConst c
+    | _ -> None
+
+and genAccOrLongSelect (ctx: Ctx) (isLong: bool) (isMin: bool) (l: Expr) (r: Expr) =
+  let leaf (x: Expr) = if isLong then longLeaf ctx x else accLeaf ctx x
+  let gen (x: Expr) = if isLong then genLong ctx x else genAcc ctx x
+  let held (x: Expr) = match leaf x with Some(AHome { reg = Some B }) -> true | _ -> false
+  let transfer (s: Reg) = if isMin then tgt s a else tlt s a
+  let noConflict = not (conflict (touches false l) (touches false r))
+  match accWordOperand ctx isLong r with
+  | Some w when noConflict ->
+    gen l
+    cmpTransferWord ctx isMin w
+  | _ ->
+    match leaf r with
+    | Some rl when noConflict && (not (held l) || held r) ->
+      gen l
+      emitAll ctx (loadAccLeaf rl B)
+      emit ctx (cmp b a)
+      emit ctx (transfer b)
+    | _ when held l && noConflict ->
+      gen r
+      emit ctx (cmp b a)
+      emit ctx (transfer b)
+    | _ ->
+      match leaf l with
+      | Some ll when not ctx.bHeld && not (held l) && noConflict ->
+        thenRun ctx l (fun () -> gen r)
+        emit ctx (tfr a b)
+        emitAll ctx (loadAccLeaf ll A)
+        emit ctx (cmp b a)
+        emit ctx (transfer b)
+      | _ ->
+        gen r
+        let t = alloc ctx (if isLong then TLong else TAcc)
+        emitAll ctx (storeA t)
+        gen l
+        let rl = if isLong then AOfLong(at t 0, at t 1) else AHome t
+        emitAll ctx (loadAccLeaf rl B)
+        emit ctx (cmp b a)
+        emit ctx (transfer b)
 
 /// A multiplication: the factors in X0 and Y0, the accumulated value (if any) in A. Into B only
 /// for the local B holds, accumulating onto itself (`acc` None or that local).
@@ -1945,6 +2178,21 @@ and genLong (ctx: Ctx) (e: Expr) =
   | Some l -> emitAll ctx (loadAccLeaf l A)
   | None ->
     match e with
+    | MinMaxExpr(isMin, l, r) -> genAccOrLongSelect ctx true isMin l r
+    | Intr "long.pack" [hi; lo] ->
+      let xs = operands ctx [ hi; lo ]
+      emitAll ctx (loadAccLeaf (AOfWord xs[0]) A)
+      match xs[1] with
+      | WImm 0 -> ()
+      | WImm v -> emit ctx (move (immL v) a0)
+      | WMem m -> emit ctx (move m a0)
+      | WReg r -> emit ctx (move r a0)
+    | Intr "long.min" [l; r] -> genAccOrLongSelect ctx true true l r
+    | Intr "long.max" [l; r] -> genAccOrLongSelect ctx true false l r
+    | Intr "long.clamp" [x; lo; hi] ->
+      let maxExpr = Expr.Call(Ir.intrinsic "long.max", [ x; lo ])
+      let minExpr = Expr.Call(Ir.intrinsic "long.min", [ maxExpr; hi ])
+      genLong ctx minExpr
     | Call(None, mi, [x]) when intrinsic (resolve mi [x]) = Some "long.ofAcc" ->
       genAcc ctx x
       let t = alloc ctx TLong
@@ -1979,6 +2227,9 @@ and genWord (ctx: Ctx) (e: Expr) : unit =
   | Some w -> emitAll ctx (loadWord w x0)
   | None ->
     match e with
+    | _ when isFracSelect e ->
+      genFracSelectAcc ctx e
+      emit ctx (move a1 x0)
     | Let(v, value, body) -> withLet ctx v value body (fun () -> genWord ctx body)
     | IfThenElse(c, t, f) when (match tryConst ctx c with Some(:? bool) -> true | _ -> false) ->
       genWord ctx (if (tryConst ctx c).Value :?> bool then t else f)
@@ -1994,6 +2245,12 @@ and genWord (ctx: Ctx) (e: Expr) : unit =
       | Some "acc.hi", [x] -> emit ctx (move (accPart ctx x 1) x0)
       | Some "acc.lo", [x] -> emit ctx (move (accPart ctx x 0) x0)
       | Some "acc.sat", [x] -> emit ctx (move (accPart ctx x 2) x0)
+      | Some "long.hi", [x] -> genLong ctx x; emit ctx (move a1 x0)
+      | Some "long.lo", [x] -> genLong ctx x; emit ctx (move a0 x0)
+      | Some "frac.abs", [x] ->
+        loadFracIntoA ctx x
+        emit ctx (abs'' a)
+        emit ctx (move a x0)
       | Some "frac.ofBool", [c] -> genWord ctx (selection ctx (Expr.IfThenElse(c, Expr.Value(box (Frac.ofRaw 1), TyFrac), Ir.zero TyFrac)))
       | Some "table.read", [t; i] -> tableRead ctx t i 1 0 x0
       | Some "region.read", [_; _] when ctx.affineAt.ContainsKey e ->
@@ -2318,6 +2575,19 @@ and store (ctx: Ctx) (h: Home) (e: Expr) =
   | TLong ->
     let rec storeLong (e: Expr) =
       match e with
+      | MinMaxExpr _ ->
+        genLong ctx e
+        emitAll ctx (storeA h)
+      | Intr "long.pack" [hi; lo] ->
+        if not (conflict (touches false hi) (touches false lo)) then
+          storeWord ctx hi (at h 0)
+          storeWord ctx lo (at h 1)
+        else
+          let xs = operands ctx [ hi; lo ]
+          emitAll ctx (loadWord xs[0] x0)
+          emit ctx (move x0 (at h 0))
+          emitAll ctx (loadWord xs[1] x0)
+          emit ctx (move x0 (at h 1))
       | Let(v, value, body) -> withLet ctx v value body (fun () -> storeLong body)
       | Sequential(s, rest) -> thenRun ctx rest (fun () -> genStmt ctx s); storeLong rest
       | Call(None, mi, [x]) when intrinsic (resolve mi [x]) = Some "long.ofAcc" ->
@@ -2383,6 +2653,9 @@ and storeHeld (ctx: Ctx) (r: Reg) (e: Expr) =
       | Intr "acc.sub" [l; f] -> word true l f || acc sub l f
       | Intr "acc.addFrac" [l; f] -> word false l f
       | Intr "acc.subFrac" [l; f] -> word true l f
+      | Intr "acc.abs" [l] when self l ->
+        onto (abs'' r)
+        true
       | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone && not (isSub ctx mi) && (reflected mi).IsSome ->
         let body = inlined mi args
         lined ctx body (fun () -> storeHeld ctx r body)
@@ -2401,11 +2674,20 @@ and storeWord (ctx: Ctx) (e: Expr) (dst: Mem) =
     | w ->
       emitAll ctx (loadWord w x0)
       emit ctx (move x0 dst)
+  | _ when isFracSelect e ->
+    genFracSelectAcc ctx e
+    emit ctx (move a1 dst)
   | Let(v, value, body) -> withLet ctx v value body (fun () -> storeWord ctx body dst)
   | Sequential(s, rest) -> thenRun ctx rest (fun () -> genStmt ctx s); storeWord ctx rest dst
   | Call(None, mi, [x]) when intrinsic (resolve mi [x]) = Some "acc.sat" -> emit ctx (move (accPart ctx x 2) dst)
   | Call(None, mi, [x]) when intrinsic (resolve mi [x]) = Some "acc.hi" -> emit ctx (move (accPart ctx x 1) dst)
   | Call(None, mi, [x]) when intrinsic (resolve mi [x]) = Some "acc.lo" -> emit ctx (move (accPart ctx x 0) dst)
+  | Intr "long.hi" [x] -> genLong ctx x; emit ctx (move a1 dst)
+  | Intr "long.lo" [x] -> genLong ctx x; emit ctx (move a0 dst)
+  | Intr "frac.abs" [x] ->
+    loadFracIntoA ctx x
+    emit ctx (abs'' a)
+    emit ctx (move a dst)
   | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone && not (isSub ctx mi) && (reflected mi).IsSome ->
     let body = inlined mi args
     lined ctx body (fun () -> storeWord ctx body dst)
@@ -2436,6 +2718,9 @@ and accPart (ctx: Ctx) (x: Expr) (part: int) =
 and storeWordReg (ctx: Ctx) (e: Expr) (dst: Reg) =
   match e with
   | _ when (wordLeaf ctx e).IsSome -> emitAll ctx (loadWord (wordLeaf ctx e).Value dst)
+  | _ when isFracSelect e ->
+    genFracSelectAcc ctx e
+    emit ctx (move a1 dst)
   | Let(v, value, body) -> withLet ctx v value body (fun () -> storeWordReg ctx body dst)
   | Sequential(s, rest) -> thenRun ctx rest (fun () -> genStmt ctx s); storeWordReg ctx rest dst
   | ComputedElement ctx (f, w, c, []) ->
@@ -2449,6 +2734,12 @@ and storeWordReg (ctx: Ctx) (e: Expr) (dst: Reg) =
   | Intr "acc.sat" [x] -> emit ctx (move (accPart ctx x 2) dst)
   | Intr "acc.hi" [x] -> emit ctx (move (accPart ctx x 1) dst)
   | Intr "acc.lo" [x] -> emit ctx (move (accPart ctx x 0) dst)
+  | Intr "long.hi" [x] -> genLong ctx x; emit ctx (move a1 dst)
+  | Intr "long.lo" [x] -> genLong ctx x; emit ctx (move a0 dst)
+  | Intr "frac.abs" [x] ->
+    loadFracIntoA ctx x
+    emit ctx (abs'' a)
+    emit ctx (move a dst)
   | Intr "table.read" [t; i] -> tableRead ctx t i 1 0 dst
   | Intr "table.row" [t; w; i; c] -> tableRead ctx t i (constInt ctx "a table width" w) (constInt ctx "a table column" c) dst
   | Intr "region.read" [_; _] when ctx.affineAt.ContainsKey e -> emit ctx (move ctx.affineAt[e] dst)
@@ -2498,7 +2789,10 @@ and withLetAt (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> 
       ctx.consts <- ctx.consts.Add(v, c)
       bound ctx v None (Some c) body
       ctx.consts <- saved             // an inlined helper's variables are shared by its instances
-    | _ -> fail $"{v.Name}: a {IrTy.name v.Type} must be an immutable constant (only Frac, Acc and Long live on the DSP)"
+    | _ ->
+      match findRuntimeMath value with
+      | Some mathName -> failRuntimeMath mathName
+      | None -> fail $"{v.Name}: a {IrTy.name v.Type} must be an immutable constant (only Frac, Acc and Long live on the DSP)"
   else
   match tryConst ctx value with
   | Some c when not v.IsMutable ->
@@ -2656,11 +2950,12 @@ and inMemory (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> u
 /// or that are unconditionally bound inside a loop while `v` is live in or after the loop.
 and rivalsOf (ctx: Ctx) (v: Var) (e: Expr) =
   let uses (x: Expr) = x.GetFreeVars() |> Seq.contains v
+  let isSyntheticSelect (w: Var) = w.Name = "_minL" || w.Name = "_minR" || w.Name = "_maxL" || w.Name = "_maxR"
   let rec go (inLoop: bool) (liveAfter: bool) (e: Expr) =
     match e with
     | Let(w, value, body) ->
       let liveForValue = liveAfter || uses body
-      let here = if w.Type = TyFrac && (uses body || (liveAfter && inLoop)) then [ w ] else []
+      let here = if w.Type = TyFrac && not (isSyntheticSelect w) && (uses body || (liveAfter && inLoop)) then [ w ] else []
       here @ go inLoop liveForValue value @ go inLoop liveAfter body
     | Sequential(s1, s2) ->
       go inLoop (liveAfter || uses s2) s1 @ go inLoop liveAfter s2
@@ -2754,6 +3049,10 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
     let region = constRegion ctx r
     computedStore ctx i 0 (fun () -> regionInR0 ctx region) (computedMem region.bank) value
   | StateElement ctx (m, [ value ]) -> storeWord ctx value m
+  | LongElement ctx (hi, lo, [ Intr "long.pack" [ hiExpr; loExpr ] ])
+      when (wordLeaf ctx hiExpr).IsSome && (wordLeaf ctx loExpr).IsSome ->
+    storeWord ctx hiExpr hi
+    storeWord ctx loExpr lo
   | LongElement ctx (hi, lo, [ value ]) ->
     genLong ctx value
     emit ctx (move a1 hi)
@@ -3629,8 +3928,9 @@ and bitTest (ctx: Ctx) (n: Expr) (f: Expr) =
 and branchUnless (ctx: Ctx) (cond: Expr) (target: string) =
   let asAcc (x: Expr) =
     if x.Type = TyFrac then Expr.Call(Ir.intrinsic "acc.ofFrac", [ x ])
+    elif x.Type = TyLong then Expr.Call(Ir.intrinsic "acc.ofLong", [ x ])
     elif x.Type = TyAcc then x
-    else fail $"comparisons are on Frac or Acc values, not {IrTy.name x.Type}"
+    else fail $"comparisons are on Frac, Acc or Long values, not {IrTy.name x.Type}"
   match cond with
   | Intr "loop.everyPass" [ c ] -> branchUnless ctx c target
   // a bit of a word: `btst #n,d`, the bit in the carry
@@ -3671,7 +3971,11 @@ and branchUnless (ctx: Ctx) (cond: Expr) (target: string) =
       | "op_GreaterThan" -> "op_LessThan"
       | "op_GreaterThanOrEqual" -> "op_LessThanOrEqual"
       | n -> n
-    let zero (x: Expr) = match tryConst ctx x with Some(:? Acc as v) -> v.Raw = 0L | _ -> false
+    let zero (x: Expr) =
+      match tryConst ctx x with
+      | Some(:? Acc as v) -> v.Raw = 0L
+      | Some(:? Long as v) -> v.Raw = 0L
+      | _ -> false
     // against zero: tst, on the local in B where it is one
     let test (x: Expr) =
       match accLeaf ctx x with

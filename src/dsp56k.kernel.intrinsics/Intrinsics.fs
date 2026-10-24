@@ -10,6 +10,7 @@
 namespace dsp56k.kernel
 
 open System
+open System.Runtime.CompilerServices
 
 /// The compiler's name for an operation. Constant-only operations (`Const`) are evaluated when
 /// the kernel is compiled and must have constant arguments.
@@ -163,6 +164,44 @@ type Frac =
   [<Intrinsic "frac.ofBool">]
   static member ofBool (b: bool) = if b then Frac.ofRaw 1 else Frac.zero
 
+  /// `move f,a` `abs a` `move a,d`: the magnitude of `f`, limited to `$7fffff` (`Frac.one`) when
+  /// `f` is `-1` (`$800000`).
+  [<Intrinsic "frac.abs"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member abs (f: Frac) =
+    if f.Raw = -0x800000 then Frac.one
+    elif f.Raw < 0 then { Frac.Raw = -f.Raw }
+    else f
+
+  /// `move f,a` `abs a` `move a,d`: the magnitude of `f` (enables F# `abs f`).
+  [<Intrinsic "frac.abs"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member Abs (f: Frac) = Frac.abs f
+
+  /// Branchless minimum (`cmp` + `tgt`), comparing `.Raw` directly (zero .NET allocations).
+  [<Intrinsic "frac.min"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member Min (x: Frac, y: Frac) = if x.Raw <= y.Raw then x else y
+
+  /// Curried branchless minimum (`cmp` + `tgt`).
+  [<Intrinsic "frac.min"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member min (x: Frac) (y: Frac) = if x.Raw <= y.Raw then x else y
+
+  /// Branchless maximum (`cmp` + `tlt`), comparing `.Raw` directly (zero .NET allocations).
+  [<Intrinsic "frac.max"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member Max (x: Frac, y: Frac) = if x.Raw >= y.Raw then x else y
+
+  /// Curried branchless maximum (`cmp` + `tlt`).
+  [<Intrinsic "frac.max"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member max (x: Frac) (y: Frac) = if x.Raw >= y.Raw then x else y
+
+  /// Branchless clamp to `[lo, hi]` (`cmp` + `tlt` + `cmp` + `tgt`).
+  [<Intrinsic "frac.clamp"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member Clamp (x: Frac, lo: Frac, hi: Frac) =
+    let v = if x.Raw < lo.Raw then lo else x
+    if v.Raw > hi.Raw then hi else v
+
+  /// Curried branchless clamp: `x |> Frac.clamp lo hi`.
+  [<Intrinsic "frac.clampFrom"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member clamp (lo: Frac) (hi: Frac) (x: Frac) = Frac.Clamp(x, lo, hi)
+
   /// Frac * Frac: `mpy`, the 48-bit fractional product in an accumulator (-1 * -1 is +1, held
   /// in the extension).
   [<Intrinsic "frac.mul">]
@@ -220,6 +259,40 @@ and [<Struct>] Acc =
 
   [<Intrinsic "acc.neg">]
   static member (~-) (a: Acc) = { Acc.Raw = Bits.sext56 (-a.Raw) }
+
+  /// `abs a`: 56-bit absolute value in 1 word / 1 cycle.
+  [<Intrinsic "acc.abs"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member abs (a: Acc) = { Acc.Raw = Bits.sext56 (if a.Raw < 0L then -a.Raw else a.Raw) }
+
+  /// `abs a`: 56-bit absolute value in 1 word / 1 cycle (enables F# `abs a`).
+  [<Intrinsic "acc.abs"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member Abs (a: Acc) = Acc.abs a
+
+  /// Branchless 56-bit minimum (`cmp` + `tgt`), comparing `.Raw` directly (zero .NET allocations).
+  [<Intrinsic "acc.min"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member Min (a: Acc, b: Acc) = if a.Raw <= b.Raw then a else b
+
+  /// Curried branchless 56-bit minimum (`cmp` + `tgt`).
+  [<Intrinsic "acc.min"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member min (a: Acc) (b: Acc) = if a.Raw <= b.Raw then a else b
+
+  /// Branchless 56-bit maximum (`cmp` + `tlt`), comparing `.Raw` directly (zero .NET allocations).
+  [<Intrinsic "acc.max"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member Max (a: Acc, b: Acc) = if a.Raw >= b.Raw then a else b
+
+  /// Curried branchless 56-bit maximum (`cmp` + `tlt`).
+  [<Intrinsic "acc.max"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member max (a: Acc) (b: Acc) = if a.Raw >= b.Raw then a else b
+
+  /// Branchless 56-bit clamp to `[lo, hi]` (`cmp` + `tlt` + `cmp` + `tgt`).
+  [<Intrinsic "acc.clamp"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member Clamp (x: Acc, lo: Acc, hi: Acc) =
+    let v = if x.Raw < lo.Raw then lo else x
+    if v.Raw > hi.Raw then hi else v
+
+  /// Curried branchless 56-bit clamp: `x |> Acc.clamp lo hi`.
+  [<Intrinsic "acc.clampFrom"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member clamp (lo: Acc) (hi: Acc) (x: Acc) = Acc.Clamp(x, lo, hi)
 
   /// `asr #n,a,a`, n constant.
   [<Intrinsic "acc.asr">]
@@ -372,6 +445,58 @@ and [<Struct>] Long =
     if a.Raw > 0x7fffffffffffL then { Long.Raw = 0x7fffffffffffL }
     elif a.Raw < -0x800000000000L then { Long.Raw = -0x800000000000L }
     else { Long.Raw = a.Raw }
+
+  /// Pack two 24-bit words `hi:lo` into a 48-bit `Long` (`move hi,a` `move lo,a0` or direct
+  /// word stores), without 24-bit shifts.
+  [<Intrinsic "long.pack"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member pack (hi: Frac) (lo: Frac) =
+    { Long.Raw = (int64 hi.Raw <<< 24) ||| (int64 lo.Raw &&& 0xffffffL) }
+
+  /// Tupled `Long.pack`.
+  [<Intrinsic "long.pack"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member Pack (hi: Frac, lo: Frac) = Long.pack hi lo
+
+  /// The upper 24-bit word (`a1` or the upper memory word) of a 48-bit `Long`.
+  [<Intrinsic "long.hi"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member hi (l: Long) = Frac.ofRaw (int (l.Raw >>> 24))
+
+  /// The upper 24-bit word (`a1` or the upper memory word) of a 48-bit `Long`.
+  [<Intrinsic "long.hi"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member Hi (l: Long) = Long.hi l
+
+  /// The lower 24-bit word (`a0` or the lower memory word) of a 48-bit `Long`.
+  [<Intrinsic "long.lo"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member lo (l: Long) = Frac.ofRaw (int l.Raw)
+
+  /// The lower 24-bit word (`a0` or the lower memory word) of a 48-bit `Long`.
+  [<Intrinsic "long.lo"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member Lo (l: Long) = Long.lo l
+
+  /// Branchless 48-bit minimum (`cmp` + `tgt`), comparing `.Raw` directly (zero .NET allocations).
+  [<Intrinsic "long.min"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member Min (a: Long, b: Long) = if a.Raw <= b.Raw then a else b
+
+  /// Curried branchless 48-bit minimum (`cmp` + `tgt`).
+  [<Intrinsic "long.min"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member min (a: Long) (b: Long) = if a.Raw <= b.Raw then a else b
+
+  /// Branchless 48-bit maximum (`cmp` + `tlt`), comparing `.Raw` directly (zero .NET allocations).
+  [<Intrinsic "long.max"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member Max (a: Long, b: Long) = if a.Raw >= b.Raw then a else b
+
+  /// Curried branchless 48-bit maximum (`cmp` + `tlt`).
+  [<Intrinsic "long.max"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member max (a: Long) (b: Long) = if a.Raw >= b.Raw then a else b
+
+  /// Branchless 48-bit clamp to `[lo, hi]` (`cmp` + `tlt` + `cmp` + `tgt`).
+  [<Intrinsic "long.clamp"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member Clamp (x: Long, lo: Long, hi: Long) =
+    let v = if x.Raw < lo.Raw then lo else x
+    if v.Raw > hi.Raw then hi else v
+
+  /// Curried branchless 48-bit clamp: `x |> Long.clamp lo hi`.
+  [<Intrinsic "long.clampFrom"; MethodImpl(MethodImplOptions.AggressiveInlining)>]
+  static member clamp (lo: Long) (hi: Long) (x: Long) = Long.Clamp(x, lo, hi)
 
 /// Where a table's words are on the DSP.
 type TableSource =

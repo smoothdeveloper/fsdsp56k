@@ -1894,6 +1894,124 @@ module CountedWhileAndLoopYield =
   let kernel = Kernel.define "probe-counted-while-loop-yield" <@ init @> <@ trig @> <@ render @>
 
 
+/// Step 2 intrinsics: Min / Max / Clamp (tupled, curried, FSharp.Core min/max, compile-time
+/// System.Math), Acc.abs / Frac.abs / FSharp.Core abs, and Long.pack / Long.hi / Long.lo.
+[<ReflectedDefinition>]
+module Step2Intrinsics =
+  type S =
+    { mutable w    : Frac
+      mutable acc  : Acc
+      mutable pair : Long
+      [<Length 4>]
+      pairs        : Long array }
+
+  [<Const>]
+  let constLo () = Frac.ofRaw (System.Math.Min(-0x200000, 0x100000))
+
+  [<Const>]
+  let constHi () = Frac.ofRaw (System.Math.Max(-0x200000, 0x300000))
+
+  [<Const>]
+  let constMid () = Frac.ofRaw (System.Math.Clamp(0x500000, -0x100000, 0x250000))
+
+  [<Const>]
+  let constAbs () = Frac.ofRaw (System.Math.Abs(-0x123456))
+
+  [<Subroutine>]
+  let clampSub (x: Frac) (lo: Frac) (hi: Frac) =
+    let a = Frac.Clamp(x, lo, hi)
+    let b = min a hi
+    max b lo
+
+  [<Subroutine>]
+  let absSub (x: Frac) (y: Frac) =
+    let ax = Frac.abs x
+    let ay = abs y
+    Acc.sat (Acc.abs (x * y) + ax - ay)
+
+  [<Subroutine>]
+  let packSub (hi: Frac) (lo: Frac) =
+    let p = Long.pack hi lo
+    Acc.sat (Acc.ofFrac (Long.hi p) + Long.lo p)
+
+  let init (_: Banks.P) (s: S) =
+    s.w <- Frac.zero
+    s.acc <- Acc.zero
+    s.pair <- Long.pack (Frac.ofRaw 0x123456) (Frac.ofRaw 0x800001)
+    for i in 0 .. 3 do
+      s.pairs[i] <- Long.Pack(Frac.ofRaw i, Frac.ofRaw 0x800005)
+
+  let trig (p: Banks.P) (s: S) =
+    let fMin = Frac.Min(p.a, p.b)
+    let fMax = Frac.max p.c p.d
+    s.w <- Frac.clamp (constLo ()) (constHi ()) (min fMin fMax)
+    let a1 = Acc.Min(p.a * p.b, p.c * p.d)
+    let a2 = Acc.max a1 (Acc.ofFrac (constMid ()))
+    s.acc <- Acc.Clamp(max a1 a2, Acc.ofFrac (constLo ()), Acc.ofFrac (constHi ()))
+    let l1 = Long.pack p.a p.b
+    let l2 = Long.Pack(p.c, p.d)
+    let lMin = Long.Min(l1, l2)
+    let lMax = max l1 l2
+    s.pair <- Long.Clamp(lMin, Long.min l1 l2, Long.Max(lMax, s.pair))
+
+  let renderMinMax (p: Banks.P) (s: S) (out: Output) =
+    let lo = Frac.Min(p.a, p.b)
+    let hi = Frac.Max(p.a, p.b)
+    let mutable running = s.acc
+    for i in 0 .. 31 do
+      let raw = Acc.sat (Acc.ofFrac p.c + Frac.ofRaw i)
+      let c1 = Frac.Clamp(raw, lo, hi)
+      let c2 = clampSub c1 (constLo ()) (constHi ())
+      running <- Acc.Clamp(running + c1 * p.d, Acc.ofFrac lo, Acc.ofFrac hi)
+      running <- min running (Acc.ofFrac (constHi ()))
+      out.Write(Acc.sat (running + c2))
+    s.acc <- running
+    s.w <- Frac.Max(s.w, lo)
+
+  let renderAbs (p: Banks.P) (s: S) (out: Output) =
+    let c = constAbs ()
+    let negOne = Frac.ofRaw 0x800000
+    s.w <- Frac.Abs negOne
+    let mutable running = Acc.abs (p.a * p.b - p.c * p.d)
+    for _ in 0 .. 31 do
+      running <- Acc.Abs(running - p.a * p.c)
+      running <- abs running
+      let f1 = Frac.abs p.a
+      let f2 = absSub p.b p.d
+      out.Write(Acc.sat (running + f1 * c + f2 * s.w))
+    s.acc <- running
+
+  let renderLongPack (p: Banks.P) (s: S) (out: Output) =
+    let lowSet = Frac.ofRaw 0x800005
+    s.pair <- Long.pack p.a lowSet
+    let directHi = Long.hi (Long.pack p.b p.c)
+    let directLo = Long.Lo(Long.Pack(p.b, p.d))
+    s.w <- Acc.sat (Acc.ofFrac directHi + directLo)
+    for i in 0 .. 3 do
+      let prev = s.pairs[i]
+      let nextHi = Acc.sat (Acc.ofFrac (Long.hi prev) + p.a)
+      let nextLo = Acc.sat (Acc.ofFrac (Long.lo prev) + p.b)
+      s.pairs[i] <- Long.pack nextHi nextLo
+    for _ in 0 .. 7 do
+      for i in 0 .. 3 do
+        let elem = s.pairs[i]
+        let h = Long.Hi elem
+        let l = Long.lo elem
+        let sub = packSub p.c p.d
+        out.Write(Acc.sat (Acc.ofFrac h + l + Long.hi s.pair + Long.lo s.pair + sub + s.w))
+
+  let renderRuntimeMath (p: Banks.P) (s: S) (out: Output) =
+    let bad = Frac.ofRaw (System.Math.Min(p.a.Raw, p.b.Raw))
+    s.w <- bad
+    for _ in 0 .. 31 do
+      out.Write bad
+
+  let minMaxKernel = Kernel.define "probe-step2-minmax" <@ init @> <@ trig @> <@ renderMinMax @>
+  let absKernel = Kernel.define "probe-step2-abs" <@ init @> <@ trig @> <@ renderAbs @>
+  let longPackKernel = Kernel.define "probe-step2-long-pack" <@ init @> <@ trig @> <@ renderLongPack @>
+  let runtimeMathKernel = Kernel.define "probe-step2-runtime-math" <@ init @> <@ trig @> <@ renderRuntimeMath @>
+
+
 let probeMachine =
   { Mds.machine "org.fsdsp56k.probe" "PROBE" "GND" "PR" with
       parameters = [| for n in [| "A"; "B"; "C"; "D" |] -> Mds.param n Mds.UnipolarQ23 |] }
@@ -2851,5 +2969,58 @@ let tests =
       match dsp56k.kernel.Compile.compile Kernel.mds Probes.scaledIndexKernel with
       | Ok _ -> failtest "compiled"
       | Error e -> Expect.stringContains e "loop index" "the message names the problem"
+    }
+
+    test "Min, Max and Clamp (Frac, Acc, Long, FSharp.Core min/max, compile-time System.Math): branchless Tcc, equals the .NET kernel" {
+      match Optimize.compile Optimize.Peephole Kernel.mds Step2Intrinsics.minMaxKernel with
+      | Error e -> failtest e
+      | Ok c ->
+        let hasTcc = c.items |> Array.exists (function dsp56k.Item.Op(dsp56k.Tcc((dsp56k.Cond.Lt | dsp56k.Cond.Gt), _, _)) -> true | _ -> false)
+        let hasBcc = c.items |> Array.exists (function dsp56k.Item.Op(dsp56k.Branch(dsp56k.Bcc _, _)) -> true | _ -> false)
+        Expect.isTrue hasTcc "emits tlt/tgt conditional transfers"
+        Expect.isFalse hasBcc "zero conditional branches emitted for min/max/clamp"
+      needNative ()
+      conformance Step2Intrinsics.minMaxKernel 71
+    }
+
+    test "System.Math.Min/Max/Clamp/Abs at runtime gives a clear error pointing to min, max, abs and Frac.Min/Max/Clamp" {
+      match dsp56k.kernel.Compile.compile Kernel.mds Step2Intrinsics.runtimeMathKernel with
+      | Ok _ -> failtest "runtime System.Math.Min should be refused"
+      | Error e ->
+        Expect.stringContains e "System.Math.Min is only supported on compile-time constants" "explains compile-time constant restriction"
+        Expect.stringContains e "Frac.Clamp" "points to Frac.Min / Frac.Max / Frac.Clamp"
+    }
+
+    test "Acc.abs, Frac.abs and FSharp.Core abs: single-word hardware abs instruction, equals the .NET kernel" {
+      Expect.equal (Frac.abs (Frac.ofRaw 0x800000)).Raw 0x7fffff "-1.0f<f> saturates to +0x7fffff on .NET"
+      Expect.equal (Frac.abs (Frac.ofRaw -0x123456)).Raw 0x123456 "negative Frac magnitude"
+      Expect.equal (Acc.abs (Acc.ofRaw -0x123456789abcL)).Raw 0x123456789abcL "negative Acc magnitude"
+      match Optimize.compile Optimize.Peephole Kernel.mds Step2Intrinsics.absKernel with
+      | Error e -> failtest e
+      | Ok c ->
+        let absOps = c.items |> Array.filter (function dsp56k.Item.Op(dsp56k.Par(Some(dsp56k.Unary(dsp56k.AluUnary.Abs, _)), _)) -> true | _ -> false)
+        let hasBcc = c.items |> Array.exists (function dsp56k.Item.Op(dsp56k.Branch(dsp56k.Bcc _, _)) -> true | _ -> false)
+        Expect.isGreaterThanOrEqual absOps.Length 4 "emits hardware abs instructions"
+        Expect.isFalse hasBcc "zero conditional branches emitted for abs"
+      needNative ()
+      conformance Step2Intrinsics.absKernel 72
+    }
+
+    test "Long.pack, Long.hi and Long.lo: direct sub-register and word moves without 24-bit shifts, equals the .NET kernel" {
+      let packed = Long.pack (Frac.ofRaw 0x800000) (Frac.ofRaw 0x800001)
+      Expect.equal (Long.hi packed).Raw -0x800000 "Long.hi preserves signed upper word"
+      Expect.equal (Long.lo packed).Raw -0x7fffff "Long.lo preserves bit-23-set lower word"
+      Expect.equal packed.Raw (Bits.sext48 ((0x800000L <<< 24) ||| 0x800001L)) "48-bit raw representation"
+      match Optimize.compile Optimize.Peephole Kernel.mds Step2Intrinsics.longPackKernel with
+      | Error e -> failtest e
+      | Ok c ->
+        let hasShift24 =
+          c.items |> Array.exists (function
+            | dsp56k.Item.Op(dsp56k.Rep(dsp56k.Count { expr = dsp56k.Num 24L }))
+            | dsp56k.Item.Op(dsp56k.ShiftImm(_, 24, _, _)) -> true
+            | _ -> false)
+        Expect.isFalse hasShift24 "zero 24-bit shifts emitted for Long.pack / Long.hi / Long.lo"
+      needNative ()
+      conformance Step2Intrinsics.longPackKernel 73
     }
   ]

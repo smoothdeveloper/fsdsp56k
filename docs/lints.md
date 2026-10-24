@@ -41,10 +41,16 @@ let clipped =
   else x
 ```
 
-### Status today & planned intrinsics
+### Recommended rewrite (compiles today)
 
-- **Today**: The F# compiler front end lowers `if a < b then a else b` to a conditional branch diamond (`cmp` + `bcc` + `bra`), and only `[<HandWritten>]` assembly routines emit `Tcc`. When saturation to `[-1, +1)` is all that is needed, use `Acc.sat acc` (which compiles today to a saturating move from `a`/`b`).
-- **Planned (Steps 2–3)**: `Frac.Min` / `Frac.Max` / `Frac.Clamp` (and `Acc`/`Long` counterparts) as intrinsics plus the `select -> Tcc` optimiser pass (A4) will lower two-way and clamp selects to branchless `cmp` + `tlt`/`tgt` transfers.
+```fsharp
+// Branchless cmp + tlt + cmp + tgt on DSP, and 0 B .NET allocation:
+let clipped = Frac.Clamp(x, lo, hi)
+let loPick  = Frac.Min(a, b)
+let hiPick  = Frac.Max(a, b)
+```
+
+`Frac.Min`, `Frac.Max`, `Frac.Clamp` (and curried `Frac.min`, `Frac.max`, `Frac.clamp`), along with `Acc` and `Long` counterparts and `FSharp.Core.Operators.min`/`max`, lower directly to branchless `cmp` + `tlt`/`tgt` conditional transfers. On .NET, `Frac.Min`/`Max`/`Clamp` (and `Acc`/`Long` counterparts) compare `.Raw` directly (`0 B` allocation). `System.Math.Min`/`Max`/`Clamp` are supported for compile-time constants.
 
 ---
 
@@ -60,14 +66,15 @@ Assembling or splitting a 48-bit `Long` value by shifting an `Acc` 24 bits (`acc
 ### Recommended rewrite (compiles today)
 
 ```fsharp
-// Store/load 48-bit state via Long.ofAcc / Acc.ofLong and read words via Acc.hi / Acc.lo:
+// Pack two 24-bit Frac words directly into a 48-bit Long, and read upper/lower words:
+s.pair <- Long.pack hi lo
+let hiWord = Long.hi s.pair
+let loWord = Long.lo s.pair
+
+// Or convert between 56-bit Acc and 48-bit Long:
 s.acc <- Long.ofAcc acc
 let restored = Acc.ofLong s.acc
-let hiWord = Acc.hi restored
-let loWord = Acc.lo restored
 ```
-
-- **Planned (Step 2)**: Direct two-word `Long.pack hi lo`, `Long.hi x`, and `Long.lo x` helpers.
 
 ---
 
@@ -83,10 +90,15 @@ let loWord = Acc.lo restored
 let mag = if x < Acc.zero then -x else x
 ```
 
-### Status today & planned intrinsic
+### Recommended rewrite (compiles today)
 
-- **Today**: Only `[<HandWritten>]` assembly routines emit hardware `abs a` / `abs b`; F# sign-branch negation compiles to a branch over `neg`.
-- **Planned (Step 2)**: `Acc.abs` and `Frac.abs` intrinsics lowering directly to the single-word, 1-cycle `abs` instruction.
+```fsharp
+// Emits single-word, 1-cycle hardware `abs a`:
+let mag  = Acc.abs x
+let fmag = Frac.abs y
+// FSharp.Core `abs x` on Acc or Frac also lowers to hardware `abs a`:
+let mag2 = abs x
+```
 
 ---
 
@@ -111,7 +123,7 @@ let masked = Acc.hi (Acc.andHi 0x00ff0f (Acc.ofFrac x))
 let nextState = Frac.lfsr 0x400007 state
 ```
 
-- **Planned (Step 2)**: General wordwise `eor` / `or` / `not` intrinsics if corpus counts justify them.
+- **Planned**: General wordwise `eor` / `or` / `not` intrinsics if corpus counts justify them.
 
 ---
 
@@ -146,7 +158,7 @@ let diff = (p.a * p.b) - p.b * p.c
 The diagnostic message states why the diamond remained a branch:
 1. **Branch body writes memory** (`Store` inside a branch arm cannot be predicated with `Tcc`).
 2. **Branch body performs ALU or control operations** (`Tcc` only transfers registers).
-3. **Condition code is not lowered to `Tcc` yet** (**Planned in Step 3**: optimiser pass A4 `select -> Tcc` once candidate values live in `X1`/`Y1`/`A`/`B`).
+3. **Condition code is not lowered to `Tcc` yet** (for ordering selects, use `Frac.Min`/`Max`/`Clamp` or `min`/`max`; general `select -> Tcc` pass A4 is planned in Step 3).
 
 ---
 
@@ -196,10 +208,17 @@ for _ = 0 to 3 do
 - **Lint**: `dsp-5001` (`[ir]`) — Generic F# comparison (`<`, `>`, `<=`, `>=`, `=`, `min`, `max`) on `Frac` / `Acc` / `Long` structs inside `RENDER` boxes on .NET (48 B/call).
 - **Kudos**: `dsp-k5001` (`[ir]`) — .NET `RENDER` allocates `0 B` per block after warmup (measured via `GC.GetAllocatedBytesForCurrentThread()`).
 
-### Why it matters & status
+### Why it matters & recommended rewrite (compiles today)
 
 Grading and stress sweeps execute the .NET reference `RENDER` thousands of times alongside the DSP emulator. Calling F#'s generic comparison operators (`<`, `>`, `<=`, `>=`, `=`, `min`, `max`) on `Frac`, `Acc`, or `Long` structs dispatches through `LanguagePrimitives.GenericComparison` on .NET, boxing both operands (`48 B` per call).
 
-- **Today**: Avoid unnecessary comparisons in hot `.NET` loops when arithmetic or `Acc.sat` suffices (the DSP kernel compiler requires comparisons to be written on `Frac` or `Acc` values, not `.Raw`).
-- **Planned (Step 2)**: `static member inline Min/Max/Clamp` on `Frac`, `Acc`, and `Long` comparing `.Raw` directly on .NET (`0 B` allocation) and tagged as DSP intrinsics.
+Use `Frac.Min`, `Frac.Max`, `Frac.Clamp` (or `Frac.min`, `Frac.max`, `Frac.clamp`) and their `Acc` / `Long` counterparts, which compare `.Raw` directly on .NET (`0 B` allocation) and compile to branchless `cmp` + `Tcc` on the DSP:
+
+```fsharp
+// 0 B allocation on .NET, branchless cmp + tlt/tgt on DSP:
+let clipped = Frac.Clamp(x, lo, hi)
+let smaller = Frac.Min(a, b)
+let larger  = Frac.Max(a, b)
+```
+
 

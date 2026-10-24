@@ -1,4 +1,5 @@
 input-thru	machinedrum	ok	53	53bbcacca906e4e8
+intrinsics-parity	machinedrum	ok	132	2a1138b353657bd3
 main-tap	machinedrum	ok	56	cdc8fa43eba3b164
 pluck	machinedrum	ok	169	05d248fa6b886e7f
 probe-address-twice	machinedrum	ok	67	e5438ebb72aaf30b
@@ -60,6 +61,10 @@ probe-size-8100	machinedrum	ok	1038	38d56890bfaef8d5
 probe-size-small	machinedrum	ok	30	347015f8740b6210
 probe-state-ring	machinedrum	ok	143	f635883a3ed5c953
 probe-state-ring-off	machinedrum	error	-	e3268e71cb3bfb09	ring at Y+$9: a 6-word ring starts on a multiple of 8 in the workset (move the field)
+probe-step2-abs	machinedrum	ok	246	da808ecf0186cacd
+probe-step2-long-pack	machinedrum	ok	260	a5552ca8d649f028
+probe-step2-minmax	machinedrum	ok	278	c6f0167b62a24a13
+probe-step2-runtime-math	machinedrum	error	-	a65747f19b69b900	System.Math.Min is only supported on compile-time constants; for runtime DSP values use min, max, abs or Frac.Min / Frac.Max / Frac.Clamp (Acc.Min / Acc.Max / Acc.Clamp, Long.Min / Long.Max / Long.Clamp)
 probe-stereo	machinedrum	error	-	0ff33fe26e5970df	probe-stereo: WritePair needs a stereo target, Machinedrum MDS has 1 channel(s)
 probe-subroutine-frames	machinedrum	ok	167	34a45b3706160ab4
 probe-subroutines	machinedrum	ok	198	de93bc8714176c96

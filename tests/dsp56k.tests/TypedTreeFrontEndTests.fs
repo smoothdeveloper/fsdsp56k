@@ -142,4 +142,96 @@ let standaloneJsonTest =
       Expect.equal (lines |> List.filter (fun l -> not (l.EndsWith "same") && not (l.Contains "\t[]\t"))) [] "every kernel compiles to the program of the quotation front end"
   }
 
-let tests = testList "kernel IR, the typed tree front end" [ sineTests; sweepTest; jsonTest; jsonSweepTest; standaloneJsonTest ]
+[<ReflectedDefinition>]
+module IntrinsicsParity =
+  type P =
+    { a : Frac
+      b : Frac
+      c : Frac }
+
+  type S =
+    { mutable w    : Frac
+      mutable acc  : Acc
+      mutable pair : Long }
+
+  let init (_: P) (s: S) =
+    s.w <- Frac.zero
+    s.acc <- Acc.zero
+    s.pair <- Long.zero
+
+  let trig (p: P) (s: S) =
+    s.pair <- Long.pack p.a p.b
+    s.w <- Frac.Clamp(min p.a p.b, Frac.Min(p.a, p.c), Frac.max p.b p.c)
+    s.acc <- Acc.Clamp(max (p.a * p.b) (p.b * p.c), Acc.ofFrac p.a, Acc.ofFrac p.c)
+
+  let render (p: P) (s: S) (out: Output) =
+    for _ = 0 to 31 do
+      let hi = Long.hi s.pair
+      let lo = Long.lo s.pair
+      let a1 = Acc.abs (Acc.ofFrac hi - lo)
+      let a2 = abs (p.a * p.b)
+      let f1 = Frac.abs p.c
+      let f2 = abs s.w
+      let m  = Frac.Clamp(min f1 f2, p.a, max p.b p.c)
+      out.Write(Acc.sat (Acc.Min(a1, a2) + m))
+
+  let kernel = Kernel.define "intrinsics-parity" <@ init @> <@ trig @> <@ render @>
+
+let intrinsicsParitySource = """
+module dsp56k.tests.TypedTreeFrontEndTests.IntrinsicsParity
+
+open dsp56k.kernel
+
+type P =
+  { a : Frac
+    b : Frac
+    c : Frac }
+
+type S =
+  { mutable w    : Frac
+    mutable acc  : Acc
+    mutable pair : Long }
+
+let init (_: P) (s: S) =
+  s.w <- Frac.zero
+  s.acc <- Acc.zero
+  s.pair <- Long.zero
+
+let trig (p: P) (s: S) =
+  s.pair <- Long.pack p.a p.b
+  s.w <- Frac.Clamp(min p.a p.b, Frac.Min(p.a, p.c), Frac.max p.b p.c)
+  s.acc <- Acc.Clamp(max (p.a * p.b) (p.b * p.c), Acc.ofFrac p.a, Acc.ofFrac p.c)
+
+let render (p: P) (s: S) (out: Output) =
+  for _ = 0 to 31 do
+    let hi = Long.hi s.pair
+    let lo = Long.lo s.pair
+    let a1 = Acc.abs (Acc.ofFrac hi - lo)
+    let a2 = abs (p.a * p.b)
+    let f1 = Frac.abs p.c
+    let f2 = abs s.w
+    let m  = Frac.Clamp(min f1 f2, p.a, max p.b p.c)
+    out.Write(Acc.sat (Acc.Min(a1, a2) + m))
+"""
+
+let intrinsicsParityTest =
+  test "Step 2 intrinsics (Min/Max/Clamp, abs, Long.pack/hi/lo, FSharp.Core min/max/abs) compile identically across Quotation, TypedTree, and JSON front ends" {
+    let tmpFile = Path.Combine(Path.GetTempPath(), $"IntrinsicsParity_{Guid.NewGuid():N}.fs")
+    try
+      File.WriteAllText(tmpFile, intrinsicsParitySource)
+      match FromTypedTree.check [ tmpFile ] [] with
+      | Error e -> failtest $"FromTypedTree.check: {e}"
+      | Ok checked' ->
+        let ttIr = Expect.wantOk (FromTypedTree.kernel checked' "intrinsics-parity" ("init", "trig", "render")) "FromTypedTree.kernel"
+        let jsonText = TypedTreeJson.ofFiles checked'.contents
+        let jsonIr = Expect.wantOk (ReflectionHost.kernel jsonText "dsp56k.tests.TypedTreeFrontEndTests.IntrinsicsParity" "intrinsics-parity" ("init", "trig", "render")) "ReflectionHost.kernel"
+        let qComp = Expect.wantOk (Compile.generate Kernel.mds IntrinsicsParity.kernel) "Quotation compile"
+        let ttComp = Expect.wantOk (Compile.generateIr Kernel.mds ttIr) "TypedTree compile"
+        let jsonComp = Expect.wantOk (Compile.generateIr Kernel.mds jsonIr) "JSON compile"
+        Expect.equal (Program.source (code ttComp.items)) (Program.source (code qComp.items)) "TypedTree matches Quotation"
+        Expect.equal (Program.source (code jsonComp.items)) (Program.source (code qComp.items)) "JSON matches Quotation"
+    finally
+      if File.Exists tmpFile then File.Delete tmpFile
+  }
+
+let tests = testList "kernel IR, the typed tree front end" [ sineTests; sweepTest; jsonTest; jsonSweepTest; standaloneJsonTest; intrinsicsParityTest ]

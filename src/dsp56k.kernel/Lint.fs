@@ -36,22 +36,22 @@ let rules : Rule array =
        kudosId      = "dsp-k1001"
        family       = "intrinsic"
        anchor       = "docs/lints.md#dsp-1001"
-       title        = "Comparison select diamond lowered to conditional branch"
-       summary      = "Comparison branch diamonds (`if a < b then a else b`) emit conditional branches instead of branchless `Tcc` transfers (planned: `Min`/`Max`/`Clamp` intrinsics and `select -> Tcc` lowering)."
+       title        = "Use Min / Max / Clamp instead of comparison branch diamond"
+       summary      = "Comparison branch diamonds (`if a < b then a else b`) emit conditional branches instead of branchless `Tcc` transfers; use `Frac.Min`/`Max`/`Clamp` (or `Acc`/`Long` counterparts, or `min`/`max`)."
        kudosSummary = "Conditional value selection lowered to branchless `Tcc` transfer." }
      { id           = "dsp-1002"
        kudosId      = "dsp-k1002"
        family       = "intrinsic"
        anchor       = "docs/lints.md#dsp-1002"
-       title        = "Use Long.ofAcc / Acc.ofLong / Acc.hi / Acc.lo instead of 24-bit shifts and bit clears"
-       summary      = "Shifting by 24 bits (`<<< 24`, `>>> 24`) and clearing bit 23 to pack or split words emits multi-instruction sequences in direct codegen instead of direct `a1`/`a0` sub-register moves (`Long.ofAcc`/`Acc.ofLong`/`Acc.hi`/`Acc.lo` compile today; `Long.pack`/`Long.hi`/`Long.lo` planned)."
+       title        = "Use Long.pack / Long.hi / Long.lo / Long.ofAcc / Acc.ofLong instead of 24-bit shifts and bit clears"
+       summary      = "Shifting by 24 bits (`<<< 24`, `>>> 24`) and clearing bit 23 to pack or split words emits multi-instruction sequences in direct codegen instead of direct `a1`/`a0` sub-register moves (`Long.pack`, `Long.hi`, `Long.lo`, `Long.ofAcc`, `Acc.ofLong`, `Acc.hi`, `Acc.lo`)."
        kudosSummary = "48-bit word pack/unpack uses direct accumulator sub-register moves (`a1`/`a0`) without 24-bit shifts." }
      { id           = "dsp-1003"
        kudosId      = "dsp-k1003"
        family       = "intrinsic"
        anchor       = "docs/lints.md#dsp-1003"
-       title        = "Sign-branch negation diamond instead of hardware abs"
-       summary      = "Sign-branch absolute value (`if x < 0 then -x else x`) emits a test and branch diamond instead of the 1-cycle `abs` instruction (planned: `Acc.abs` / `Frac.abs` intrinsic)."
+       title        = "Use Acc.abs / Frac.abs (or abs) instead of sign-branch negation diamond"
+       summary      = "Sign-branch absolute value (`if x < 0 then -x else x`) emits a test and branch diamond instead of the 1-cycle `abs` instruction (`Acc.abs`, `Frac.abs`, or `abs`)."
        kudosSummary = "Absolute value lowered to single-word 1-cycle hardware `abs` instruction." }
      { id           = "dsp-1004"
        kudosId      = "dsp-k1004"
@@ -93,7 +93,7 @@ let rules : Rule array =
        family       = "host"
        anchor       = "docs/lints.md#dsp-5001"
        title        = "Generic F# comparison on Frac/Acc/Long structs boxes on .NET (48 B/call)"
-       summary      = "Calling generic `<`, `>`, `<=`, `>=`, `=`, `min`, or `max` on `Frac`/`Acc`/`Long` structs boxes via `GenericCompare` on .NET (48 B/call); planned `Min`/`Max`/`Clamp` intrinsics compare `.Raw` with 0 B allocation."
+       summary      = "Calling generic `<`, `>`, `<=`, `>=`, `=`, `min`, or `max` on `Frac`/`Acc`/`Long` structs boxes via `GenericCompare` on .NET (48 B/call); `Frac.Min`/`Max`/`Clamp` (and `Acc`/`Long` counterparts) compare `.Raw` with 0 B allocation."
        kudosSummary = "Host .NET `RENDER` executes with 0 B managed allocation per block." } |]
 
 let private ruleById = rules |> Array.map (fun r -> r.id, r) |> Map.ofArray
@@ -172,7 +172,7 @@ let private isKernelValueTy (t: IrTy) =
 let private isComparisonName (name: string) =
   match name with
   | "op_LessThan" | "op_LessThanOrEqual" | "op_GreaterThan" | "op_GreaterThanOrEqual"
-  | "op_Equality" | "op_Inequality" | "Min" | "Max" | "compare" -> true
+  | "op_Equality" | "op_Inequality" | "Min" | "Max" | "min" | "max" | "compare" -> true
   | _ -> false
 
 let private isOrderingName (name: string) =

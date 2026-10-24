@@ -29,7 +29,7 @@ module LintProbes =
 
   let trig (_: P) (_: S) = ()
 
-  // --- dsp-1001: manual comparison select vs clean ---
+  // --- dsp-1001: manual comparison select vs Frac.Clamp / Frac.Min / Frac.Max ---
   let fire1001 (p: P) (s: S) (out: Output) =
     for _ = 0 to 31 do
       let x = p.a
@@ -39,11 +39,11 @@ module LintProbes =
 
   let clean1001 (p: P) (s: S) (out: Output) =
     for _ = 0 to 31 do
-      let y = Acc.sat (Acc.ofFrac p.a + p.b)
-      s.w <- y
-      out.Write y
+      let y = Frac.Clamp(p.a, p.b, p.c)
+      s.w <- Frac.Min(y, p.c)
+      out.Write(Frac.Max(s.w, p.b))
 
-  // --- dsp-1002: manual 24-bit shift pack vs Long.ofAcc/Acc.ofLong ---
+  // --- dsp-1002: manual 24-bit shift pack vs Long.pack / Long.hi / Long.lo ---
   let fire1002 (p: P) (s: S) (out: Output) =
     for _ = 0 to 31 do
       let packed = (Acc.ofFrac p.a >>> 24) + Acc.ofFrac p.b
@@ -52,11 +52,12 @@ module LintProbes =
 
   let clean1002 (p: P) (s: S) (out: Output) =
     for _ = 0 to 31 do
+      s.acc <- Long.pack p.a p.b
       let a = Acc.ofLong s.acc
-      s.w <- Acc.lo a
-      out.Write(Acc.hi a)
+      s.w <- Long.lo s.acc
+      out.Write(Acc.sat (Acc.ofFrac (Long.hi s.acc) + Acc.hi a))
 
-  // --- dsp-1003: manual sign branch over neg vs clean ---
+  // --- dsp-1003: manual sign branch over neg vs Acc.abs / Frac.abs ---
   let fire1003 (p: P) (s: S) (out: Output) =
     for _ = 0 to 31 do
       let x = Acc.ofFrac p.a
@@ -64,6 +65,13 @@ module LintProbes =
       let y = Acc.sat m
       s.w <- y
       out.Write y
+
+  let clean1003 (p: P) (s: S) (out: Output) =
+    for _ = 0 to 31 do
+      let m = Acc.abs (Acc.ofFrac p.a)
+      let y = Frac.abs p.b
+      s.w <- y
+      out.Write(Acc.sat (m + y))
 
   // --- dsp-1004: bit-by-bit loop vs hardware bitwise ---
   let fire1004 (p: P) (s: S) (out: Output) =
@@ -138,6 +146,18 @@ module LintProbes =
       let y = if p.a = p.b then p.a else p.b
       s.w <- y
       out.Write y
+
+  let fire5001Min (p: P) (s: S) (out: Output) =
+    for _ = 0 to 31 do
+      let y = min p.a p.b
+      s.w <- y
+      out.Write y
+
+  let clean5001 (p: P) (s: S) (out: Output) =
+    for _ = 0 to 31 do
+      let y = Frac.Clamp(p.a, p.b, p.c)
+      s.w <- Frac.Min(y, p.b)
+      out.Write(Frac.Max(s.w, p.c))
 
 let private probeKernel name render =
   Kernel.define name <@ LintProbes.init @> <@ LintProbes.trig @> render
@@ -255,16 +275,12 @@ let ruleTests =
       for w in w1001 do
         Expect.equal w.anchor "docs/lints.md#dsp-1001" "dsp-1001 anchor"
         Expect.isTrue (w.message.Contains "docs/lints.md#dsp-1001") "message includes anchor"
-      let rClean = check "clean1001" <@ LintProbes.clean1001 @>
+      let rClean = checkWith { Lint.Options.defaults with kudos = true } "clean1001" <@ LintProbes.clean1001 @>
       Expect.isEmpty (rClean.warnings |> Array.filter (fun w -> w.id = "dsp-1001")) "clean1001 has no dsp-1001"
-      // Verify dsp-k1001 fires on branchless Tcc with ordering cond and fails when accompanied by a branch
+      Expect.isTrue (rClean.kudos |> Array.exists (fun k -> k.id = "dsp-k1001" && k.anchor = "docs/lints.md#dsp-1001")) "clean1001 earns dsp-k1001 from compiled Frac.Clamp/Min/Max"
+      // Verify dsp-k1001 is suppressed when the same origin also emitted a branch
       let layout = Kernel.layout Kernel.mds (probeKernel "clean1001" <@ LintProbes.clean1001 @>)
       let orig = Origin.ofRange { file = "a.fs"; line = 20 }
-      let tccAsm = [| Op(Tcc(Cond.Lt, Some(X0, dsp56k.Acc.A), None)), orig |]
-      let sinkOk = Sink.create ()
-      Lint.collectAsmFacts sinkOk layout tccAsm tccAsm
-      let ksOk = Lint.queryKudos { Lint.Options.defaults with kudos = true } sinkOk
-      Expect.isTrue (ksOk |> Array.exists (fun k -> k.id = "dsp-k1001" && k.anchor = "docs/lints.md#dsp-1001")) "dsp-k1001 fires on branchless ordering Tcc"
       let branchedAsm = [| Op(Branch(Bcc Cond.Lt, { expr = Sym "L1"; force = Auto })), orig; Op(Tcc(Cond.Lt, Some(X0, dsp56k.Acc.A), None)), orig; Label "L1", orig |]
       let sinkBr = Sink.create ()
       Lint.collectAsmFacts sinkBr layout branchedAsm branchedAsm
@@ -284,16 +300,9 @@ let ruleTests =
       let rFire = check "fire1003" <@ LintProbes.fire1003 @>
       let w1003 = rFire.warnings |> Array.filter (fun w -> w.id = "dsp-1003")
       Expect.isNonEmpty w1003 "dsp-1003 fires on manual sign branch over neg"
-      let rClean = check "clean1001" <@ LintProbes.clean1001 @>
-      Expect.isEmpty (rClean.warnings |> Array.filter (fun w -> w.id = "dsp-1003")) "clean1001 has no dsp-1003"
-      // Verify dsp-k1003 fires on hardware `abs a` instruction and fails without it
-      let layout = Kernel.layout Kernel.mds (probeKernel "clean1001" <@ LintProbes.clean1001 @>)
-      let orig = Origin.ofRange { file = "a.fs"; line = 30 }
-      let absAsm = [| Op(Par(Some(Unary(AluUnary.Abs, dsp56k.Acc.A)), [||])), orig |]
-      let sinkOk = Sink.create ()
-      Lint.collectAsmFacts sinkOk layout absAsm absAsm
-      let ksOk = Lint.queryKudos { Lint.Options.defaults with kudos = true } sinkOk
-      Expect.isTrue (ksOk |> Array.exists (fun k -> k.id = "dsp-k1003" && k.anchor = "docs/lints.md#dsp-1003")) "dsp-k1003 fires on hardware abs instruction"
+      let rClean = checkWith { Lint.Options.defaults with kudos = true } "clean1003" <@ LintProbes.clean1003 @>
+      Expect.isEmpty (rClean.warnings |> Array.filter (fun w -> w.id = "dsp-1003")) "clean1003 has no dsp-1003"
+      Expect.isTrue (rClean.kudos |> Array.exists (fun k -> k.id = "dsp-k1003" && k.anchor = "docs/lints.md#dsp-1003")) "clean1003 earns dsp-k1003 from compiled Acc.abs / Frac.abs"
 
     testCase "dsp-1004 and dsp-k1004: bit-by-bit loop vs hardware bitwise" <| fun () ->
       let rFire = check "fire1004" <@ LintProbes.fire1004 @>
@@ -315,15 +324,9 @@ let ruleTests =
       let rFire = check "fire1001" <@ LintProbes.fire1001 @>
       let w3001 = rFire.warnings |> Array.filter (fun w -> w.id = "dsp-3001")
       Expect.isNonEmpty w3001 "dsp-3001 fires on short branch diamond"
-      let rClean = check "clean1001" <@ LintProbes.clean1001 @>
+      let rClean = checkWith { Lint.Options.defaults with kudos = true } "clean1001" <@ LintProbes.clean1001 @>
       Expect.isEmpty (rClean.warnings |> Array.filter (fun w -> w.id = "dsp-3001")) "clean1001 has no dsp-3001"
-      let layout = Kernel.layout Kernel.mds (probeKernel "clean1001" <@ LintProbes.clean1001 @>)
-      let orig = Origin.ofRange { file = "a.fs"; line = 40 }
-      let tccAsm = [| Op(Tcc(Cond.Eq, Some(X0, dsp56k.Acc.A), None)), orig |]
-      let sinkOk = Sink.create ()
-      Lint.collectAsmFacts sinkOk layout tccAsm tccAsm
-      let ksOk = Lint.queryKudos { Lint.Options.defaults with kudos = true } sinkOk
-      Expect.isTrue (ksOk |> Array.exists (fun k -> k.id = "dsp-k3001" && k.anchor = "docs/lints.md#dsp-3001")) "dsp-k3001 fires on branchless Tcc"
+      Expect.isTrue (rClean.kudos |> Array.exists (fun k -> k.id = "dsp-k3001" && k.anchor = "docs/lints.md#dsp-3001")) "clean1001 earns dsp-k3001 from compiled Tcc"
 
     testCase "dsp-3002 and dsp-k3002: software backward branch loop vs hardware DO loop" <| fun () ->
       let rFire = check "fire3002" <@ LintProbes.fire3002 @>
@@ -344,13 +347,18 @@ let ruleTests =
     testCase "dsp-5001 and dsp-k5001: .NET boxing in RENDER vs 0 B allocation" <| fun () ->
       let rFire = check "fire5001" <@ LintProbes.fire5001 @>
       let w5001 = rFire.warnings |> Array.filter (fun w -> w.id = "dsp-5001")
-      Expect.isNonEmpty w5001 "dsp-5001 fires on box inside RENDER"
-      let cleanK = probeKernel "clean3002" <@ LintProbes.clean3002 @>
+      Expect.isNonEmpty w5001 "dsp-5001 fires on generic = inside RENDER"
+      let rFireMin = checkWith { Lint.Options.defaults with kudos = true } "fire5001Min" <@ LintProbes.fire5001Min @>
+      Expect.isNonEmpty (rFireMin.warnings |> Array.filter (fun w -> w.id = "dsp-5001")) "dsp-5001 fires on FSharp.Core min on Frac (boxes on .NET)"
+      Expect.isEmpty (rFireMin.warnings |> Array.filter (fun w -> w.id = "dsp-1001")) "FSharp.Core min lowers to branchless Tcc without dsp-1001"
+      Expect.isTrue (rFireMin.kudos |> Array.exists (fun k -> k.id = "dsp-k1001")) "FSharp.Core min earns dsp-k1001 on DSP"
+      let cleanK = probeKernel "clean5001" <@ LintProbes.clean5001 @>
       let allocClean = Lint.measureNetAllocation Kernel.mds cleanK
-      Expect.equal allocClean 0L "clean3002 allocates 0 B on .NET"
-      let rClean = checkWith { Lint.Options.defaults with kudos = true; netAllocatedBytes = Some allocClean } "clean3002" <@ LintProbes.clean3002 @>
+      Expect.equal allocClean 0L "clean5001 (Frac.Min/Max/Clamp) allocates 0 B on .NET"
+      let rClean = checkWith { Lint.Options.defaults with kudos = true; netAllocatedBytes = Some allocClean } "clean5001" <@ LintProbes.clean5001 @>
+      Expect.isEmpty (rClean.warnings |> Array.filter (fun w -> w.id = "dsp-5001")) "clean5001 has no dsp-5001"
       Expect.isTrue (rClean.kudos |> Array.exists (fun k -> k.id = "dsp-k5001" && k.anchor = "docs/lints.md#dsp-5001")) "0 B .NET allocation earns dsp-k5001"
-      let rAlloc = checkWith { Lint.Options.defaults with kudos = true; netAllocatedBytes = Some 24L } "clean3002" <@ LintProbes.clean3002 @>
+      let rAlloc = checkWith { Lint.Options.defaults with kudos = true; netAllocatedBytes = Some 24L } "clean5001" <@ LintProbes.clean5001 @>
       Expect.isFalse (rAlloc.kudos |> Array.exists (fun k -> k.id = "dsp-k5001")) "non-zero allocation does not earn dsp-k5001"
 
     testCase "layer filter (--lint-layer ir | asm) and anti-gaming (bitExact = false suppresses kudos)" <| fun () ->
