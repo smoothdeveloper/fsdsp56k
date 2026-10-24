@@ -1973,7 +1973,9 @@ and tableRead (ctx: Ctx) (t: Expr) (index: Expr) (width: int) (col: int) (dst: R
           emit ctx (move x0 r0)
     else
       // a1 = index * width, by shifts and adds
-      genAcc ctx (Expr.Call(Ir.intrinsic "acc.ofFrac", [ index ]))
+      match index with
+      | Intr "acc.hi" [x] when width = 1 -> genAcc ctx x
+      | _ -> genAcc ctx (Expr.Call(Ir.intrinsic "acc.ofFrac", [ index ]))
       if width > 1 then
         let bits = Convert.ToString(width, 2)
         emit ctx (tfr a b)
@@ -2000,7 +2002,9 @@ and indexInN0 (ctx: Ctx) (w: Expr) (extra: int) =
   match wordLeaf ctx w with
   | Some leaf when extra = 0 -> emitAll ctx (loadWord leaf (N 0))
   | _ ->
-    genAcc ctx (Expr.Call(Ir.intrinsic "acc.ofFrac", [ w ]))
+    match w with
+    | Intr "acc.hi" [x] -> genAcc ctx x
+    | _ -> genAcc ctx (Expr.Call(Ir.intrinsic "acc.ofFrac", [ w ]))
     if extra <> 0 then emit ctx (add (immL (extra &&& 0xffffff)) a)
     emit ctx (move a1 (N 0))
 
@@ -2896,9 +2900,13 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
               | None, [] -> None
             match fresh with
             | Some reg ->
-              emit ctx (move r6 a)
-              emit ctx (add (immL (f.offset + size f * lo)) a)
-              emit ctx (move a1 (R reg))
+              let d = f.offset + size f * lo
+              if d = 0 then emit ctx (move r6 (R reg))
+              elif d > 0 && d <= 63 then emit ctx (lua (disp r6 d) (R reg))
+              else
+                emit ctx (move r6 a)
+                emit ctx (add (immL d) a)
+                emit ctx (move a1 (R reg))
               ctx.indexed <- ctx.indexed.Add((v, name), (reg, 0))
               owners.Add((reg, f))
               if size f = 2 then longRegs.Add reg

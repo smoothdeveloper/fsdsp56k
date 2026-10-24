@@ -1807,6 +1807,47 @@ module OuterWalkAndRegions =
   let kernel = Kernel.define "probe-outer-walk-regions" <@ init @> <@ trig @> <@ render @>
 
 
+/// Back-to-back region accesses at computed offsets from a state word (reusing `r0` across
+/// `mds: import` markers without `move a1,a` or redundant `move #>$0,r0`), an accumulator
+/// clamp whose branch `tfr` folds into `b` so the 3-word accumulator save/reload drops, and
+/// a state-array loop whose trailing `move (r1)+` folds into `x:(r1)+`.
+[<ReflectedDefinition>]
+module ImportAndClampForward =
+  [<XMemory>]
+  type S =
+    { mutable baseOff : Frac
+      [<Length 8>] tap : Frac array }
+
+  let init (_: Banks.P) (s: S) =
+    s.baseOff <- Frac.ofRaw 2
+    for i in 0 .. 7 do
+      s.tap[i] <- Frac.zero
+
+  let trig (_: Banks.P) (s: S) =
+    for i in 0 .. 7 do
+      s.tap[i] <- Frac.ofRaw i
+
+  let render (p: Banks.P) (s: S) (out: Output) =
+    let i0 = Acc.hi (Acc.ofFrac s.baseOff + Frac.ofRaw 1)
+    let i1 = Acc.hi (Acc.ofFrac s.baseOff + Frac.ofRaw 2)
+    let i2 = Acc.hi (Acc.ofFrac s.baseOff + Frac.ofRaw 3)
+    Region.write Scratch.x i0 p.a
+    Region.write Scratch.x i1 p.b
+    let r0 = Region.read Scratch.x i0
+    let r1 = Region.read Scratch.x i1
+    Region.write Scratch.x i2 (Acc.sat (Acc.ofFrac r0 + Acc.ofFrac r1))
+    let r2 = Region.read Scratch.x i2
+    for i in 0 .. 7 do
+      s.tap[i] <- Acc.sat (Acc.ofFrac s.tap[i] + (Acc.ofFrac r2 >>> 3))
+    for _ in 0 .. 31 do
+      let x = p.a * r2 + p.b * p.c
+      let c1 = Acc.sat (if x > Acc.ofFrac p.d then Acc.ofFrac p.d else x)
+      let c2 = Acc.sat (if x < Acc.zero then Acc.zero else x)
+      out.Write (Acc.sat (Acc.ofFrac c1 + Acc.ofFrac c2))
+
+  let kernel = Kernel.define "probe-import-and-clamp-forward" <@ init @> <@ trig @> <@ render @>
+
+
 let probeMachine =
   { Mds.machine "org.fsdsp56k.probe" "PROBE" "GND" "PR" with
       parameters = [| for n in [| "A"; "B"; "C"; "D" |] -> Mds.param n Mds.UnipolarQ23 |] }
@@ -2451,6 +2492,21 @@ let tests =
           Expect.exists render (fun l -> l.Contains "x:(r2)+") "second region offset split onto x:(r2)+"
           Expect.exists render (fun l -> l.Contains "y:(r4)+") "outer DO loop state block walked with y:(r4)+"
         conformance OuterWalkAndRegions.kernel 76
+      }
+      test "import base forwarding, accumulator clamp tfr folding, and DO loop post-increment folding: compiled program equals the .NET kernel" {
+        needNative ()
+        match Optimize.compile Optimize.Peephole Kernel.mds ImportAndClampForward.kernel with
+        | Error e -> failtest e
+        | Ok c ->
+          let lines = c.items |> Array.map dsp56k.Print.item
+          let at (label: string) = Array.findIndex ((=) label) lines
+          let render = lines[at "RENDER:" + 1 ..]
+          let importCount = render |> Array.filter (fun l -> l.Contains "mds: import") |> Array.length
+          Expect.equal importCount 1 "six back-to-back region accesses share one r0 import base load in RENDER"
+          Expect.isFalse (render |> Array.exists (fun l -> l.Contains "move    a1,a")) "no redundant move a1,a before move a1,n0"
+          Expect.isFalse (render |> Array.exists (fun l -> l.Contains "move    (r1)+")) "trailing move (r1)+ folded into x:(r1)+"
+          Expect.isFalse (render |> Array.exists (fun l -> l.Contains ",a2")) "accumulator clamp needs no 3-word save/reload"
+        conformance ImportAndClampForward.kernel 77
       }
       test "register locals read in both branches of an if: compiled program equals the .NET kernel" {
         needNative ()

@@ -60,6 +60,7 @@ type Facts() =
   let mutable next = 0
   let consts = Dictionary<int64, int>()
   let signExts = Dictionary<int, int>()
+  let imports = Dictionary<string * int64, int>()
 
   member _.Fresh() =
     next <- next + 1
@@ -79,6 +80,14 @@ type Facts() =
     | _ ->
       let id = this.Fresh()
       consts[v] <- id
+      id
+
+  member this.Import(marker: string, off: int64) =
+    match imports.TryGetValue((marker, off)) with
+    | true, id -> id
+    | _ ->
+      let id = this.Fresh()
+      imports[(marker, off)] <- id
       id
 
   member this.SignExt(v: int) =
@@ -208,9 +217,18 @@ let forwardWith (accCopies: bool) (keepTriples: bool) (items: (Item * int) array
   let f = Facts()
   let out = ResizeArray<Item * int>()
   let mutable i = 0
+  let targetLabels = HashSet<string>([ "INIT"; "TRIG"; "RENDER" ])
+  for it, _ in items do
+    match it with
+    | Label l when l.StartsWith "SUB_" -> targetLabels.Add l |> ignore
+    | Op(Loop(_, _, { expr = Sym t }))
+    | Op(Branch(_, { expr = Sym t }))
+    | Op(Jump(_, { expr = Sym t }))
+    | Op(BitBranch(_, _, _, { expr = Sym t })) -> targetLabels.Add t |> ignore
+    | _ -> ()
   // the instruction after an `mds:` marker has a word the loader patches (an import's address,
-  // a relocated target): its immediate is not the value written, so it ends what is known
-  let mutable patched = false
+  // a relocated target): its immediate is not the literal value written
+  let mutable patched : string option = None
   let single (it: Item) =
     match it with
     | Op(Par(None, [| m |])) -> Some m
@@ -255,18 +273,76 @@ let forwardWith (accCopies: bool) (keepTriples: bool) (items: (Item * int) array
       i <- i + 3
     else
       match it with
-      | Label _ | Dc _ | Ds _ | Org _ | Equ _ ->
+      | Label l ->
+        let isPatchLabel =
+          not (targetLabels.Contains l)
+          && i + 1 < items.Length
+          && (match fst items[i + 1] with Comment t -> t.StartsWith machinedrum.Abi.markerPrefix | _ -> false)
+        if not isPatchLabel then f.Clear()
+        out.Add(it, line)
+        i <- i + 1
+      | Dc _ | Ds _ | Org _ | Equ _ ->
         f.Clear()
         out.Add(it, line)
         i <- i + 1
       | Comment text ->
-        if text.StartsWith machinedrum.Abi.markerPrefix then patched <- true
+        if text.StartsWith machinedrum.Abi.markerPrefix then patched <- Some text
         out.Add(it, line)
         i <- i + 1
-      | Op _ when patched ->
-        patched <- false
-        f.Clear()
-        out.Add(it, line)
+      | Op _ when patched.IsSome ->
+        let marker = patched.Value
+        patched <- None
+        let hasPatchHeader () =
+          out.Count >= 2
+          && (match fst out[out.Count - 2], fst out[out.Count - 1] with
+              | Label lbl, Comment c -> c = marker && not (targetLabels.Contains lbl)
+              | _ -> false)
+        match it with
+        | Op(Par(None, [| Imm({ expr = Num k; force = Long }, dst) |]))
+            when marker.StartsWith "mds: import " && not (marker.EndsWith "+0") ->
+          let impId = f.Import(marker, k)
+          let alreadyThere =
+            match dst with
+            | A | B -> f.Loaded dst = Some impId
+            | d when isWord d -> f.Get(SReg d) = Some impId
+            | _ -> false
+          if alreadyThere && hasPatchHeader () then
+            out.RemoveRange(out.Count - 2, 2)
+          else
+            let holderOpt =
+              if isWord dst && hasPatchHeader () then
+                match f.Holder(impId, dst) with
+                | Some r when Lower.encodes (Par(None, [| Copy(r, dst) |])) -> Some r
+                | _ -> None
+              else None
+            match holderOpt with
+            | Some r ->
+              out.RemoveRange(out.Count - 2, 2)
+              out.Add(Op(Par(None, [| Copy(r, dst) |])), line)
+            | None ->
+              out.Add(it, line)
+            f.WriteReg dst
+            match dst with
+            | A | B ->
+              f.Set(SReg(if dst = A then A2 else B2), f.SignExt impId)
+              f.Set(SReg(if dst = A then A1 else B1), impId)
+              f.Set(SReg(if dst = A then A0 else B0), f.Const 0L)
+              f.SetLoaded(dst, impId)
+            | d when isWord d -> f.Set(SReg d, impId)
+            | _ -> ()
+        | Op(Par(alu, moves)) when not (moves |> Array.exists (function Store _ -> true | _ -> false)) ->
+          alu |> Option.iter (fun a -> for w in Lower.aluWrites a do f.WriteReg w)
+          for m in moves do
+            for w in Lower.moveWrites m do f.WriteReg w
+          out.Add(it, line)
+        | Op instr ->
+          match aluWrites instr with
+          | Some ws -> for w in ws do f.WriteReg w
+          | None -> f.Clear()
+          out.Add(it, line)
+        | _ ->
+          f.Clear()
+          out.Add(it, line)
         i <- i + 1
       | Op(Par(alu, moves)) ->
         let keep =
@@ -424,8 +500,7 @@ let joinAccumulatorsY (first: int) (temps: int) (yFirst: int) (yTemps: int) (ite
           | _ -> 0
       let transfer state item =
         match item with
-        | Label _ -> state
-        | Comment text when not (text.StartsWith machinedrum.Abi.markerPrefix) -> state
+        | Label _ | Comment _ -> state
         | Op(Branch((Bra | Bcc _), _)) | Op(Jump((Jmp | Jcc _), _))
         | Op(Loop _) | Op Enddo | Op Nop -> state
         | Op(Par(alu, moves)) ->
@@ -731,64 +806,101 @@ let copyForward (items: (Item * int) array) =
     | _ -> None
   for i in 0 .. cur.Length - 1 do
     if not (dropped.Contains i) then
-      match fst cur[i] with
-      | Op(Par(None, [| first |])) ->
-        let target =
-          match first with
-          | Load(_, _, r) | Copy(_, r) | Imm(_, r) when r = X0 || r = Y0 -> Some r
-          | _ -> None
-        match target with
-        | None -> ()
-        | Some r ->
-          let between = ResizeArray<Reg * Reg>()
-          let mutable k = i + 1
-          let mutable searching = true
-          while searching && k < cur.Length do
-            if dropped.Contains k then k <- k + 1
-            else
-              match fst cur[k] with
-              | Comment _ -> k <- k + 1
-              | Op(Par(None, [| second |])) ->
-                let combined =
-                  match first, second with
-                  | Load(sp, ea, r), Copy(r', d) when r = r' && d <> A2 && d <> B2 -> Some(r, Load(sp, ea, d))
-                  | Copy(src, r), Copy(r', d) when r = r' && not ((src = A || src = B) && (d = A || d = B)) && d <> A2 && d <> B2 -> Some(r, Copy(src, d))
-                  | Copy(src, r), Store(r', sp, ea) when r = r' && between.Count = 0 -> Some(r, Store(src, sp, ea))
-                  | Imm(op, r), Copy(r', d) when r = r' && op.force = Long && d <> A2 && d <> B2 -> Some(r, Imm(op, d))
-                  | _ -> None
-                let placeAtK = between.Count > 0 && (match first with Copy _ -> true | _ -> false)
-                let clear (m: Move) =
-                  let mr = Lower.moveReads m
-                  let mw = Lower.moveWrites m
-                  between |> Seq.forall (fun (s', d') ->
-                    not (mr |> Array.exists (overlap d'))
-                    && not (mw |> Array.exists (overlap d'))
-                    && (placeAtK || not (mw |> Array.exists (overlap s'))))
-                let put = if placeAtK then k else i
-                let drop = if placeAtK then i else k
-                match combined with
-                | Some(r, m) when clear m && Lower.encodes (Par(None, [| m |])) && deadAfterAt put drop k (Op(Par(None, [| m |]))) r ->
-                  cur[put] <- (Op(Par(None, [| m |])), snd cur[put])
-                  dropped.Add drop |> ignore
-                  searching <- false
-                | _ ->
-                  match second with
-                  | Copy(s', d') when between.Count = 0 && data s' && data d' && s' <> r && d' <> r ->
-                    between.Add(s', d')
-                    k <- k + 1
-                  | _ -> searching <- false
-              | Op instr ->
-                match first with
-                | Copy(src, _) when data src && src <> r && (between |> Seq.forall (fun (_, d') -> not (overlap src d'))) ->
-                  match renameAlu r src instr with
-                  | Some instr' when deadAfterAt k i k (Op instr') r ->
-                    cur[k] <- (Op instr', snd cur[k])
-                    dropped.Add i |> ignore
+      let accWrite =
+        match fst cur[i] with
+        | Op(Par(None, [| Load(sp, ea, ((A | B) as acc)) |])) ->
+          Some(acc, fun d -> Par(None, [| Load(sp, ea, Acc.reg d) |]))
+        | Op(Par(None, [| Copy(src, ((A | B) as acc)) |])) when src <> A && src <> B && src <> A2 && src <> B2 ->
+          Some(acc, fun d -> Par(None, [| Copy(src, Acc.reg d) |]))
+        | Op(Par(None, [| Imm(op, ((A | B) as acc)) |])) ->
+          Some(acc, fun d -> Par(None, [| Imm(op, Acc.reg d) |]))
+        | Op(Par(Some(Unary(AluUnary.Clr, accD)), [||])) ->
+          Some(Acc.reg accD, fun d -> Par(Some(Unary(AluUnary.Clr, d)), [||]))
+        | _ -> None
+      match accWrite with
+      | Some(acc, rebuild) ->
+        let mutable k = i + 1
+        while k < cur.Length && (dropped.Contains k || (match fst cur[k] with Comment _ -> true | _ -> false)) do
+          k <- k + 1
+        if k < cur.Length then
+          match fst cur[k] with
+          | Op(Par(Some(Binary(AluOp.Tfr, srcAcc, dstAcc)), [||])) when srcAcc = acc && Acc.reg dstAcc <> acc ->
+            let m = rebuild dstAcc
+            if Lower.encodes m && deadAfterAt i k k (Op m) acc then
+              cur[i] <- (Op m, snd cur[i])
+              dropped.Add k |> ignore
+          | Op(Par(None, [| Copy(hi, dst) |]))
+              when (fst cur[i] = Op(Par(None, [| Copy(A1, A) |])) && hi = A1 && acc = A
+                    || fst cur[i] = Op(Par(None, [| Copy(B1, B) |])) && hi = B1 && acc = B)
+                   && dst <> acc && dst <> A0 && dst <> A2 && dst <> B0 && dst <> B2
+                   && deadAfterAt k i k (fst cur[k]) acc ->
+            dropped.Add i |> ignore
+          | Op(Par(None, [| Store(hi, _, _) |]))
+              when (fst cur[i] = Op(Par(None, [| Copy(A1, A) |])) && hi = A1 && acc = A
+                    || fst cur[i] = Op(Par(None, [| Copy(B1, B) |])) && hi = B1 && acc = B)
+                   && deadAfterAt k i k (fst cur[k]) acc ->
+            dropped.Add i |> ignore
+          | _ -> ()
+      | None -> ()
+      if not (dropped.Contains i) then
+        match fst cur[i] with
+        | Op(Par(None, [| first |])) ->
+          let target =
+            match first with
+            | Load(_, _, r) | Copy(_, r) | Imm(_, r) when r = X0 || r = Y0 -> Some r
+            | _ -> None
+          match target with
+          | None -> ()
+          | Some r ->
+            let between = ResizeArray<Reg * Reg>()
+            let mutable k = i + 1
+            let mutable searching = true
+            while searching && k < cur.Length do
+              if dropped.Contains k then k <- k + 1
+              else
+                match fst cur[k] with
+                | Comment _ -> k <- k + 1
+                | Op(Par(None, [| second |])) ->
+                  let combined =
+                    match first, second with
+                    | Load(sp, ea, r), Copy(r', d) when r = r' && d <> A2 && d <> B2 -> Some(r, Load(sp, ea, d))
+                    | Copy(src, r), Copy(r', d) when r = r' && not ((src = A || src = B) && (d = A || d = B)) && d <> A2 && d <> B2 -> Some(r, Copy(src, d))
+                    | Copy(src, r), Store(r', sp, ea) when r = r' && between.Count = 0 -> Some(r, Store(src, sp, ea))
+                    | Imm(op, r), Copy(r', d) when r = r' && op.force = Long && d <> A2 && d <> B2 -> Some(r, Imm(op, d))
+                    | _ -> None
+                  let placeAtK = between.Count > 0 && (match first with Copy _ -> true | _ -> false)
+                  let clear (m: Move) =
+                    let mr = Lower.moveReads m
+                    let mw = Lower.moveWrites m
+                    between |> Seq.forall (fun (s', d') ->
+                      not (mr |> Array.exists (overlap d'))
+                      && not (mw |> Array.exists (overlap d'))
+                      && (placeAtK || not (mw |> Array.exists (overlap s'))))
+                  let put = if placeAtK then k else i
+                  let drop = if placeAtK then i else k
+                  match combined with
+                  | Some(r, m) when clear m && Lower.encodes (Par(None, [| m |])) && deadAfterAt put drop k (Op(Par(None, [| m |]))) r ->
+                    cur[put] <- (Op(Par(None, [| m |])), snd cur[put])
+                    dropped.Add drop |> ignore
                     searching <- false
+                  | _ ->
+                    match second with
+                    | Copy(s', d') when between.Count = 0 && data s' && data d' && s' <> r && d' <> r ->
+                      between.Add(s', d')
+                      k <- k + 1
+                    | _ -> searching <- false
+                | Op instr ->
+                  match first with
+                  | Copy(src, _) when data src && src <> r && (between |> Seq.forall (fun (_, d') -> not (overlap src d'))) ->
+                    match renameAlu r src instr with
+                    | Some instr' when deadAfterAt k i k (Op instr') r ->
+                      cur[k] <- (Op instr', snd cur[k])
+                      dropped.Add i |> ignore
+                      searching <- false
+                    | _ -> searching <- false
                   | _ -> searching <- false
                 | _ -> searching <- false
-              | _ -> searching <- false
-      | _ -> ()
+        | _ -> ()
   cur |> Array.mapi (fun i x -> i, x) |> Array.choose (fun (i, x) -> if dropped.Contains i then None else Some x)
 
 /// (Superseded by the liveness version above; kept for reference.)
@@ -1875,7 +1987,7 @@ let walkWith (yLimit: int) (items: (Item * int) array) =
         ok
       its, labels, isFree
 
-    let partitionGroups (sp: Space) (allAccs: (int * int * Reg * bool) array) (isLoop: bool) (isUnconditional: int -> bool) =
+    let partitionGroups (sp: Space) (allAccs: (int * int * Reg * bool) array) (isLoop: bool) (maxRegs: int) (isUnconditional: int -> bool) =
       let endOff (sub: (int * int * Reg * bool) array) =
         if isLoop then let _, k0, _, _ = sub[0] in k0
         else let _, lastK, _, _ = sub[sub.Length - 1] in lastK
@@ -1888,18 +2000,18 @@ let walkWith (yLimit: int) (items: (Item * int) array) =
         else
           let _, k0, _, _ = sub[0]
           let allSameReadOnly = sub |> Array.forall (fun (_, k, _, isStore) -> k = k0 && not isStore)
-          if allSameReadOnly then 0
+          if isLoop && allSameReadOnly then 0
           else
             match canWalkSeq sub (endOff sub) with
             | Some(k0, needN, _) ->
               let setupCycles = (if k0 = 0 then 1 else 3) + (if needN.IsSome then 1 else 0)
+              let packCount =
+                sub
+                |> Array.filter (fun (idx, _, reg, isStore) -> canPackWith idx sp reg isStore)
+                |> Array.length
               if isLoop then
-                max 0 (32 * sub.Length - setupCycles)
+                max 0 (32 * (sub.Length + packCount) - setupCycles)
               else
-                let packCount =
-                  sub
-                  |> Array.filter (fun (idx, _, reg, isStore) -> canPackWith idx sp reg isStore)
-                  |> Array.length
                 max 0 (sub.Length + packCount - setupCycles)
             | None -> 0
       let groups =
@@ -1915,16 +2027,27 @@ let walkWith (yLimit: int) (items: (Item * int) array) =
           let parts = ResizeArray<Set<int>>()
           for iv in rawIntervals do
             let arr = Set.toArray iv
-            let mutable p = 0
-            while p < arr.Length do
-              let mutable bestEnd = -1
-              for q in p .. arr.Length - 1 do
+            let m = arr.Length
+            let dp = Array.zeroCreate<int> (m + 1)
+            let choice = Array.create m -1
+            for p = m - 1 downto 0 do
+              let mutable bestScore = dp[p + 1]
+              let mutable bestQ = -1
+              for q in p .. m - 1 do
                 let slice = Set.ofArray arr[p .. q]
                 let sub = allAccs |> Array.filter (fun (_, k, _, _) -> slice.Contains k)
-                if valid sub then bestEnd <- q
-              if bestEnd >= p then
-                parts.Add (Set.ofArray arr[p .. bestEnd])
-                p <- bestEnd + 1
+                if valid sub then
+                  let sc = groupSaving sub + dp[q + 1]
+                  if sc > bestScore then
+                    bestScore <- sc
+                    bestQ <- q
+              dp[p] <- bestScore
+              choice[p] <- bestQ
+            let mutable p = 0
+            while p < m do
+              if choice[p] >= p then
+                parts.Add (Set.ofArray arr[p .. choice[p]])
+                p <- choice[p] + 1
               else
                 parts.Add (Set.singleton arr[p])
                 p <- p + 1
@@ -1951,23 +2074,42 @@ let walkWith (yLimit: int) (items: (Item * int) array) =
               if valid curSub then
                 usedPart[a] <- true
                 byOffsets.Add curSub
-          let byOrder = ResizeArray<(int * int * Reg * bool) array>()
+          let ordParts = ResizeArray<(int * int * Reg * bool) array>()
           let mutable p = 0
           while p < allAccs.Length do
             let mutable bestEnd = -1
             for q in p + 1 .. allAccs.Length - 1 do
               if valid allAccs[p .. q] then bestEnd <- q
             if bestEnd > p then
-              byOrder.Add allAccs[p .. bestEnd]
+              ordParts.Add allAccs[p .. bestEnd]
               p <- bestEnd + 1
             else
               p <- p + 1
+          let usedOrd = Array.create ordParts.Count false
+          let byOrder = ResizeArray<(int * int * Reg * bool) array>()
+          for a in 0 .. ordParts.Count - 1 do
+            if not usedOrd[a] then
+              usedOrd[a] <- true
+              let mutable curSub = ordParts[a]
+              let mutable curSave = groupSaving curSub
+              for b in a + 1 .. ordParts.Count - 1 do
+                if not usedOrd[b] then
+                  let candSub = Array.append curSub ordParts[b]
+                  if valid candSub then
+                    let bSave = groupSaving ordParts[b]
+                    let candSave = groupSaving candSub
+                    if candSave >= curSave + bSave then
+                      curSub <- candSub
+                      curSave <- candSave
+                      usedOrd[b] <- true
+              byOrder.Add curSub
           let offArr = byOffsets.ToArray()
           let ordArr = byOrder.ToArray()
-          let offScore = offArr |> Array.sumBy groupSaving
-          let ordScore = ordArr |> Array.sumBy groupSaving
+          let topCap = max 1 maxRegs
+          let offScore = offArr |> Array.map groupSaving |> Array.sortDescending |> Array.truncate topCap |> Array.sum
+          let ordScore = ordArr |> Array.map groupSaving |> Array.sortDescending |> Array.truncate topCap |> Array.sum
           if ordScore > offScore then ordArr else offArr
-      groups |> Array.sortByDescending groupSaving
+      groups |> Array.map (fun sub -> sub, groupSaving sub) |> Array.sortByDescending snd
 
     // Phase 1: inner-most DO loops in RENDER.
     let its1, labels1, isFree1 = computeRegInfo ()
@@ -2007,46 +2149,49 @@ let walkWith (yLimit: int) (items: (Item * int) array) =
             if p0 > 0 && its1[p0 - 1] = machinedrum.Abi.relocateMarker then p0 <- p0 - 1
             if p0 > 0 && (match its1[p0 - 1] with Label l -> l.EndsWith "_DO" | _ -> false) then p0 <- p0 - 1
             for k in p0 .. endIdx do inWalkedLoop[k] <- true
+            let isUnconditional idx =
+              branchSpans |> Seq.forall (fun (bIdx, tIdx) -> not (idx > bIdx && idx < tIdx))
+            let maxLoopRegs =
+              [ 1 .. 5 ]
+              |> List.filter (fun r -> isFree1 r false p0 endIdx)
+              |> List.length
+            let allGroups =
+              [| for sp in [ Space.Y; Space.X ] do
+                   let allAccs =
+                     [| for idx in loopIdx + 1 .. endIdx - 1 do
+                          match dispOf (fst cur[idx]) with
+                          | Some(sp', k, reg, isStore) when sp' = sp -> yield (idx, k, reg, isStore)
+                          | _ -> () |]
+                   if allAccs.Length >= 2 && maxLoopRegs > 0 then
+                     for sub, saving in partitionGroups sp allAccs true maxLoopRegs isUnconditional do
+                       if saving > 0 then yield (sp, sub, saving) |]
+              |> Array.sortByDescending (fun (_, _, saving) -> saving)
             let usedRegs = HashSet<int>()
-            for sp in [ Space.Y; Space.X ] do
-              let allAccs =
-                [| for idx in loopIdx + 1 .. endIdx - 1 do
-                     match dispOf (fst cur[idx]) with
-                     | Some(sp', k, reg, isStore) when sp' = sp -> yield (idx, k, reg, isStore)
-                     | _ -> () |]
-              if allAccs.Length >= 2 then
-                let isUnconditional idx =
-                  branchSpans |> Seq.forall (fun (bIdx, tIdx) -> not (idx > bIdx && idx < tIdx))
-                let groups = partitionGroups sp allAccs true isUnconditional
-                let prefRegs = if sp = Space.Y then [ 4; 5; 3; 2; 1 ] else [ 1; 2; 3; 4; 5 ]
-                for sub in groups do
-                  let _, k0, _, _ = sub[0]
-                  // A single invariant offset with no stores is hoist's responsibility, not walk's.
-                  let allSameReadOnly =
-                    sub |> Array.forall (fun (_, k, _, isStore) -> k = k0 && not isStore)
-                  if not allSameReadOnly then
-                    match canWalkSeq sub k0 with
-                    | Some(k0, needN, deltas) ->
-                      let regOpt =
-                        prefRegs
-                        |> List.tryFind (fun r ->
-                          not (usedRegs.Contains r) && isFree1 r needN.IsSome p0 endIdx)
-                      match regOpt with
-                      | Some r ->
-                        usedRegs.Add r |> ignore
-                        let _, ln = cur[loopIdx]
-                        let setupR =
-                          if k0 = 0 then Op(Par(None, [| Copy(R 6, R r) |])), ln
-                          else Op(Lua(Disp(6, Operand.num k0), R r)), ln
-                        insertions.Add(p0, setupR)
-                        match needN with
-                        | Some d -> insertions.Add(p0, (Op(Par(None, [| Imm(Operand.num d, N r) |])), ln))
-                        | None -> ()
-                        for a in 0 .. sub.Length - 1 do
-                          let idx, _, _, _ = sub[a]
-                          rewriteAt idx (stepEa r deltas[a])
-                      | None -> ()
-                    | None -> ()
+            for sp, sub, _ in allGroups do
+              let _, k0, _, _ = sub[0]
+              let prefRegs = if sp = Space.Y then [ 4; 5; 3; 2; 1 ] else [ 1; 2; 3; 4; 5 ]
+              match canWalkSeq sub k0 with
+              | Some(k0, needN, deltas) ->
+                let regOpt =
+                  prefRegs
+                  |> List.tryFind (fun r ->
+                    not (usedRegs.Contains r) && isFree1 r needN.IsSome p0 endIdx)
+                match regOpt with
+                | Some r ->
+                  usedRegs.Add r |> ignore
+                  let _, ln = cur[loopIdx]
+                  let setupR =
+                    if k0 = 0 then Op(Par(None, [| Copy(R 6, R r) |])), ln
+                    else Op(Lua(Disp(6, Operand.num k0), R r)), ln
+                  insertions.Add(p0, setupR)
+                  match needN with
+                  | Some d -> insertions.Add(p0, (Op(Par(None, [| Imm(Operand.num d, N r) |])), ln))
+                  | None -> ()
+                  for a in 0 .. sub.Length - 1 do
+                    let idx, _, _, _ = sub[a]
+                    rewriteAt idx (stepEa r deltas[a])
+                | None -> ()
+              | None -> ()
         | _ -> ()
       | _ -> ()
 
@@ -2074,70 +2219,182 @@ let walkWith (yLimit: int) (items: (Item * int) array) =
         let mutable bEnd = bStart
         while bEnd + 1 < n && renderIn[bEnd + 1] && not inWalkedLoop[bEnd + 1] && not (isBlockBoundary (bEnd + 1)) do
           bEnd <- bEnd + 1
+        let allGroups =
+          [| for sp in [ Space.Y; Space.X ] do
+               let allAccs =
+                 [| for idx in bStart .. bEnd do
+                      match dispOf (fst cur[idx]) with
+                      | Some(sp', k, reg, isStore) when sp' = sp -> yield (idx, k, reg, isStore)
+                      | _ -> () |]
+               if allAccs.Length >= 2 then
+                 for sub, saving in partitionGroups sp allAccs false 5 (fun _ -> true) do
+                   if saving > 0 then yield (sp, sub, saving) |]
+          |> Array.sortByDescending (fun (_, _, saving) -> saving)
         let usedRegs = HashSet<int>()
-        for sp in [ Space.Y; Space.X ] do
-          let allAccs =
-            [| for idx in bStart .. bEnd do
-                 match dispOf (fst cur[idx]) with
-                 | Some(sp', k, reg, isStore) when sp' = sp -> yield (idx, k, reg, isStore)
-                 | _ -> () |]
-          if allAccs.Length >= 2 then
-            let groups = partitionGroups sp allAccs false (fun _ -> true)
+        for sp, sub, _ in allGroups do
+          if sub.Length >= 2 then
+            let firstIdx, _, _, _ = sub[0]
+            let lastIdx, lastK, _, _ = sub[sub.Length - 1]
             let prefRegs = if sp = Space.Y then [ 4; 5; 3; 2; 1 ] else [ 1; 2; 3; 4; 5 ]
-            for sub in groups do
-              if sub.Length >= 2 then
-                let firstIdx, k0, _, _ = sub[0]
-                let lastIdx, lastK, _, _ = sub[sub.Length - 1]
-                let allSameReadOnly =
-                  sub |> Array.forall (fun (_, k, _, isStore) -> k = k0 && not isStore)
-                if not allSameReadOnly then
-                  match canWalkSeq sub lastK with
-                  | Some(k0, needN, deltas) ->
-                    let setupCycles = (if k0 = 0 then 1 else 3) + (if needN.IsSome then 1 else 0)
-                    let packCount =
-                      sub
-                      |> Array.filter (fun (idx, _, reg, isStore) -> canPackWith idx sp reg isStore)
-                      |> Array.length
-                    if sub.Length + packCount > setupCycles then
-                      let regOpt =
-                        prefRegs
-                        |> List.tryFind (fun r ->
-                          not (usedRegs.Contains r) && isFree2 r needN.IsSome firstIdx lastIdx)
-                      match regOpt with
-                      | Some r ->
-                        usedRegs.Add r |> ignore
-                        let _, ln = cur[firstIdx]
-                        let setupR =
-                          if k0 = 0 then Op(Par(None, [| Copy(R 6, R r) |])), ln
-                          else Op(Lua(Disp(6, Operand.num k0), R r)), ln
-                        insertions.Add(firstIdx, setupR)
-                        match needN with
-                        | Some d -> insertions.Add(firstIdx, (Op(Par(None, [| Imm(Operand.num d, N r) |])), ln))
-                        | None -> ()
-                        for a in 0 .. sub.Length - 1 do
-                          let idx, _, _, _ = sub[a]
-                          rewriteAt idx (stepEa r deltas[a])
-                      | None -> ()
+            match canWalkSeq sub lastK with
+            | Some(k0, needN, deltas) ->
+              let setupCycles = (if k0 = 0 then 1 else 3) + (if needN.IsSome then 1 else 0)
+              let packCount =
+                sub
+                |> Array.filter (fun (idx, _, reg, isStore) -> canPackWith idx sp reg isStore)
+                |> Array.length
+              if sub.Length + packCount > setupCycles then
+                let regOpt =
+                  prefRegs
+                  |> List.tryFind (fun r ->
+                    not (usedRegs.Contains r) && isFree2 r needN.IsSome firstIdx lastIdx)
+                match regOpt with
+                | Some r ->
+                  usedRegs.Add r |> ignore
+                  let _, ln = cur[firstIdx]
+                  let setupR =
+                    if k0 = 0 then Op(Par(None, [| Copy(R 6, R r) |])), ln
+                    else Op(Lua(Disp(6, Operand.num k0), R r)), ln
+                  insertions.Add(firstIdx, setupR)
+                  match needN with
+                  | Some d -> insertions.Add(firstIdx, (Op(Par(None, [| Imm(Operand.num d, N r) |])), ln))
                   | None -> ()
+                  for a in 0 .. sub.Length - 1 do
+                    let idx, _, _, _ = sub[a]
+                    rewriteAt idx (stepEa r deltas[a])
+                | None -> ()
+            | None -> ()
         bStart <- bEnd + 1
 
-    if insertions.Count = 0 then cur
-    else
-      let byIdx = Dictionary<int, ResizeArray<Item * int>>()
-      for idx, item in insertions do
-        match byIdx.TryGetValue idx with
-        | true, list -> list.Add item
-        | false, _ ->
-          let list = ResizeArray<Item * int>()
-          list.Add item
-          byIdx[idx] <- list
-      let out = ResizeArray<Item * int>(n + insertions.Count)
-      for i in 0 .. n - 1 do
-        match byIdx.TryGetValue i with
-        | true, list -> out.AddRange list
-        | false, _ -> ()
-        out.Add cur[i]
-      out.ToArray()
+    let walked =
+      if insertions.Count = 0 then cur
+      else
+        let byIdx = Dictionary<int, ResizeArray<Item * int>>()
+        for idx, item in insertions do
+          match byIdx.TryGetValue idx with
+          | true, list -> list.Add item
+          | false, _ ->
+            let list = ResizeArray<Item * int>()
+            list.Add item
+            byIdx[idx] <- list
+        let out = ResizeArray<Item * int>(n + insertions.Count)
+        for i in 0 .. n - 1 do
+          match byIdx.TryGetValue i with
+          | true, list -> out.AddRange list
+          | false, _ -> ()
+          out.Add cur[i]
+        out.ToArray()
+
+    // Fold trailing `move (rN)+` / `move (rN)-` at the end of a DO loop into the last `Ind rN`
+    // access in the loop body when nothing between them touches rN.
+    let foldCur = Array.copy walked
+    let dropped = HashSet<int>()
+    let fn = foldCur.Length
+    let flabels = Dictionary<string, int>()
+    for i in 0 .. fn - 1 do
+      match fst foldCur[i] with
+      | Label l -> flabels[l] <- i
+      | _ -> ()
+    let touchesReg (r: int) (instr: Instr) =
+      match readsOf instr, writesOf instr with
+      | Some rs, Some ws ->
+        let check (x: Reg) = x = R r || x = N r || x = M r
+        Array.exists check rs || Array.exists check ws
+      | _ -> true
+    for loopIdx in 0 .. fn - 1 do
+      match fst foldCur[loopIdx] with
+      | Op(Loop(_, _, { expr = Sym endLabel })) ->
+        match flabels.TryGetValue endLabel with
+        | true, endIdx when endIdx > loopIdx ->
+          let mutable innerOk = true
+          let branchSpans = ResizeArray<int * int>()
+          for k in loopIdx + 1 .. endIdx - 1 do
+            match fst foldCur[k] with
+            | Op(Loop _ | Forever _ | Enddo | Rts | Rti | Jump _) -> innerOk <- false
+            | Op(Branch(Bsr, _)) -> innerOk <- false
+            | Op(Branch(_, { expr = Sym t }))
+            | Op(BitBranch(_, _, _, { expr = Sym t })) ->
+              match flabels.TryGetValue t with
+              | true, tIdx when tIdx > k && tIdx <= endIdx -> branchSpans.Add(k, tIdx)
+              | _ -> innerOk <- false
+            | Op(Branch _ | BitBranch _) -> innerOk <- false
+            | _ -> ()
+          if innerOk then
+            let isUncond idx =
+              branchSpans |> Seq.forall (fun (bIdx, tIdx) -> not (idx > bIdx && idx < tIdx))
+            for uIdx in endIdx - 1 .. -1 .. loopIdx + 1 do
+              if not (dropped.Contains uIdx) && isUncond uIdx then
+                match fst foldCur[uIdx] with
+                | Op(Par(None, [| Update((PostInc r | PostDec r) as stepEa) |])) when r >= 1 && r <= 5 ->
+                  let afterClean =
+                    [ uIdx + 1 .. endIdx - 1 ]
+                    |> List.forall (fun k ->
+                      dropped.Contains k
+                      || (match fst foldCur[k] with
+                          | Comment _ | Label _ -> true
+                          | Op ins -> not (touchesReg r ins)
+                          | _ -> false))
+                  if afterClean then
+                    let prevOpt =
+                      [ uIdx - 1 .. -1 .. loopIdx + 1 ]
+                      |> List.tryFind (fun k ->
+                        not (dropped.Contains k)
+                        && (match fst foldCur[k] with
+                            | Op ins -> touchesReg r ins
+                            | _ -> false))
+                    match prevOpt with
+                    | Some pIdx when isUncond pIdx ->
+                      match fst foldCur[pIdx] with
+                      | Op(Par(alu, moves)) ->
+                        let aluTouches =
+                          match alu with
+                          | Some a ->
+                            let check (x: Reg) = x = R r || x = N r || x = M r
+                            Array.exists check (Lower.aluReads a) || Array.exists check (Lower.aluWrites a)
+                          | None -> false
+                        let moveTouches =
+                          moves
+                          |> Array.mapi (fun mi m ->
+                            let check (x: Reg) = x = R r || x = N r || x = M r
+                            mi, Array.exists check (Lower.moveReads m) || Array.exists check (Lower.moveWrites m))
+                          |> Array.filter snd
+                        if not aluTouches && moveTouches.Length = 1 then
+                          let mi, _ = moveTouches[0]
+                          let rewrittenMove =
+                            match moves[mi] with
+                            | Load(sp, Ind r', dst) when r' = r && (sp = Space.X || sp = Space.Y) ->
+                              Some(Load(sp, stepEa, dst))
+                            | Store(src, sp, Ind r') when r' = r && (sp = Space.X || sp = Space.Y) ->
+                              Some(Store(src, sp, stepEa))
+                            | _ -> None
+                          match rewrittenMove with
+                          | Some m' ->
+                            let moves' = Array.copy moves
+                            moves'[mi] <- m'
+                            let lastAfterDrop =
+                              [ endIdx - 1 .. -1 .. loopIdx + 1 ]
+                              |> List.tryFind (fun k ->
+                                k <> uIdx && not (dropped.Contains k)
+                                && (match fst foldCur[k] with Comment _ -> false | _ -> true))
+                            let endValid =
+                              match lastAfterDrop with
+                              | Some k ->
+                                match (if k = pIdx then Op(Par(alu, moves')) else fst foldCur[k]) with
+                                | Op(Branch _ | BitBranch _ | Jump _) | Label _ -> false
+                                | Op _ -> true
+                                | _ -> false
+                              | None -> false
+                            if endValid && Lower.encodes (Par(alu, moves')) then
+                              foldCur[pIdx] <- (Op(Par(alu, moves')), snd foldCur[pIdx])
+                              dropped.Add uIdx |> ignore
+                          | None -> ()
+                      | _ -> ()
+                    | _ -> ()
+                | _ -> ()
+        | _ -> ()
+      | _ -> ()
+    if dropped.Count = 0 then walked
+    else foldCur |> Array.mapi (fun i x -> i, x) |> Array.choose (fun (i, x) -> if dropped.Contains i then None else Some x)
 
 let walk (items: (Item * int) array) = walkWith 64 items
 
@@ -2289,6 +2546,12 @@ let runWithY (p: Passes) (first: int) (temps: int) (yFirst: int) (yTemps: int) (
   step p.promote (promoteY first temps yf yt)
   step p.assign (assignY first temps yf yt)
   for _ in 1 .. 2 do
+    step p.forward (forwardWith p.accCopies false)
+    step p.copyForward copyForward
+    step p.deadTemps (deadTempsFromY first temps yf yt)
+  step p.joins (joinAccumulatorsY first temps yf yt)
+  if p.joins then
+    step p.deadTemps (deadTempsFromY first temps yf yt)
     step p.forward (forwardWith p.accCopies false)
     step p.copyForward copyForward
     step p.deadTemps (deadTempsFromY first temps yf yt)
