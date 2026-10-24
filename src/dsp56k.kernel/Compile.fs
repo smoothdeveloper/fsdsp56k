@@ -726,19 +726,127 @@ let rec loopOffset (ctx: Ctx) (isIndex: Var -> bool) (e: Expr) =
   | _ -> None
 
 /// A region index `v` or `Acc.hi (Acc.ofFrac v + d)` / `- d`, d a constant word: (v, d signed).
-let stepIndex (ctx: Ctx) (e: Expr) =
+let rec stepIndex (ctx: Ctx) (e: Expr) =
   let word (x: Expr) =
     match tryConst ctx x with
     | Some(:? Frac as f) -> Some((f.Word <<< 8) >>> 8)
     | _ -> None
   match e with
   | Var v -> Some(v, 0)
+  | Let(u, x, b) when not u.IsMutable && (touches false x).writes.IsEmpty ->
+    stepIndex ctx (b.Substitute(fun w -> if w = u then Some x else None))
   | Intr "acc.hi" [ Intr "acc.addFrac" [ Intr "acc.ofFrac" [ Var v ]; d ] ] when (word d).IsSome -> Some(v, (word d).Value)
   | Intr "acc.hi" [ Intr "acc.add" [ Intr "acc.ofFrac" [ Var v ]; d ] ] when (word d).IsSome -> Some(v, (word d).Value)
   | Intr "acc.hi" [ Intr "acc.add" [ d; Intr "acc.ofFrac" [ Var v ] ] ] when (word d).IsSome -> Some(v, (word d).Value)
   | Intr "acc.hi" [ Intr "acc.subFrac" [ Intr "acc.ofFrac" [ Var v ]; d ] ] when (word d).IsSome -> Some(v, -(word d).Value)
   | Intr "acc.hi" [ Intr "acc.sub" [ Intr "acc.ofFrac" [ Var v ]; d ] ] when (word d).IsSome -> Some(v, -(word d).Value)
+  | Call(None, mi, args) when intrinsic (resolve mi args) = None && not (isSub ctx mi) && (reflected mi).IsSome ->
+    stepIndex ctx (inlined mi args)
   | _ -> None
+
+let fracOfRawMember : Member =
+  { Name = "ofRaw"; Owner = "dsp56k.kernel.Frac"; Declaring = TyFrac; ReturnType = TyFrac
+    ParameterCount = 1; Intrinsic = None; IsConst = true; IsGeneric = false; CanWrite = false; Marks = Set.empty
+    Key = "dsp56k.kernel.Frac.ofRaw"; Definition = lazy None
+    Invoke = (fun args -> box (Frac.ofRaw (unbox<int> args[0])))
+    Get = (fun _ -> failwith "ofRaw is a method") }
+
+let rec hasRegionAccess (ctx: Ctx) (seen: HashSet<Member>) (e: Expr) =
+  match e with
+  | Intr "region.read" _ | Intr "region.write" _ -> true
+  | Call(None, mi, args) ->
+    List.exists (hasRegionAccess ctx seen) args
+    || (intrinsic (resolve mi args) = None && not (isSub ctx mi)
+        && match reflected mi with Some def when seen.Add mi -> hasRegionAccess ctx seen def | _ -> false)
+  | ExprShape.ShapeVar _ -> false
+  | ExprShape.ShapeLambda(_, b) -> hasRegionAccess ctx seen b
+  | ExprShape.ShapeCombination(_, xs) -> List.exists (hasRegionAccess ctx seen) xs
+
+/// A mutable Frac local `v` initialized to a constant `lo`, tested by `while v <= hi` (or `< hi`)
+/// and stepped at the end of `body` by `v <- v + 1` with no other assignment to `v` in a region-
+/// accessing body: rewritten as `for i in lo .. hi do ...` with `v` replaced by `Frac.ofRaw i`.
+let tryCountedWhile (ctx: Ctx) (v: Var) (loExpr: Expr) (cond: Expr) (body: Expr) (range: Range option) : Expr option =
+  if not v.IsMutable || v.Type <> TyFrac then None
+  else
+    let sext (w: int) = (w <<< 8) >>> 8
+    let rec splitLastStmt (e: Expr) : (Expr * Expr) option =
+      match e with
+      | VarSet(w, step) when w = v -> Some(Expr.Value(()), step)
+      | Sequential(a, VarSet(w, step)) when w = v -> Some(a, step)
+      | Sequential(a, b) ->
+        splitLastStmt b |> Option.map (fun (b', step) -> Expr.Sequential(a, b').WithRange(e.Range), step)
+      | Let(u, x, VarSet(w, step)) when w = v && not u.IsMutable ->
+        Some(Expr.Value(()), Expr.Let(u, x, step))
+      | Let(u, x, b) ->
+        splitLastStmt b
+        |> Option.bind (fun (b', step) ->
+          if not (step.GetFreeVars() |> Seq.contains u) then
+            Some(Expr.Let(u, x, b').WithRange(e.Range), step)
+          elif not u.IsMutable && not (b'.GetFreeVars() |> Seq.contains u) && (touches false x).writes.IsEmpty then
+            Some(b', Expr.Let(u, x, step))
+          else None)
+      | _ -> None
+    let rec hasVarSet (e: Expr) =
+      match e with
+      | VarSet(w, x) -> w = v || hasVarSet x
+      | ExprShape.ShapeVar _ -> false
+      | ExprShape.ShapeLambda(_, b) -> hasVarSet b
+      | ExprShape.ShapeCombination(_, xs) -> List.exists hasVarSet xs
+    match tryConst ctx loExpr, cond with
+    | Some(:? Frac as loF), Call(None, mi, [ Var v'; hiExpr ])
+        when v' = v && (mi.Name = "op_LessThanOrEqual" || mi.Name = "op_LessThan") && owner mi = operators ->
+      match tryConst ctx hiExpr, splitLastStmt body with
+      | Some(:? Frac as hiF), Some(bodyWithoutStep, step) ->
+        let lo = sext loF.Word
+        let hi = sext hiF.Word - (if mi.Name = "op_LessThan" then 1 else 0)
+        let count = hi - lo + 1
+        match stepIndex ctx step with
+        | Some(v'', 1)
+            when v'' = v && lo >= 0 && hi < 0x7fffff && count >= 1 && count <= 65535
+                 && not (hasVarSet bodyWithoutStep) && hasRegionAccess ctx (HashSet()) bodyWithoutStep ->
+          let iVar = Var(v.Name, TyInt)
+          let ofRaw = Expr.Call(fracOfRawMember, [ Expr.Var iVar ])
+          let forBody = bodyWithoutStep.Substitute(fun w -> if w = v then Some ofRaw else None)
+          Some(Expr.ForIntegerRangeLoop(iVar, Expr.Value lo, Expr.Value hi, forBody).WithRange(range))
+        | _ -> None
+      | _ -> None
+    | _ -> None
+
+let rec canonicalLoops (ctx: Ctx) (e: Expr) : Expr =
+  match e with
+  | Let(v, loExpr, WhileLoop(cond, body)) ->
+    let loExpr' = canonicalLoops ctx loExpr
+    let body' = canonicalLoops ctx body
+    match tryCountedWhile ctx v loExpr' cond body' e.Range with
+    | Some loop -> loop
+    | None -> Expr.Let(v, loExpr', Expr.WhileLoop(cond, body').WithRange(body.Range)).WithRange(e.Range)
+  | Let(v, loExpr, Sequential(WhileLoop(cond, body), rest))
+      when not (rest.GetFreeVars() |> Seq.contains v) ->
+    let loExpr' = canonicalLoops ctx loExpr
+    let body' = canonicalLoops ctx body
+    let rest' = canonicalLoops ctx rest
+    match tryCountedWhile ctx v loExpr' cond body' e.Range with
+    | Some loop -> Expr.Sequential(loop, rest').WithRange(e.Range)
+    | None -> Expr.Let(v, loExpr', Expr.Sequential(Expr.WhileLoop(cond, body').WithRange(body.Range), rest')).WithRange(e.Range)
+  | Let(v, value, body) when not v.IsMutable ->
+    let value' = canonicalLoops ctx value
+    let saved = ctx.consts
+    match constObject ctx value' with
+    | Some c -> ctx.consts <- ctx.consts.Add(v, c)
+    | None -> ()
+    let body' = canonicalLoops ctx body
+    ctx.consts <- saved
+    if obj.ReferenceEquals(value, value') && obj.ReferenceEquals(body, body') then e
+    else Expr.Let(v, value', body').WithRange(e.Range)
+  | ExprShape.ShapeVar _ -> e
+  | ExprShape.ShapeLambda(u, b) ->
+    let b' = canonicalLoops ctx b
+    if obj.ReferenceEquals(b, b') then e else Expr.Lambda(u, b').WithRange(e.Range)
+  | ExprShape.ShapeCombination(shape, xs) ->
+    let xs' = List.map (canonicalLoops ctx) xs
+    if List.forall2 (fun (a: Expr) b -> obj.ReferenceEquals(a, b)) xs xs' then e
+    else ExprShape.RebuildShapeCombination(shape, xs').WithRange(e.Range)
+
 
 /// `Frac.index w`, `Frac.index w + c` or `Frac.index w - c`, not known when compiling: (w, c).
 let computedIndex (ctx: Ctx) (e: Expr) =
@@ -2506,7 +2614,7 @@ and inMemory (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> u
     let register =
       if tyOf v.Type <> TFrac || score v < 2 then None
       else
-        let rivals = rivalsOf v bodyExpr |> List.filter (fun w -> score w > score v) |> List.length
+        let rivals = rivalsOf ctx v bodyExpr |> List.filter (fun w -> score w > score v) |> List.length
         match ctx.freeData with
         | r :: rest when ctx.freeData.Length > rivals ->
           ctx.freeData <- rest
@@ -2514,7 +2622,7 @@ and inMemory (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> u
         | _ -> None
     if tyOf v.Type = TFrac && not (isNull (System.Environment.GetEnvironmentVariable "FSDSP_KERNEL_DEBUG")) then
       let holders = [ for KeyValue(w, h) in ctx.vars do if h.reg.IsSome && not (ctx.deadLocals.Contains w) then $"{w.Name}:{h.reg.Value}" ]
-      eprintfn $"let {v.Name} score {score v} rivals {rivalsOf v bodyExpr |> List.filter (fun w -> score w > score v) |> List.map (fun w -> w.Name)} free {ctx.freeData} held {holders} -> {register}"
+      eprintfn $"let {v.Name} score {score v} rivals {rivalsOf ctx v bodyExpr |> List.filter (fun w -> score w > score v) |> List.map (fun w -> w.Name)} free {ctx.freeData} held {holders} -> {register}"
     let h =
       match register with
       | Some r -> { space = Space.X; offset = -1; ty = TFrac; reg = Some r; bound = infinity }
@@ -2532,14 +2640,35 @@ and inMemory (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> u
     | Some r when not (ctx.deadLocals.Remove v) -> ctx.freeData <- r :: ctx.freeData
     | _ -> ()
 
-/// The Frac locals bound inside an expression while `v` is still read: those whose scope uses it.
-and rivalsOf (v: Var) (e: Expr) =
-  match e with
-  | Let(w, value, body) when w.Type = TyFrac ->
-    (if body.GetFreeVars() |> Seq.contains v then [ w ] else []) @ rivalsOf v value @ rivalsOf v body
-  | ExprShape.ShapeVar _ -> []
-  | ExprShape.ShapeLambda(_, b) -> rivalsOf v b
-  | ExprShape.ShapeCombination(_, xs) -> List.collect (rivalsOf v) xs
+/// The Frac locals bound inside an expression while `v` is still read: those whose scope uses it,
+/// or that are unconditionally bound inside a loop while `v` is live in or after the loop.
+and rivalsOf (ctx: Ctx) (v: Var) (e: Expr) =
+  let uses (x: Expr) = x.GetFreeVars() |> Seq.contains v
+  let rec go (inLoop: bool) (liveAfter: bool) (e: Expr) =
+    match e with
+    | Let(w, value, body) ->
+      let liveForValue = liveAfter || uses body
+      let here = if w.Type = TyFrac && (uses body || (liveAfter && inLoop)) then [ w ] else []
+      here @ go inLoop liveForValue value @ go inLoop liveAfter body
+    | Sequential(s1, s2) ->
+      go inLoop (liveAfter || uses s2) s1 @ go inLoop liveAfter s2
+    | ForIntegerRangeLoop(_, lo, hi, body) ->
+      let liveInLoop = liveAfter || uses body
+      go inLoop (liveInLoop || uses hi) lo @ go inLoop liveInLoop hi @ go true liveInLoop body
+    | WhileLoop(cond, body) ->
+      let liveInLoop = liveAfter || uses cond || uses body
+      go true liveInLoop cond @ go true liveInLoop body
+    | IfThenElse(cond, t, f) ->
+      go inLoop (liveAfter || uses t || uses f) cond @ go false liveAfter t @ go false liveAfter f
+    | ExprShape.ShapeVar _ -> []
+    | ExprShape.ShapeLambda(_, b) -> go false liveAfter b
+    | ExprShape.ShapeCombination(_, xs) ->
+      xs
+      |> List.mapi (fun i x ->
+        let laterUses = xs |> List.skip (i + 1) |> List.exists uses
+        go inLoop (liveAfter || laterUses) x)
+      |> List.concat
+  go false (ctx.conts |> List.exists uses) e |> List.distinct
 
 /// The Frac locals bound inside an expression.
 and innerLocals (e: Expr) =
@@ -2559,6 +2688,18 @@ and genStmt (ctx: Ctx) (e: Expr) : unit =
   | _ -> thenRun ctx e (fun () -> genStmtIn ctx e)
 
 and genStmtIn (ctx: Ctx) (e: Expr) : unit =
+  let e =
+    match e with
+    | Let(v, loExpr, WhileLoop(cond, body)) ->
+      match tryCountedWhile ctx v loExpr cond body e.Range with
+      | Some loop -> loop
+      | None -> e
+    | Let(v, loExpr, Sequential(WhileLoop(cond, body), rest))
+        when not (rest.GetFreeVars() |> Seq.contains v) ->
+      match tryCountedWhile ctx v loExpr cond body e.Range with
+      | Some loop -> Expr.Sequential(loop, rest).WithRange(e.Range)
+      | None -> e
+    | _ -> e
   let e =
     if ctx.depth = 0 && (match e with Let _ | Sequential _ -> true | _ -> false) && not (ctx.fusedSpines.Contains e) then
       if spineLoops 0 e < 2 then
@@ -2689,6 +2830,8 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
           match ctx.scores.TryGetValue u with
           | true, sc -> ctx.scores[u'] <- sc
           | _ -> ()
+          if ctx.unrolled.Contains u then ctx.unrolled.Add u' |> ignore
+          if ctx.kept.Contains u then ctx.kept.Add u' |> ignore
           u', env.Add(u, u')
         match e.Node with
         | NVar u ->
@@ -2723,7 +2866,7 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
       depChanged <- false
       body |> visit (fun e ->
         match e with
-        | Let(w, x, _) when not w.IsMutable && not (depVars.Contains w) ->
+        | Let(w, x, _) when not w.IsMutable && not (depVars.Contains w) && not (hasRegionAccess (HashSet()) x) ->
           if x.GetFreeVars() |> Seq.exists depVars.Contains then
             depVars.Add w |> ignore
             depChanged <- true
@@ -2731,6 +2874,13 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
         true)
     let rec expandRegionCalls (e: Expr) : Expr =
       match e with
+      | Let(u, x, b) ->
+        let x' = expandRegionCalls x
+        if not u.IsMutable && not (hasRegionAccess (HashSet()) x') && (x'.GetFreeVars() |> Seq.exists depVars.Contains) then
+          depVars.Add u |> ignore
+        let b' = expandRegionCalls b
+        if obj.ReferenceEquals(x, x') && obj.ReferenceEquals(b, b') then e
+        else Expr.Let(u, x', b').WithRange(e.Range)
       | Call(None, mi, args)
           when intrinsic (resolve mi args) = None && not (isSub ctx mi)
                && (match reflected mi with Some def -> hasRegionAccess (HashSet()) def | None -> false)
@@ -2773,21 +2923,51 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
         | Var x when lets.ContainsKey x -> affine env lets[x]
         | Var x when x.Type = TyFrac && not (assignedIn.Contains x) && not (boundIn.Contains x) && ctx.vars.ContainsKey x ->
           Some(Some e, 0, 0)
+        | PropertyGet(Some(Var s), p, [])
+            when s.Type = ctx.kernel.stateType && (field ctx p.Name).ty = TFrac && not (writesField p.Name body) ->
+          Some(Some e, 0, 0)
         | Let(w, x, b) when not w.IsMutable -> affine (env.Add(w, x)) b
-        | Intr "acc.hi" [ Intr "acc.addFrac" [ Intr "acc.ofFrac" [ a ]; b ] ] ->
+        | Intr "acc.lo" [ Intr "acc.asr" [ Intr "frac.mul" [ a; b ]; n ] ]
+            when (match tryConst ctx n with Some(:? int as 1) -> true | _ -> false) ->
           match affine env a, affine env b with
+          | Some(None, 0, m), Some(None, c, k)
+          | Some(None, c, k), Some(None, 0, m) -> Some(None, m * c, m * k)
+          | _ -> None
+        | Intr "acc.hi" [ x ] -> affineAcc env x
+        | Call(None, mi, args) when intrinsic (resolve mi args) = None && not (isSub ctx mi) && (reflected mi).IsSome ->
+          affine env (inlined mi args)
+        | _ -> None
+    and affineAcc (env: Map<Var, Expr>) (e: Expr) : (Expr option * int * int) option =
+      match tryConst ctx e with
+      | Some(:? Acc as a) -> Some(None, 0, sext (int ((a.Raw >>> 24) &&& 0xffffffL)))
+      | _ ->
+        match e with
+        | Var x when env.ContainsKey x -> affineAcc env env[x]
+        | Var x when lets.ContainsKey x -> affineAcc env lets[x]
+        | Let(w, x, b) when not w.IsMutable -> affineAcc (env.Add(w, x)) b
+        | Intr "acc.ofFrac" [ a ] -> affine env a
+        | Intr "acc.addFrac" [ a; b ] ->
+          match affineAcc env a, affine env b with
           | Some(ia, ca, ka), Some(ib, cb, kb) -> Some(plus ia ib, ca + cb, ka + kb)
           | _ -> None
-        | Intr "acc.hi" [ Intr "acc.subFrac" [ Intr "acc.ofFrac" [ a ]; b ] ] ->
-          match affine env a, affine env b with
+        | Intr "acc.add" [ a; b ] ->
+          match affineAcc env a, affineAcc env b with
+          | Some(ia, ca, ka), Some(ib, cb, kb) -> Some(plus ia ib, ca + cb, ka + kb)
+          | _ -> None
+        | Intr "acc.subFrac" [ a; b ] ->
+          match affineAcc env a, affine env b with
           | Some(ia, ca, ka), Some(None, cb, kb) -> Some(ia, ca - cb, ka - kb)
           | _ -> None
-        | Intr "acc.hi" [ Intr "acc.asl" [ Intr "acc.ofFrac" [ a ]; n ] ] ->
-          match affine env a, tryConst ctx n with
+        | Intr "acc.sub" [ a; b ] ->
+          match affineAcc env a, affineAcc env b with
+          | Some(ia, ca, ka), Some(None, cb, kb) -> Some(ia, ca - cb, ka - kb)
+          | _ -> None
+        | Intr "acc.asl" [ a; n ] ->
+          match affineAcc env a, tryConst ctx n with
           | Some(None, c, k), Some(:? int as n) when n >= 0 && n < 16 -> Some(None, c <<< n, k <<< n)
           | _ -> None
         | Call(None, mi, args) when intrinsic (resolve mi args) = None && not (isSub ctx mi) && (reflected mi).IsSome ->
-          affine env (inlined mi args)
+          affineAcc env (inlined mi args)
         | _ -> None
     let consumed = HashSet<Expr>(HashIdentity.Reference)
     let groups = Dictionary<string, Region * Expr option * int * int * int>() // key -> region, inv, stride, baseDisp, register (-1: none yet)
@@ -2828,7 +3008,8 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
     // the lets only those indexes read go: their values written into the indexes, so the body is
     // generated without them, and a copy of a part of it (an inner loop unswitched) still reads
     // whole indexes; the accesses are found again in the body as it now is
-    let body =
+    let origBody = body
+    let mutable body =
       if skipped.IsEmpty then body
       else
         let rec drop (e: Expr) : Expr =
@@ -2870,11 +3051,11 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
         List.iter scan rest
       | Call(None, mi, [ Var i ]) when i = v && mi.Name = "ofRaw" && mi.Declaring = TyFrac -> counted <- true
       // a helper given the index: what its body does with it once inlined
-      | Call(None, mi, args) when intrinsic mi = None && not (isSub ctx mi) && (reflected mi).IsSome
+      | Call(None, mi, args) when intrinsic (resolve mi args) = None && not (isSub ctx mi) && (reflected mi).IsSome
                                   && args |> List.exists (fun a -> a.GetFreeVars() |> Seq.contains v) ->
         scan (inlined mi args)
       | Var i when i = v ->
-        fail $"the loop index {v.Name} can index state arrays (s.field[{v.Name} + c]) or be read as Frac.ofRaw {v.Name}; not {body}"
+        fail $"the loop index {v.Name} can index state arrays (s.field[{v.Name} + c]) or be read as Frac.ofRaw {v.Name}; not {origBody}"
       | ExprShape.ShapeVar _ -> ()
       | ExprShape.ShapeLambda(_, b) -> scan b
       | ExprShape.ShapeCombination(_, xs) -> List.iter scan xs
@@ -3065,6 +3246,7 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
                 yield reg, c, true ]
         else
           if groups.Count > 0 then
+            body <- origBody
             consumed.Clear(); accessAt.Clear()
             skipped <- Set.empty
             scan body
@@ -3110,7 +3292,8 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
       let first = ctx.items.Count
       ctx.depth <- ctx.depth + 2
       ctx.deepest <- max ctx.deepest ctx.depth
-      thenRun ctx body (fun () -> genStmt ctx body)     // the body runs again
+      let finalBody = body
+      thenRun ctx finalBody (fun () -> genStmt ctx finalBody)     // the body runs again
       ctx.depth <- ctx.depth - 2
       let stepped = not regs.IsEmpty || counter.IsSome || (affineRegs |> List.exists (fun (_, _, s) -> s))
       // DO needs an instruction to end on: the body's end cannot be a branch target
@@ -3138,9 +3321,10 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
       ctx.counters <- savedCounters
       ctx.inductions <- savedInductions
       for e in accessAt.Keys do ctx.affineAt.Remove e |> ignore
-      ctx.freeRegs <- (affineRegs |> List.map (fun (r, _, _) -> r)) @ ctx.freeRegs
+      if not affineRegs.IsEmpty then
+        ctx.freeRegs <- List.sort ((affineRegs |> List.map (fun (r, _, _) -> r)) @ ctx.freeRegs)
       for w, c, taken in stepLocals do
-        ctx.freeRegs <- taken @ ctx.freeRegs
+        ctx.freeRegs <- List.sort (taken @ ctx.freeRegs)
         let k = c * count
         if k <> 0 then
           genStmt ctx (Expr.VarSet(w, Expr.Call(Ir.intrinsic "acc.hi", [ operatorCall "op_Addition" TyAcc [ Expr.Call(Ir.intrinsic "acc.ofFrac", [ Expr.Var w ]); Expr.Value(box (Frac.ofRaw k), TyFrac) ] ])))
@@ -3393,7 +3577,7 @@ and compileFSharpSub (ctx: Ctx) (sub: Sub) =
         if ty = TAcc then emit ctx (move e (at h 2))
         na <- na + 1
       ctx.vars <- ctx.vars.Add(v, h)
-  let body = ordered (normalize body)
+  let body = canonicalLoops ctx (ordered (normalize body))
   let r = sub.mi.ReturnType
   pend ctx [ body ] (fun () ->
     if r = TyFrac then genWord ctx body
@@ -3540,7 +3724,8 @@ let entry (ctx: Ctx) (name: string) (mi: Member) =
   | None -> ()
   // how much each local is used, loops weighted by their trip counts
   ctx.scores.Clear()
-  weigh ctx 1 (normalize (body def))
+  let norm = canonicalLoops ctx (normalize (body def))
+  weigh ctx 1 norm
   emit ctx (Label name)
   if savesTrack then
     // R1 holds the track number only on entry
@@ -3548,7 +3733,7 @@ let entry (ctx: Ctx) (name: string) (mi: Member) =
     ctx.trackHome <- Some h
     emit ctx (move r1 (at h 0))
   ctx.line <- 0; ctx.sourceLine <- 0
-  genStmt ctx (ordered (normalize (body def)))
+  genStmt ctx (ordered norm)
   emit ctx rts
 
 /// The words a RENDER body writes, when the count does not depend on the parameters: loops

@@ -9,7 +9,7 @@ probe-auto-size	machinedrum	ok	1889	da8b6494841ccab4
 probe-auto-sub	machinedrum	ok	134	33128424d5dbc065
 probe-banks	machinedrum	ok	96	ce5026a92f7d0a38
 probe-bit-test	machinedrum	ok	145	63e6eb81f21da1ba
-probe-bool-let	machinedrum	ok	144	93a2d2d760da1766
+probe-bool-let	machinedrum	ok	146	32c121dcc5c7e883
 probe-branch-registers	machinedrum	ok	89	88e71ee76d8805fb
 probe-clb-normf	machinedrum	ok	53	193119d5d17499c0
 probe-clb-normf-edges	machinedrum	ok	158	4e28b8d45320f68e
@@ -17,6 +17,7 @@ probe-computed-index	machinedrum	ok	169	9689196395cedc93
 probe-computed-past	machinedrum	ok	21	bd9e68a466445963
 probe-control	machinedrum	ok	94	f365b2abebaca5d8
 probe-counted-loops	machinedrum	ok	110	4ca6e408a4919503
+probe-counted-while-loop-yield	machinedrum	ok	146	2cc2cfffcc6149e8
 probe-crowded-registers	machinedrum	error	-	63454ec9fd4eeab4	y1[i]: no address register is free for the loop over i (r1..r5 hold c1 (r1), c2 (r2), c3 (r3), c4 (r4), c5 (r5)). End a cursor before the loop, or index with a word counted when running: s.y1[Frac.index (Frac.ofRaw i)] (r0 and n0, no register held)
 probe-divide	machinedrum	ok	66	8e8613223bb82818
 probe-divide-carry	machinedrum	ok	66	b393b11b7a3daafa
@@ -44,7 +45,7 @@ probe-mulsu-dmac	machinedrum	ok	57	3398177a383e9896
 probe-order	machinedrum	ok	147	980cc74e19d3ef6e
 probe-outer-walk-regions	machinedrum	ok	108	bc98eb6f8b882cb8
 probe-piped	machinedrum	ok	32	962bfd9a19a9e066
-probe-region-induction	machinedrum	ok	116	e014675fc088d78c
+probe-region-induction	machinedrum	ok	116	8a163fa39ca15a36
 probe-region-shared-index	machinedrum	ok	88	7f281bc137a539c0
 probe-region-shared-let	machinedrum	ok	53	23f6dc3b8f53b942
 probe-ring-taps	machinedrum	ok	234	318bce08f63c6070

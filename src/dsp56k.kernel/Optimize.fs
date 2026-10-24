@@ -214,6 +214,7 @@ let aluWrites (instr: Instr) =
 /// register instead (done last: earlier, the register's read would keep copyForward from
 /// removing the register's own load).
 let forwardWith (accCopies: bool) (keepTriples: bool) (items: (Item * int) array) =
+  let items = Array.copy items
   let f = Facts()
   let out = ResizeArray<Item * int>()
   let mutable i = 0
@@ -234,6 +235,18 @@ let forwardWith (accCopies: bool) (keepTriples: bool) (items: (Item * int) array
     | Op(Par(None, [| m |])) -> Some m
     | _ -> None
   while i < items.Length do
+    if accCopies && not keepTriples && patched.IsNone then
+      match single (fst items[i]) with
+      | Some(Store(((A | B) as acc), space, ea)) when (workset space ea).IsSome ->
+        let mutable k = i + 1
+        while k < items.Length && (match fst items[k] with Comment _ -> true | _ -> false) do k <- k + 1
+        if k < items.Length then
+          match single (fst items[k]) with
+          | Some(Load(space', ea', ((X0 | X1 | Y0 | Y1) as dst))) when space = space' && ea = ea' ->
+            items[i] <- (Op(Par(None, [| Copy(acc, dst) |])), snd items[i])
+            items[k] <- (Op(Par(None, [| Store(dst, space, ea) |])), snd items[k])
+          | _ -> ()
+      | _ -> ()
     let it, line = items[i]
     // an Acc's three words reloaded into the accumulator they were stored from (or the other one)
     let isTload, triple, otherTriple =
@@ -257,7 +270,23 @@ let forwardWith (accCopies: bool) (keepTriples: bool) (items: (Item * int) array
           | _ -> false, false, None
         | _ -> false, false, None
       else false, false, None
+    let immPair =
+      if not isTload && i + 1 < items.Length && patched.IsNone then
+        match single (fst items[i]), single (fst items[i + 1]) with
+        | Some(Imm(opHi, ((A | B) as acc))), Some(Imm(opLo, lo))
+            when lo = (if acc = A then A0 else B0)
+                 && (opHi.force = Long || immValue opHi = Some 0L)
+                 && (opLo.force = Long || immValue opLo = Some 0L) ->
+          match immValue opHi, immValue opLo with
+          | Some vHi, Some vLo ->
+            let ext, hi = if acc = A then A2, A1 else B2, B1
+            let cHi, cLo = f.Const vHi, f.Const vLo
+            f.Get(SReg ext) = Some(f.SignExt cHi) && f.Get(SReg hi) = Some cHi && f.Get(SReg lo) = Some cLo
+          | _ -> false
+        | _ -> false
+      else false
     if triple then i <- i + 3
+    elif immPair then i <- i + 2
     elif otherTriple.IsSome then
       let src, dst = otherTriple.Value
       let alu = Some(Binary(AluOp.Tfr, src, dst))
@@ -409,6 +438,9 @@ let forwardWith (accCopies: bool) (keepTriples: bool) (items: (Item * int) array
         | Some k -> out.Add(k, line)
         | None -> ()
         i <- i + 1
+      | Op(Branch(Bcc _, _)) when accCopies && not keepTriples ->
+        out.Add(it, line)
+        i <- i + 1
       | Op instr ->
         match aluWrites instr with
         | Some ws -> for w in ws do f.WriteReg w
@@ -458,161 +490,6 @@ let tempSlot (first: int) (temps: int) (yFirst: int) (yTemps: int) (space: Space
   | Some(SMem(Space.X, k)) when k >= first && k < temps -> Some k
   | Some(SMem(Space.Y, k)) when k >= yFirst && k < yTemps -> Some(1024 + k)
   | _ -> None
-
-/// Whole-accumulator reloads whose three raw parts equal their temporary on every incoming
-/// path. Value IDs need not agree between paths: a clamp can select a different value while
-/// keeping A equal to its home on both. Unknown effects and entry paths contribute no facts.
-let joinAccumulatorsY (first: int) (temps: int) (yFirst: int) (yTemps: int) (items: (Item * int) array) =
-  let its = Array.map fst items
-  let n = its.Length
-  let temp = tempSlot first temps yFirst yTemps
-  let single i = match its[i] with Op(Par(None, [| m |])) -> Some m | _ -> None
-  let reload i =
-    if i + 2 >= n then None
-    else
-      match single i, single (i + 1), single (i + 2) with
-      | Some(Load(sp1, e1, ((A | B) as acc))), Some(Load(sp0, e0, lo)), Some(Load(sp2, e2, ext))
-          when lo = (if acc = A then A0 else B0) && ext = (if acc = A then A2 else B2) ->
-        match temp sp1 e1, temp sp0 e0, temp sp2 e2 with
-        | Some k, Some k0, Some k2 when k0 = k + 1 && k2 = k + 2 -> Some(k, acc)
-        | _ -> None
-      | _ -> None
-  match successors its with
-  | None -> items
-  | Some succ ->
-    let preds = Array.init n (fun _ -> ResizeArray<int>())
-    for i in 0 .. n - 1 do for j in succ[i] do preds[j].Add i
-    let candidates = [| for i in 0 .. n - 1 do match reload i with Some pair -> yield pair | _ -> () |] |> Array.distinct
-    let dropped = HashSet<int>()
-    for k, acc in candidates do
-      let spSlot = if k >= 1024 then Space.Y else Space.X
-      let registers = if acc = A then [| A1; A0; A2 |] else [| B1; B0; B2 |]
-      let regMask r =
-        let touched = parts r
-        registers |> Array.mapi (fun bit r -> if List.contains r touched then 1 <<< bit else 0) |> Array.fold (|||) 0
-      let memoryMask space ea =
-        match temp space ea with
-        | Some word when word >= k && word < k + 3 -> 1 <<< (word - k)
-        | _ ->
-          match workset space ea with
-          | Some _ -> 0
-          | None when space = spSlot -> 7     // an indirect store can alias the temporary
-          | _ -> 0
-      let transfer state item =
-        match item with
-        | Label _ | Comment _ -> state
-        | Op(Branch((Bra | Bcc _), _)) | Op(Jump((Jmp | Jcc _), _))
-        | Op(Loop _) | Op Enddo | Op Nop -> state
-        | Op(Par(alu, moves)) ->
-          let mutable changed = 0
-          let mutable stored = 0
-          let mutable baseChanged = false
-          let write r =
-            changed <- changed ||| regMask r
-            if r = R 6 then baseChanged <- true
-          alu |> Option.iter (fun a -> Lower.aluWrites a |> Array.iter write)
-          for move in moves do
-            // Lower.storage deliberately merges A0/A1/A2 for interference; equality needs
-            // their precise writes so the three-part reload does not erase its earlier parts.
-            match move with
-            | Load(_, ea, r) -> write r; Lower.eaWrites ea |> Array.iter write
-            | Store(_, _, ea) | Update ea -> Lower.eaWrites ea |> Array.iter write
-            | Copy(_, r) | Imm(_, r) -> write r
-            match move with Store(_, sp, ea) -> stored <- stored ||| memoryMask sp ea | _ -> ()
-          if baseChanged then 0
-          else
-            let mutable result = state &&& (7 ^^^ (changed ||| stored))
-            // Generate equality only for a single move without an ALU: a parallel move's
-            // sources precede all writes, and overlapping destinations need more modelling.
-            for move in (if alu.IsNone && moves.Length = 1 then moves else [||]) do
-              match move with
-              | Store(src, sp, ea) ->
-                match temp sp ea with
-                | Some word when word >= k && word < k + 3 ->
-                  let bit = 1 <<< (word - k)
-                  // Parallel stores read the old register, before any ALU/register writes.
-                  if src = registers[word - k] && changed &&& bit = 0 then result <- result ||| bit
-                | _ -> ()
-              | Load(sp, ea, dst) ->
-                match temp sp ea with
-                | Some word when word >= k && word < k + 3 ->
-                  let bit = 1 <<< (word - k)
-                  if (dst = registers[word - k] || (word = k && dst = acc)) && stored &&& bit = 0 then
-                    result <- result ||| bit
-                | _ -> ()
-              | _ -> ()
-            result
-        | Op instr ->
-          match aluWrites instr with
-          | Some writes when not (List.contains (R 6) writes) ->
-            state &&& (7 ^^^ (writes |> List.map regMask |> List.fold (|||) 0))
-          | _ -> 0
-        | _ -> 0
-      let incoming = Array.zeroCreate<int> n
-      let outgoing = Array.zeroCreate<int> n
-      let mutable changed = true
-      while changed do
-        changed <- false
-        for i in 0 .. n - 1 do
-          let before = if preds[i].Count = 0 then 0 else preds[i] |> Seq.map (fun p -> outgoing[p]) |> Seq.reduce (&&&)
-          let after = transfer before its[i]
-          if before <> incoming[i] || after <> outgoing[i] then
-            incoming[i] <- before
-            outgoing[i] <- after
-            changed <- true
-      for i in 0 .. n - 1 do
-        if incoming[i] = 7 && reload i = Some(k, acc) then
-          for j in i .. i + 2 do dropped.Add j |> ignore
-    items |> Array.mapi (fun i item -> i, item) |> Array.choose (fun (i, item) -> if dropped.Contains i then None else Some item)
-
-let joinAccumulators (first: int) (temps: int) (items: (Item * int) array) =
-  joinAccumulatorsY first temps 0 0 items
-
-/// Stores to the compiler's temporaries (X workset words from `first` up to `temps` and Y
-/// workset words from `yFirst` up to `yTemps`; the words below are state) that no path reads
-/// before the word is written again.
-let deadTempsFromY (first: int) (temps: int) (yFirst: int) (yTemps: int) (items: (Item * int) array) =
-  let its = Array.map fst items
-  let temp = tempSlot first temps yFirst yTemps
-  let uses i =
-    match its[i] with
-    | Op(Par(_, moves)) -> moves |> Array.choose (function Load(sp, ea, _) -> temp sp ea | _ -> None) |> Set.ofArray
-    | _ -> Set.empty
-  let defs i =
-    match its[i] with
-    | Op(Par(_, moves)) -> moves |> Array.choose (function Store(_, sp, ea) -> temp sp ea | _ -> None) |> Set.ofArray
-    | _ -> Set.empty
-  match successors its with
-  | None -> items
-  | Some succ ->
-    let n = its.Length
-    let liveIn = Array.create n Set.empty
-    let liveOut = Array.create n Set.empty
-    let u = Array.init n uses
-    let d = Array.init n defs
-    let mutable changed = true
-    while changed do
-      changed <- false
-      for i in n - 1 .. -1 .. 0 do
-        let out = succ[i] |> Array.fold (fun acc j -> Set.union acc liveIn[j]) Set.empty
-        let inn = Set.union u[i] (Set.difference out d[i])
-        if out <> liveOut[i] || inn <> liveIn[i] then
-          liveOut[i] <- out
-          liveIn[i] <- inn
-          changed <- true
-    items |> Array.mapi (fun i x -> i, x) |> Array.filter (fun (i, _) ->
-      match its[i] with
-      | Op(Par(None, [| Store(_, sp, ea) |])) ->
-        match temp sp ea with
-        | Some k -> liveOut[i].Contains k
-        | None -> true
-      | _ -> true) |> Array.map snd
-
-let deadTempsFrom (first: int) (temps: int) (items: (Item * int) array) =
-  deadTempsFromY first temps 0 0 items
-
-/// The dead temporaries of a kernel without [<XMemory>] state: X words below `temps`.
-let deadTemps (temps: int) (items: (Item * int) array) = deadTempsFrom 0 temps items
 
 /// Registers an instruction reads, as far as this pass needs (None: not known).
 let readsOf (instr: Instr) =
@@ -730,8 +607,252 @@ let deadAfter (items: (Item * int) array) (from: int) (r: Reg) =
           | _ -> dead <- false
         dead
 
+/// Whole-accumulator reloads whose three raw parts equal their temporary on every incoming
+/// path. Value IDs need not agree between paths: a clamp can select a different value while
+/// keeping A equal to its home on both. Unknown effects and entry paths contribute no facts.
+let joinAccumulatorsY (first: int) (temps: int) (yFirst: int) (yTemps: int) (items: (Item * int) array) =
+  let temp = tempSlot first temps yFirst yTemps
+  let items =
+    let out = ResizeArray<Item * int>(items.Length)
+    let nonCommentBack start count =
+      let res = ResizeArray<int>()
+      let mutable j = start
+      while j >= 0 && res.Count < count do
+        match fst items[j] with
+        | Comment _ -> ()
+        | _ -> res.Add j
+        j <- j - 1
+      res.ToArray()
+    let nonCommentFwd start count =
+      let res = ResizeArray<int>()
+      let mutable j = start
+      while j < items.Length && res.Count < count do
+        match fst items[j] with
+        | Comment _ -> ()
+        | _ -> res.Add j
+        j <- j + 1
+      res.ToArray()
+    for i in 0 .. items.Length - 1 do
+      match fst items[i] with
+      | Label lbl ->
+        let back = nonCommentBack (i - 1) 6
+        let fwd = nonCommentFwd (i + 1) 3
+        let isClampBridge =
+          if back.Length >= 4 && fwd.Length = 3 then
+            match fst items[back[2]], fst items[back[1]], fst items[back[0]] with
+            | Op(Par(None, [| Store(A1, sp1, e1) |])), Op(Par(None, [| Store(A0, sp0, e0) |])), Op(Par(None, [| Store(A2, sp2, e2) |])) ->
+              match temp sp1 e1, temp sp0 e0, temp sp2 e2 with
+              | Some k, Some k0, Some k2 when k0 = k + 1 && k2 = k + 2 ->
+                let hasBle =
+                  back[3..] |> Array.exists (fun bi ->
+                    match fst items[bi] with
+                    | Op(Branch(Bcc Cond.Le, { expr = Sym t })) -> t = lbl
+                    | _ -> false)
+                match hasBle, fst items[fwd[0]], fst items[fwd[1]], fst items[fwd[2]] with
+                | true, Op(Par(Some(Binary(AluOp.Tfr, B, Acc.A)), [||])), Op(AluImm(CmpI, _, Acc.A)), Op(Branch(Bcc Cond.Ge, _)) ->
+                  deadAfter items (fwd[0] + 1) B
+                | _ -> false
+              | _ -> false
+            | _ -> false
+          else false
+        if isClampBridge then
+          out.Add(Op(Par(Some(Binary(AluOp.Tfr, A, Acc.B)), [||])), snd items[i])
+      | _ -> ()
+      out.Add items[i]
+    out.ToArray()
+  let its = Array.map fst items
+  let n = its.Length
+  let single i = match its[i] with Op(Par(None, [| m |])) -> Some m | _ -> None
+  let reload i =
+    if i + 2 >= n then None
+    else
+      match single i, single (i + 1), single (i + 2) with
+      | Some(Load(sp1, e1, ((A | B) as acc))), Some(Load(sp0, e0, lo)), Some(Load(sp2, e2, ext))
+          when lo = (if acc = A then A0 else B0) && ext = (if acc = A then A2 else B2) ->
+        match temp sp1 e1, temp sp0 e0, temp sp2 e2 with
+        | Some k, Some k0, Some k2 when k0 = k + 1 && k2 = k + 2 -> Some(k, acc)
+        | _ -> None
+      | _ -> None
+  match successors its with
+  | None -> items
+  | Some succ ->
+    let preds = Array.init n (fun _ -> ResizeArray<int>())
+    for i in 0 .. n - 1 do for j in succ[i] do preds[j].Add i
+    let candidates = [| for i in 0 .. n - 1 do match reload i with Some pair -> yield pair | _ -> () |] |> Array.distinct
+    let dropped = HashSet<int>()
+    let regsA = [| A1; A0; A2 |]
+    let regsB = [| B1; B0; B2 |]
+    let maskOf (regs: Reg array) (r: Reg) =
+      let touched = parts r
+      regs |> Array.mapi (fun bit p -> if List.contains p touched then 1 <<< bit else 0) |> Array.fold (|||) 0
+    for k, acc in candidates do
+      let spSlot = if k >= 1024 then Space.Y else Space.X
+      let memoryMask space ea =
+        match temp space ea with
+        | Some word when word >= k && word < k + 3 -> 1 <<< (word - k)
+        | _ ->
+          match workset space ea with
+          | Some _ -> 0
+          | None when space = spSlot -> 7     // an indirect store can alias the temporary
+          | _ -> 0
+      // 9-bit state: bits 0..2 = (A == slot), bits 3..5 = (B == slot), bits 6..8 = (A == B)
+      let close (aSlot: int) (bSlot: int) (abEq: int) =
+        let a = aSlot ||| (bSlot &&& abEq)
+        let b = bSlot ||| (a &&& abEq)
+        let ab = abEq ||| (a &&& b)
+        a ||| (b <<< 3) ||| (ab <<< 6)
+      let transfer state item =
+        match item with
+        | Label _ | Comment _ -> state
+        | Op(Branch((Bra | Bcc _), _)) | Op(Jump((Jmp | Jcc _), _))
+        | Op(Loop _) | Op Enddo | Op Nop -> state
+        | Op(Par(alu, moves)) ->
+          let s0 = close (state &&& 7) ((state >>> 3) &&& 7) ((state >>> 6) &&& 7)
+          let mutable aSlot = s0 &&& 7
+          let mutable bSlot = (s0 >>> 3) &&& 7
+          let mutable abEq = (s0 >>> 6) &&& 7
+          let mutable baseChanged = false
+          match alu with
+          | None -> ()
+          | Some(Binary(AluOp.Tfr, A, Acc.B)) ->
+            bSlot <- aSlot
+            abEq <- 7
+          | Some(Binary(AluOp.Tfr, B, Acc.A)) ->
+            aSlot <- bSlot
+            abEq <- 7
+          | Some a ->
+            for r in Lower.aluWrites a do
+              if r = R 6 then baseChanged <- true
+              let ma, mb = maskOf regsA r, maskOf regsB r
+              aSlot <- aSlot &&& (7 ^^^ ma)
+              bSlot <- bSlot &&& (7 ^^^ mb)
+              abEq <- abEq &&& (7 ^^^ (ma ||| mb))
+          let mutable changedA = 0
+          let mutable changedB = 0
+          let mutable stored = 0
+          let write r =
+            changedA <- changedA ||| maskOf regsA r
+            changedB <- changedB ||| maskOf regsB r
+            if r = R 6 then baseChanged <- true
+          for move in moves do
+            // Lower.storage deliberately merges A0/A1/A2 for interference; equality needs
+            // their precise writes so the three-part reload does not erase its earlier parts.
+            match move with
+            | Load(_, ea, r) -> write r; Lower.eaWrites ea |> Array.iter write
+            | Store(_, _, ea) | Update ea -> Lower.eaWrites ea |> Array.iter write
+            | Copy(_, r) | Imm(_, r) -> write r
+            match move with Store(_, sp, ea) -> stored <- stored ||| memoryMask sp ea | _ -> ()
+          if baseChanged then 0
+          else
+            aSlot <- aSlot &&& (7 ^^^ (changedA ||| stored))
+            bSlot <- bSlot &&& (7 ^^^ (changedB ||| stored))
+            abEq <- abEq &&& (7 ^^^ (changedA ||| changedB))
+            // Generate equality only for a single move without an ALU: a parallel move's
+            // sources precede all writes, and overlapping destinations need more modelling.
+            for move in (if alu.IsNone && moves.Length = 1 then moves else [||]) do
+              match move with
+              | Store(src, sp, ea) ->
+                match temp sp ea with
+                | Some word when word >= k && word < k + 3 ->
+                  let bit = 1 <<< (word - k)
+                  if src = regsA[word - k] && changedA &&& bit = 0 then
+                    aSlot <- aSlot ||| bit
+                    if abEq &&& bit <> 0 then bSlot <- bSlot ||| bit
+                  if src = regsB[word - k] && changedB &&& bit = 0 then
+                    bSlot <- bSlot ||| bit
+                    if abEq &&& bit <> 0 then aSlot <- aSlot ||| bit
+                | _ -> ()
+              | Load(sp, ea, dst) ->
+                match temp sp ea with
+                | Some word when word >= k && word < k + 3 ->
+                  let bit = 1 <<< (word - k)
+                  if (dst = regsA[word - k] || (word = k && dst = A)) && stored &&& bit = 0 then
+                    aSlot <- aSlot ||| bit
+                  if (dst = regsB[word - k] || (word = k && dst = B)) && stored &&& bit = 0 then
+                    bSlot <- bSlot ||| bit
+                | _ -> ()
+              | _ -> ()
+            close aSlot bSlot abEq
+        | Op instr ->
+          match aluWrites instr with
+          | Some writes when not (List.contains (R 6) writes) ->
+            let ma = writes |> List.map (maskOf regsA) |> List.fold (|||) 0
+            let mb = writes |> List.map (maskOf regsB) |> List.fold (|||) 0
+            let aSlot = (state &&& 7) &&& (7 ^^^ ma)
+            let bSlot = ((state >>> 3) &&& 7) &&& (7 ^^^ mb)
+            let abEq = ((state >>> 6) &&& 7) &&& (7 ^^^ (ma ||| mb))
+            close aSlot bSlot abEq
+          | _ -> 0
+        | _ -> 0
+      let incoming = Array.zeroCreate<int> n
+      let outgoing = Array.zeroCreate<int> n
+      let mutable changed = true
+      while changed do
+        changed <- false
+        for i in 0 .. n - 1 do
+          let before = if preds[i].Count = 0 then 0 else preds[i] |> Seq.map (fun p -> outgoing[p]) |> Seq.reduce (&&&)
+          let after = transfer before its[i]
+          if before <> incoming[i] || after <> outgoing[i] then
+            incoming[i] <- before
+            outgoing[i] <- after
+            changed <- true
+      let want = if acc = A then 7 else (7 <<< 3)
+      for i in 0 .. n - 1 do
+        if (incoming[i] &&& want) = want && reload i = Some(k, acc) then
+          for j in i .. i + 2 do dropped.Add j |> ignore
+    items |> Array.mapi (fun i item -> i, item) |> Array.choose (fun (i, item) -> if dropped.Contains i then None else Some item)
+
+let joinAccumulators (first: int) (temps: int) (items: (Item * int) array) =
+  joinAccumulatorsY first temps 0 0 items
+
+/// Stores to the compiler's temporaries (X workset words from `first` up to `temps` and Y
+/// workset words from `yFirst` up to `yTemps`; the words below are state) that no path reads
+/// before the word is written again.
+let deadTempsFromY (first: int) (temps: int) (yFirst: int) (yTemps: int) (items: (Item * int) array) =
+  let its = Array.map fst items
+  let temp = tempSlot first temps yFirst yTemps
+  let uses i =
+    match its[i] with
+    | Op(Par(_, moves)) -> moves |> Array.choose (function Load(sp, ea, _) -> temp sp ea | _ -> None) |> Set.ofArray
+    | _ -> Set.empty
+  let defs i =
+    match its[i] with
+    | Op(Par(_, moves)) -> moves |> Array.choose (function Store(_, sp, ea) -> temp sp ea | _ -> None) |> Set.ofArray
+    | _ -> Set.empty
+  match successors its with
+  | None -> items
+  | Some succ ->
+    let n = its.Length
+    let liveIn = Array.create n Set.empty
+    let liveOut = Array.create n Set.empty
+    let u = Array.init n uses
+    let d = Array.init n defs
+    let mutable changed = true
+    while changed do
+      changed <- false
+      for i in n - 1 .. -1 .. 0 do
+        let out = succ[i] |> Array.fold (fun acc j -> Set.union acc liveIn[j]) Set.empty
+        let inn = Set.union u[i] (Set.difference out d[i])
+        if out <> liveOut[i] || inn <> liveIn[i] then
+          liveOut[i] <- out
+          liveIn[i] <- inn
+          changed <- true
+    items |> Array.mapi (fun i x -> i, x) |> Array.filter (fun (i, _) ->
+      match its[i] with
+      | Op(Par(None, [| Store(_, sp, ea) |])) ->
+        match temp sp ea with
+        | Some k -> liveOut[i].Contains k
+        | None -> true
+      | _ -> true) |> Array.map snd
+
+let deadTempsFrom (first: int) (temps: int) (items: (Item * int) array) =
+  deadTempsFromY first temps 0 0 items
+
+/// The dead temporaries of a kernel without [<XMemory>] state: X words below `temps`.
+let deadTemps (temps: int) (items: (Item * int) array) = deadTempsFrom 0 temps items
+
 /// `move s,x0` `move x0,d` with x0 dead afterwards: `move s,d`, when that encodes.
-let copyForward (items: (Item * int) array) =
+let copyForwardWith (dropDeadAcc: bool) (items: (Item * int) array) =
   let cur = Array.copy items
   let dropped = HashSet<int>()
   let its = Array.map fst cur
@@ -804,7 +925,46 @@ let copyForward (items: (Item * int) array) =
     | MulI(kind, neg, imm, s, d) when s = fromReg ->
       Some(MulI(kind, neg, imm, toReg, d))
     | _ -> None
+  let deadAccParts (i: int) (dst: Reg) =
+    let isPatched =
+      i > 0 && (match fst cur[i - 1] with Comment t -> t.StartsWith machinedrum.Abi.markerPrefix | _ -> false)
+    if isPatched then false
+    else
+      let acc = if List.contains dst [ A; A0; A1; A2 ] then A else B
+      let rec check (k: int) (unwritten: Set<Reg>) =
+        if unwritten.IsEmpty then true
+        elif k >= cur.Length then false
+        elif dropped.Contains k then check (k + 1) unwritten
+        else
+          match fst cur[k] with
+          | Comment _ -> check (k + 1) unwritten
+          | Op instr when not (control instr) ->
+            let readParts =
+              match instr with
+              | Par(None, [| Copy(src, _) |]) | Par(None, [| Store(src, _, _) |]) -> Some(parts src)
+              | _ -> readsOf instr |> Option.map (fun rs -> rs |> Array.toList |> List.collect parts)
+            match readParts with
+            | None -> false
+            | Some rp when rp |> List.exists unwritten.Contains -> false
+            | Some _ ->
+              let unwritten' =
+                if writesWhole acc instr then Set.empty
+                else
+                  match instr with
+                  | Par(None, [| (Load(_, _, d) | Copy(_, d) | Imm(_, d)) |]) ->
+                    Set.difference unwritten (Set.ofList (parts d))
+                  | _ -> unwritten
+              check (k + 1) unwritten'
+          | _ -> false
+      check (i + 1) (Set.ofList (parts dst))
   for i in 0 .. cur.Length - 1 do
+    if dropDeadAcc && not (dropped.Contains i) then
+      match fst cur[i] with
+      | Op(Par(None, [| (Load(_, Disp _, dst) | Imm(_, dst)) |]))
+      | Op(Par(None, [| Copy((X0 | X1 | Y0 | Y1 | A0 | A1 | A2 | B0 | B1 | B2), dst) |]))
+          when List.contains dst [ A; A0; A1; A2; B; B0; B1; B2 ] && deadAccParts i dst ->
+        dropped.Add i |> ignore
+      | _ -> ()
     if not (dropped.Contains i) then
       let accWrite =
         match fst cur[i] with
@@ -902,6 +1062,8 @@ let copyForward (items: (Item * int) array) =
                 | _ -> searching <- false
         | _ -> ()
   cur |> Array.mapi (fun i x -> i, x) |> Array.choose (fun (i, x) -> if dropped.Contains i then None else Some x)
+
+let copyForward (items: (Item * int) array) = copyForwardWith false items
 
 /// (Superseded by the liveness version above; kept for reference.)
 let deadTempsGlobal (temps: int) (items: (Item * int) array) =
@@ -1919,6 +2081,37 @@ let walkWith (yLimit: int) (items: (Item * int) array) =
         | Op(Lua(_, R r)) | Op(Par(None, [| Copy(_, R r) |])) when r >= 1 && r <= 5 -> rWrites[idx][r] <- true
         | Op(Par(None, [| Imm(_, N r) |])) when r >= 1 && r <= 5 -> nWrites[idx][r] <- true
         | _ -> ()
+      let subBounds = Array.init n (fun _ -> None)
+      let subList = ResizeArray<string * int * int>()
+      for KeyValue(l, sIdx) in labels do
+        if l.StartsWith "SUB_" && not (l.StartsWith "SUB_K_HAND_") then
+          let mutable eIdx = sIdx
+          while eIdx < n && its[eIdx] <> Op Rts do eIdx <- eIdx + 1
+          if eIdx < n then
+            subList.Add(l, sIdx, eIdx)
+            for k in sIdx .. eIdx do subBounds[k] <- Some(l, sIdx, eIdx)
+      let rSubTouch = Array.init n (fun _ -> Array.create 8 false)
+      let nSubTouch = Array.init n (fun _ -> Array.create 8 false)
+      let mutable subProp = true
+      while subProp do
+        subProp <- false
+        for (subName, sIdx, eIdx) in subList do
+          for r in 1 .. 5 do
+            let mutable rt = false
+            let mutable nt = false
+            let mutable mt = false
+            for k in sIdx .. eIdx do
+              if rReads[k][r] || rWrites[k][r] || rSubTouch[k][r] then rt <- true
+              if nReads[k][r] || nWrites[k][r] || nSubTouch[k][r] then nt <- true
+              if mTouch[k][r] then mt <- true
+            if rt || nt || mt then
+              for i in 0 .. n - 1 do
+                match its[i] with
+                | Op(Branch(Bsr, { expr = Sym s })) when s = subName ->
+                  if rt && not (rSubTouch[i][r]) then rSubTouch[i][r] <- true; subProp <- true
+                  if nt && not (nSubTouch[i][r]) then nSubTouch[i][r] <- true; subProp <- true
+                  if mt && not (mTouch[i][r]) then mTouch[i][r] <- true; subProp <- true
+                | _ -> ()
       let solveLive (reads: bool array array) (writes: bool array array) =
         let liveIn  = Array.init n (fun _ -> Array.create 8 false)
         let liveOut = Array.init n (fun _ -> Array.create 8 false)
@@ -1961,28 +2154,46 @@ let walkWith (yLimit: int) (items: (Item * int) array) =
                   if not (mNonLinear[s][r]) then
                     mNonLinear[s][r] <- true
                     mChanged <- true
-      let subBounds = Array.init n (fun _ -> None)
-      for KeyValue(l, sIdx) in labels do
-        if l.StartsWith "SUB_" && not (l.StartsWith "SUB_K_HAND_") then
-          let mutable eIdx = sIdx
-          while eIdx < n && its[eIdx] <> Op Rts do eIdx <- eIdx + 1
-          if eIdx < n then
-            for k in sIdx .. eIdx do subBounds[k] <- Some(l, sIdx, eIdx)
+      let subRLive = Dictionary<string, bool array>()
+      let subNLive = Dictionary<string, bool array>()
+      let subMNonLin = Dictionary<string, bool array>()
+      for (subName, _, _) in subList do
+        subRLive[subName] <- Array.create 8 false
+        subNLive[subName] <- Array.create 8 false
+        subMNonLin[subName] <- Array.create 8 false
+      for i in 0 .. n - 1 do
+        match its[i] with
+        | Op(Branch(Bsr, { expr = Sym s })) when subRLive.ContainsKey s ->
+          for r in 1 .. 5 do
+            if rLiveIn[i][r] || rLiveOut[i][r] then subRLive[s][r] <- true
+            if nLiveIn[i][r] || nLiveOut[i][r] then subNLive[s][r] <- true
+            if mNonLinear[i][r] then subMNonLin[s][r] <- true
+        | _ -> ()
+      let mutable callProp = true
+      while callProp do
+        callProp <- false
+        for (callerName, sIdx, eIdx) in subList do
+          for k in sIdx .. eIdx do
+            match its[k] with
+            | Op(Branch(Bsr, { expr = Sym calleeName })) when subRLive.ContainsKey calleeName ->
+              for r in 1 .. 5 do
+                if subRLive[callerName][r] && not (subRLive[calleeName][r]) then
+                  subRLive[calleeName][r] <- true; callProp <- true
+                if subNLive[callerName][r] && not (subNLive[calleeName][r]) then
+                  subNLive[calleeName][r] <- true; callProp <- true
+                if subMNonLin[callerName][r] && not (subMNonLin[calleeName][r]) then
+                  subMNonLin[calleeName][r] <- true; callProp <- true
+            | _ -> ()
       let isFree (r: int) (needN: bool) (startIdx: int) (endIdx: int) =
         let mutable ok = true
         for k in startIdx .. endIdx do
-          if rReads[k][r] || rWrites[k][r] || nReads[k][r] || nWrites[k][r] || mTouch[k][r] || mNonLinear[k][r] then
-            ok <- false
-        if ok && (rLiveIn[startIdx][r] || rLiveOut[endIdx][r]) then ok <- false
-        if ok && needN && (nLiveIn[startIdx][r] || nLiveOut[endIdx][r]) then ok <- false
+          if rReads[k][r] || rWrites[k][r] || rSubTouch[k][r] || rLiveOut[k][r] || mNonLinear[k][r] then ok <- false
+          if needN && (nReads[k][r] || nWrites[k][r] || nSubTouch[k][r] || nLiveOut[k][r]) then ok <- false
         if ok then
           match subBounds[startIdx] with
           | Some(subName, _, _) ->
-            for i in 0 .. n - 1 do
-              match its[i] with
-              | Op(Branch(Bsr, { expr = Sym s })) when s = subName ->
-                if rLiveOut[i][r] || (needN && nLiveOut[i][r]) || mNonLinear[i][r] then ok <- false
-              | _ -> ()
+            if subRLive[subName][r] || (needN && subNLive[subName][r]) || subMNonLin[subName][r] then
+              ok <- false
           | None -> ()
         ok
       its, labels, isFree
@@ -2024,56 +2235,90 @@ let walkWith (yLimit: int) (items: (Item * int) array) =
             if ks[i] = ks[i - 1] + 1 then curSet <- curSet.Add ks[i]
             else rawIntervals.Add curSet; curSet <- Set.singleton ks[i]
           rawIntervals.Add curSet
-          let parts = ResizeArray<Set<int>>()
+          let mergeParts (parts: ResizeArray<Set<int>>) =
+            let usedPart = Array.create parts.Count false
+            let byOffsets = ResizeArray<(int * int * Reg * bool) array>()
+            for a in 0 .. parts.Count - 1 do
+              if not usedPart[a] then
+                let mutable merged = parts[a]
+                let mutable curSub = allAccs |> Array.filter (fun (_, k, _, _) -> merged.Contains k)
+                let mutable curSave = if valid curSub then groupSaving curSub else 0
+                for b in a + 1 .. parts.Count - 1 do
+                  if not usedPart[b] then
+                    let cand = Set.union merged parts[b]
+                    let candSub = allAccs |> Array.filter (fun (_, k, _, _) -> cand.Contains k)
+                    if valid candSub then
+                      let bSub = allAccs |> Array.filter (fun (_, k, _, _) -> parts[b].Contains k)
+                      let bSave = if valid bSub then groupSaving bSub else 0
+                      let candSave = groupSaving candSub
+                      if candSave >= curSave + bSave then
+                        merged <- cand
+                        curSub <- candSub
+                        curSave <- candSave
+                        usedPart[b] <- true
+                if valid curSub then
+                  usedPart[a] <- true
+                  byOffsets.Add curSub
+            byOffsets.ToArray()
+          let parts1 = ResizeArray<Set<int>>()
+          let topCap = max 1 maxRegs
+          let mutable globalDp = Array.create (topCap + 1) (0, [])
           for iv in rawIntervals do
             let arr = Set.toArray iv
             let m = arr.Length
-            let dp = Array.zeroCreate<int> (m + 1)
-            let choice = Array.create m -1
+            let dp1 = Array.zeroCreate<int> (m + 1)
+            let choice1 = Array.create m -1
+            let dp2 = Array2D.create (m + 1) (topCap + 1) (0, [])
             for p = m - 1 downto 0 do
-              let mutable bestScore = dp[p + 1]
-              let mutable bestQ = -1
+              let mutable bestScore1 = dp1[p + 1]
+              let mutable bestQ1 = -1
+              for k in 1 .. topCap do
+                dp2[p, k] <- dp2[p + 1, k]
               for q in p .. m - 1 do
                 let slice = Set.ofArray arr[p .. q]
-                let sub = allAccs |> Array.filter (fun (_, k, _, _) -> slice.Contains k)
+                let sub = allAccs |> Array.filter (fun (_, o, _, _) -> slice.Contains o)
                 if valid sub then
-                  let sc = groupSaving sub + dp[q + 1]
-                  if sc > bestScore then
-                    bestScore <- sc
-                    bestQ <- q
-              dp[p] <- bestScore
-              choice[p] <- bestQ
+                  let sc0 = groupSaving sub
+                  let sc1 = sc0 + dp1[q + 1]
+                  if sc1 > bestScore1 then
+                    bestScore1 <- sc1
+                    bestQ1 <- q
+                  for k in 1 .. topCap do
+                    let scRest, slicesRest = dp2[q + 1, k - 1]
+                    let curBest, _ = dp2[p, k]
+                    if sc0 + scRest > curBest then
+                      dp2[p, k] <- (sc0 + scRest, slice :: slicesRest)
+              dp1[p] <- bestScore1
+              choice1[p] <- bestQ1
             let mutable p = 0
             while p < m do
-              if choice[p] >= p then
-                parts.Add (Set.ofArray arr[p .. choice[p]])
-                p <- choice[p] + 1
+              if choice1[p] >= p then
+                parts1.Add (Set.ofArray arr[p .. choice1[p]])
+                p <- choice1[p] + 1
               else
-                parts.Add (Set.singleton arr[p])
+                parts1.Add (Set.singleton arr[p])
                 p <- p + 1
-          let usedPart = Array.create parts.Count false
-          let byOffsets = ResizeArray<(int * int * Reg * bool) array>()
-          for a in 0 .. parts.Count - 1 do
-            if not usedPart[a] then
-              let mutable merged = parts[a]
-              let mutable curSub = allAccs |> Array.filter (fun (_, k, _, _) -> merged.Contains k)
-              let mutable curSave = if valid curSub then groupSaving curSub else 0
-              for b in a + 1 .. parts.Count - 1 do
-                if not usedPart[b] then
-                  let cand = Set.union merged parts[b]
-                  let candSub = allAccs |> Array.filter (fun (_, k, _, _) -> cand.Contains k)
-                  if valid candSub then
-                    let bSub = allAccs |> Array.filter (fun (_, k, _, _) -> parts[b].Contains k)
-                    let bSave = if valid bSub then groupSaving bSub else 0
-                    let candSave = groupSaving candSub
-                    if candSave >= curSave + bSave then
-                      merged <- cand
-                      curSub <- candSub
-                      curSave <- candSave
-                      usedPart[b] <- true
-              if valid curSub then
-                usedPart[a] <- true
-                byOffsets.Add curSub
+            let nextGlobal = Array.copy globalDp
+            for kTot in 1 .. topCap do
+              let mutable bestSc, bestLst = nextGlobal[kTot]
+              for kIv in 1 .. kTot do
+                let scIv, lstIv = dp2[0, kIv]
+                if scIv > 0 then
+                  let scPrev, lstPrev = globalDp[kTot - kIv]
+                  if scPrev + scIv > bestSc then
+                    bestSc <- scPrev + scIv
+                    bestLst <- lstPrev @ lstIv
+              nextGlobal[kTot] <- (bestSc, bestLst)
+            globalDp <- nextGlobal
+          let chosenSlices = snd globalDp[topCap]
+          let covered = chosenSlices |> List.fold Set.union Set.empty
+          let parts2 = ResizeArray<Set<int>>()
+          for s in chosenSlices do parts2.Add s
+          for iv in rawIntervals do
+            for o in iv do
+              if not (covered.Contains o) then parts2.Add (Set.singleton o)
+          let offArr1 = mergeParts parts1
+          let offArr2 = mergeParts parts2
           let ordParts = ResizeArray<(int * int * Reg * bool) array>()
           let mutable p = 0
           while p < allAccs.Length do
@@ -2103,11 +2348,12 @@ let walkWith (yLimit: int) (items: (Item * int) array) =
                       curSave <- candSave
                       usedOrd[b] <- true
               byOrder.Add curSub
-          let offArr = byOffsets.ToArray()
+          let scoreTop (arr: (int * int * Reg * bool) array array) =
+            arr |> Array.map groupSaving |> Array.sortDescending |> Array.truncate topCap |> Array.sum
+          let offArr = if scoreTop offArr2 > scoreTop offArr1 then offArr2 else offArr1
           let ordArr = byOrder.ToArray()
-          let topCap = max 1 maxRegs
-          let offScore = offArr |> Array.map groupSaving |> Array.sortDescending |> Array.truncate topCap |> Array.sum
-          let ordScore = ordArr |> Array.map groupSaving |> Array.sortDescending |> Array.truncate topCap |> Array.sum
+          let offScore = scoreTop offArr
+          let ordScore = scoreTop ordArr
           if ordScore > offScore then ordArr else offArr
       groups |> Array.map (fun sub -> sub, groupSaving sub) |> Array.sortByDescending snd
 
@@ -2553,10 +2799,10 @@ let runWithY (p: Passes) (first: int) (temps: int) (yFirst: int) (yTemps: int) (
   if p.joins then
     step p.deadTemps (deadTempsFromY first temps yf yt)
     step p.forward (forwardWith p.accCopies false)
-    step p.copyForward copyForward
+    step p.copyForward (copyForwardWith true)
     step p.deadTemps (deadTempsFromY first temps yf yt)
   step p.hoist (hoistFromY first temps yf yt)
-  step p.copyForward copyForward
+  step p.copyForward (copyForwardWith true)
   step p.walk (walkWith yLim)
   step p.pack pack
   step p.rotate (rotate >> (if p.pack then pack else id))

@@ -1848,6 +1848,52 @@ module ImportAndClampForward =
   let kernel = Kernel.define "probe-import-and-clamp-forward" <@ init @> <@ trig @> <@ render @>
 
 
+/// A counted `while` loop accessing a region at `s.baseOff + i` through a helper (canonicalized to
+/// a `DO` loop with `x:(r1)+` post-increment), an outer local read twice across a 32-sample loop
+/// that yields `X1`/`Y1` to the loop's inner locals, and a two-sided clamp across `Bcc`.
+[<ReflectedDefinition>]
+module CountedWhileAndLoopYield =
+  type S =
+    { mutable baseOff : Frac
+      mutable z       : Frac }
+
+  let writeAt (s: S) (idx: Frac) (v: Frac) =
+    Region.write Scratch.x (Acc.hi (Acc.ofFrac s.baseOff + idx)) v
+
+  let readAt (s: S) (idx: Frac) =
+    Region.read Scratch.x (Acc.hi (Acc.ofFrac s.baseOff + idx))
+
+  let init (_: Banks.P) (s: S) =
+    s.baseOff <- Frac.ofRaw 4
+    s.z <- Frac.zero
+
+  let trig (_: Banks.P) (s: S) =
+    s.z <- Frac.zero
+
+  let render (p: Banks.P) (s: S) (out: Output) =
+    let outer1 = Acc.sat (p.a * p.b)
+    let outer2 = Acc.sat (p.c * p.d)
+    s.z <- Acc.sat (Acc.ofFrac outer1 + Acc.ofFrac outer2)
+    let mutable k = Frac.zero
+    while k <= Frac.ofRaw 15 do
+      writeAt s k (Acc.hi (Acc.ofFrac p.a + k))
+      k <- Acc.hi (Acc.ofFrac k + Frac.ofRaw 1)
+    for i in 0 .. 15 do
+      let x = readAt s (Frac.ofRaw i)
+      let u = Acc.sat (x * p.a + s.z * p.b)
+      let v = Acc.sat (u * p.c - x * p.d)
+      let raw = u * v + v * p.a
+      let hi = Acc.ofFrac (Frac.ofRaw 0x300000)
+      let lo = Acc.ofFrac (Frac.ofRaw -0x300000)
+      let c1 = if raw > hi then hi else raw
+      let c2 = if c1 < lo then lo else c1
+      out.Write (Acc.sat c2)
+      out.Write (Acc.sat (c2 + u * p.d))
+    s.z <- Acc.sat (Acc.ofFrac s.z + outer1 * outer2)
+
+  let kernel = Kernel.define "probe-counted-while-loop-yield" <@ init @> <@ trig @> <@ render @>
+
+
 let probeMachine =
   { Mds.machine "org.fsdsp56k.probe" "PROBE" "GND" "PR" with
       parameters = [| for n in [| "A"; "B"; "C"; "D" |] -> Mds.param n Mds.UnipolarQ23 |] }
@@ -2507,6 +2553,19 @@ let tests =
           Expect.isFalse (render |> Array.exists (fun l -> l.Contains "move    (r1)+")) "trailing move (r1)+ folded into x:(r1)+"
           Expect.isFalse (render |> Array.exists (fun l -> l.Contains ",a2")) "accumulator clamp needs no 3-word save/reload"
         conformance ImportAndClampForward.kernel 77
+      }
+      test "counted while loop canonicalization, loop register yielding, and two-sided clamp folding: compiled program equals the .NET kernel" {
+        needNative ()
+        match Optimize.compile Optimize.Peephole Kernel.mds CountedWhileAndLoopYield.kernel with
+        | Error e -> failtest e
+        | Ok c ->
+          let lines = c.items |> Array.map dsp56k.Print.item
+          let at (label: string) = Array.findIndex ((=) label) lines
+          let render = lines[at "RENDER:" + 1 ..]
+          let doIdxs = [| for i in 0 .. render.Length - 1 do if render[i].TrimStart().StartsWith "do " then i |]
+          Expect.equal doIdxs.Length 2 "while loop and for loop both compile to DO loops in RENDER"
+          Expect.isFalse (render |> Array.exists (fun l -> l.Contains "(r0+n0)")) "region while loop and for loop both step address registers without (r0+n0)"
+        conformance CountedWhileAndLoopYield.kernel 78
       }
       test "register locals read in both branches of an if: compiled program equals the .NET kernel" {
         needNative ()
