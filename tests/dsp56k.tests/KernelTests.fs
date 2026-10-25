@@ -2012,6 +2012,88 @@ module Step2Intrinsics =
   let runtimeMathKernel = Kernel.define "probe-step2-runtime-math" <@ init @> <@ trig @> <@ renderRuntimeMath @>
 
 
+/// Step 3 optimiser passes: `select` (branch diamonds over pure register/temporary updates lowered
+/// to branchless `Tcc`/`IfCc`), `tableWalk` (sequential `Table.read` and `Table.row` chained on
+/// `r0` via `p:(r0)+`/`p:(r0)-` and constant offset folding), and `narrow` (24-bit `Acc.ofFrac`
+/// webs narrowed to 1-word slots while preserving 56-bit product webs).
+[<ReflectedDefinition>]
+module Step3Optimiser =
+  let tbl =
+    Table.program "step3_tbl" [|
+      0x040000; 0x080000; 0x0c0000; 0x100000; 0x140000; 0x180000; 0x1c0000; 0x200000
+      0x240000; 0x280000; 0x2c0000; 0x300000; 0x340000; 0x380000; 0x3c0000; 0x400000
+      0x440000; 0x480000; 0x4c0000; 0x500000; 0x540000; 0x580000; 0x5c0000; 0x600000
+      0x640000; 0x680000; 0x6c0000; 0x700000; 0x740000; 0x780000; 0x7c0000; 0x7fffff
+    |]
+
+  type S =
+    { mutable w    : Frac
+      mutable acc  : Acc
+      mutable seed : Frac }
+
+  let init (_: Banks.P) (s: S) =
+    s.w <- Frac.zero
+    s.acc <- Acc.zero
+    s.seed <- Frac.ofRaw 0x13579b
+
+  let trig (_: Banks.P) (s: S) =
+    s.w <- Frac.zero
+    s.acc <- Acc.zero
+
+  let renderSelect (p: Banks.P) (s: S) (out: Output) =
+    let mutable v = s.w
+    let mutable seed = s.seed
+    for _ in 0 .. 31 do
+      seed <- Frac.lfsr 0xc20001 seed
+      let x = Acc.sat (seed * p.a + v * p.b)
+      let hi = if x > p.c then p.c else x
+      let clamped = if hi < p.d then p.d else hi
+      let mutable a = Acc.ofFrac clamped
+      if Frac.bit 0 seed then a <- -a
+      let stepped = Acc.sat a
+      v <- if stepped = Frac.zero then seed else stepped
+      out.Write v
+    s.w <- v
+    s.seed <- seed
+
+  let renderTableWalk (p: Banks.P) (s: S) (out: Output) =
+    let mutable acc = s.acc
+    for i in 0 .. 31 do
+      let idx = Acc.hi (Acc.andHi 0x03 (Acc.ofFrac p.a + Frac.ofRaw i))
+      let c0 = Table.row tbl 4 idx 0
+      let c1 = Table.row tbl 4 idx 1
+      let c2 = Table.row tbl 4 idx 2
+      let c3 = Table.row tbl 4 idx 3
+      let baseIdx = Acc.hi (Acc.andHi 0x0f (Acc.ofFrac p.b + Frac.ofRaw i))
+      let t0 = Table.read tbl baseIdx
+      let t1 = Table.read tbl (Acc.hi (Acc.ofFrac baseIdx + Frac.ofRaw 1))
+      let t2 = Table.read tbl (Acc.hi (Acc.ofFrac baseIdx + Frac.ofRaw 5))
+      let c5Idx = Acc.hi (Acc.andHi 0x0f (Acc.ofFrac p.c + Frac.ofRaw i))
+      let t5 = Table.read tbl (Acc.hi (Acc.ofFrac c5Idx + Frac.ofRaw 5))
+      acc <- Acc.sat (acc + c0 * p.a + c1 * p.b + c2 * p.c + c3 * p.d + t0 * t1 + Acc.ofFrac t2 + Acc.ofFrac t5) |> Acc.ofFrac
+      out.Write(Acc.sat acc)
+    s.acc <- acc
+
+  let renderNarrow (p: Banks.P) (s: S) (out: Output) =
+    let mutable v = s.w
+    for _ in 0 .. 31 do
+      let w1 = Acc.ofFrac p.a
+      let w2 = Acc.ofFrac p.b
+      let w3 = Acc.ofFrac p.c
+      let w4 = Acc.ofFrac p.d
+      let w5 = Acc.ofFrac v
+      let full56 = p.a * p.b + p.c * p.d
+      let comb = full56 + (w1 >>> 2) + (w2 >>> 3) - (w3 >>> 2) + (w4 >>> 3) + (w5 >>> 1)
+      let loWord = Acc.lo full56
+      v <- Acc.sat (comb + Acc.ofFrac loWord)
+      out.Write v
+    s.w <- v
+
+  let selectKernel    = Kernel.define "probe-step3-select" <@ init @> <@ trig @> <@ renderSelect @>
+  let tableWalkKernel = Kernel.define "probe-step3-table-walk" <@ init @> <@ trig @> <@ renderTableWalk @>
+  let narrowKernel    = Kernel.define "probe-step3-narrow" <@ init @> <@ trig @> <@ renderNarrow @>
+
+
 let probeMachine =
   { Mds.machine "org.fsdsp56k.probe" "PROBE" "GND" "PR" with
       parameters = [| for n in [| "A"; "B"; "C"; "D" |] -> Mds.param n Mds.UnipolarQ23 |] }
@@ -3022,5 +3104,62 @@ let tests =
         Expect.isFalse hasShift24 "zero 24-bit shifts emitted for Long.pack / Long.hi / Long.lo"
       needNative ()
       conformance Step2Intrinsics.longPackKernel 73
+    }
+
+    test "select pass: branch diamonds over pure register/temporary updates lower to branchless Tcc/IfCc, idempotent and equals the .NET kernel" {
+      match Optimize.compile Optimize.Peephole Kernel.mds Step3Optimiser.selectKernel with
+      | Error e -> failtest e
+      | Ok c ->
+        let lines = c.items |> Array.map dsp56k.Print.item
+        let at (label: string) = Array.findIndex ((=) label) lines
+        let render = lines[at "RENDER:" + 1 ..]
+        Expect.isTrue (c.items |> Array.exists (function dsp56k.Item.Op(dsp56k.Tcc _) -> true | _ -> false)) "emits Tcc conditional transfers"
+        Expect.isTrue (c.items |> Array.exists (function dsp56k.Item.Op(dsp56k.IfCc _) -> true | _ -> false)) "emits IfCc conditional ALU op"
+        Expect.isFalse (render |> Array.exists (fun l -> l.Contains "K_ELSE_")) "zero K_ELSE_ branch diamonds left in RENDER"
+        let zip = Array.zip c.items c.origins
+        let once = Optimize.select 0 c.xWorkset 0 c.yWorkset zip
+        let twice = Optimize.select 0 c.xWorkset 0 c.yWorkset once
+        Expect.equal (Array.map fst twice) (Array.map fst once) "select pass is idempotent"
+      needNative ()
+      conformance Step3Optimiser.selectKernel 79
+    }
+
+    test "tableWalk pass: sequential Table.row and Table.read chain on p:(r0)+ and fold constant offsets, idempotent and equals the .NET kernel" {
+      match Optimize.compile Optimize.Peephole Kernel.mds Step3Optimiser.tableWalkKernel with
+      | Error e -> failtest e
+      | Ok c ->
+        let lines = c.items |> Array.map dsp56k.Print.item
+        let at (label: string) = Array.findIndex ((=) label) lines
+        let render = lines[at "RENDER:" + 1 ..]
+        Expect.exists render (fun l -> l.Contains "p:(r0)+") "chains sequential table reads with p:(r0)+"
+        Expect.exists render (fun l -> l.Contains "lua" && l.Contains "(r0+$4),r0") "steps r0 by +4 across non-unit offset"
+        Expect.exists render (fun l -> l.Contains "+$5,a") "folds standalone constant index offset +5 into table base address"
+        let r0Loads = render |> Array.filter (fun l -> l.Contains ",r0" && not (l.TrimStart().StartsWith "lua")) |> Array.length
+        Expect.equal r0Loads 3 "one r0 setup for the 4-column row, one for the 3-tap read chain, and one for the standalone +5 read"
+        let zip = Array.zip c.items c.origins
+        let once = Optimize.tableWalk zip
+        let twice = Optimize.tableWalk once
+        Expect.equal (Array.map fst twice) (Array.map fst once) "tableWalk pass is idempotent"
+      needNative ()
+      conformance Step3Optimiser.tableWalkKernel 80
+    }
+
+    test "narrow pass: 24-bit Acc.ofFrac webs narrow to 1-word slots while 56-bit product webs keep a0/a2, idempotent and equals the .NET kernel" {
+      let countStores (c: Compile.Compiled) =
+        c.items |> Array.sumBy (function
+          | dsp56k.Item.Op(dsp56k.Par(_, moves)) ->
+            moves |> Array.filter (function dsp56k.Store(_, dsp56k.Space.X, _) -> true | _ -> false) |> Array.length
+          | _ -> 0)
+      match Optimize.compile (Optimize.Chosen { Optimize.Passes.all with narrow = false }) Kernel.mds Step3Optimiser.narrowKernel,
+            Optimize.compile Optimize.Peephole Kernel.mds Step3Optimiser.narrowKernel with
+      | Ok withoutNarrow, Ok withNarrow ->
+        Expect.isLessThan (countStores withNarrow) (countStores withoutNarrow) "narrow reduces X memory stores needed by 24-bit Acc.ofFrac temporaries"
+        let zip = Array.zip withNarrow.items withNarrow.origins
+        let once = Optimize.narrow 0 withNarrow.xWorkset zip
+        let twice = Optimize.narrow 0 withNarrow.xWorkset once
+        Expect.equal (Array.map fst twice) (Array.map fst once) "narrow pass is idempotent"
+      | Error e, _ | _, Error e -> failtest e
+      needNative ()
+      conformance Step3Optimiser.narrowKernel 81
     }
   ]

@@ -65,6 +65,9 @@ probe-step2-abs	machinedrum	ok	246	da808ecf0186cacd
 probe-step2-long-pack	machinedrum	ok	260	a5552ca8d649f028
 probe-step2-minmax	machinedrum	ok	278	c6f0167b62a24a13
 probe-step2-runtime-math	machinedrum	error	-	a65747f19b69b900	System.Math.Min is only supported on compile-time constants; for runtime DSP values use min, max, abs or Frac.Min / Frac.Max / Frac.Clamp (Acc.Min / Acc.Max / Acc.Clamp, Long.Min / Long.Max / Long.Clamp)
+probe-step3-narrow	machinedrum	ok	135	ee540be3b9e365ad
+probe-step3-select	machinedrum	ok	100	585952064dc7324f
+probe-step3-table-walk	machinedrum	ok	182	5c292e4d73f86999
 probe-stereo	machinedrum	error	-	0ff33fe26e5970df	probe-stereo: WritePair needs a stereo target, Machinedrum MDS has 1 channel(s)
 probe-subroutine-frames	machinedrum	ok	167	34a45b3706160ab4
 probe-subroutines	machinedrum	ok	198	de93bc8714176c96

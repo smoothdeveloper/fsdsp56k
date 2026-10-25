@@ -272,6 +272,7 @@ let ruleTests =
       let rFire = check "fire1001" <@ LintProbes.fire1001 @>
       let w1001 = rFire.warnings |> Array.filter (fun w -> w.id = "dsp-1001")
       Expect.isNonEmpty w1001 "dsp-1001 fires on manual comparison select"
+      Expect.isTrue (w1001 |> Array.forall (fun w -> w.optimiserCleaned)) "select pass cleans manual comparison select in fire1001"
       for w in w1001 do
         Expect.equal w.anchor "docs/lints.md#dsp-1001" "dsp-1001 anchor"
         Expect.isTrue (w.message.Contains "docs/lints.md#dsp-1001") "message includes anchor"
@@ -321,9 +322,11 @@ let ruleTests =
       Expect.isTrue (rClean.kudos |> Array.exists (fun k -> k.id = "dsp-k2001" && k.anchor = "docs/lints.md#dsp-2001")) "clean2001 earns dsp-k2001"
 
     testCase "dsp-3001 and dsp-k3001: branch diamond vs Tcc" <| fun () ->
-      let rFire = check "fire1001" <@ LintProbes.fire1001 @>
+      let rFire = checkWith { Lint.Options.defaults with kudos = true } "fire1001" <@ LintProbes.fire1001 @>
       let w3001 = rFire.warnings |> Array.filter (fun w -> w.id = "dsp-3001")
       Expect.isNonEmpty w3001 "dsp-3001 fires on short branch diamond"
+      Expect.isTrue (w3001 |> Array.forall (fun w -> w.optimiserCleaned)) "select pass lowers short branch diamond to Tcc in fire1001"
+      Expect.isTrue (rFire.kudos |> Array.exists (fun k -> k.id = "dsp-k3001" && k.anchor = "docs/lints.md#dsp-3001")) "select pass earns dsp-k3001 on manual comparison select"
       let rClean = checkWith { Lint.Options.defaults with kudos = true } "clean1001" <@ LintProbes.clean1001 @>
       Expect.isEmpty (rClean.warnings |> Array.filter (fun w -> w.id = "dsp-3001")) "clean1001 has no dsp-3001"
       Expect.isTrue (rClean.kudos |> Array.exists (fun k -> k.id = "dsp-k3001" && k.anchor = "docs/lints.md#dsp-3001")) "clean1001 earns dsp-k3001 from compiled Tcc"
