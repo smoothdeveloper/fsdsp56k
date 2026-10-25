@@ -438,7 +438,7 @@ let forwardWith (accCopies: bool) (keepTriples: bool) (items: (Item * int) array
         | Some k -> out.Add(k, line)
         | None -> ()
         i <- i + 1
-      | Op(Branch(Bcc _, _)) when accCopies && not keepTriples ->
+      | Op(Branch(Bcc _, _)) when accCopies ->
         out.Add(it, line)
         i <- i + 1
       | Op instr ->
@@ -639,16 +639,30 @@ let selectWith (allowScratch: bool) (first: int) (temps: int) (yFirst: int) (yTe
             | Imm(op, _) | Load(_, Abs op, _) | Store(_, _, Abs op) | Load(_, Disp(_, op), _) | Store(_, _, Disp(_, op)) ->
               for s in Expr.symbols op.expr do addRef s
             | _ -> ()
-        | AluImm(_, op, _) | MulI(_, _, op, _, _) ->
+        | AluImm(_, op, _) | MulI(_, _, op, _, _) | Lua(Disp(_, op), _) ->
           for s in Expr.symbols op.expr do addRef s
         | _ -> ()
+      | Dc ops ->
+        for ex in ops do
+          for s in Expr.symbols ex do addRef s
       | _ -> ()
     let single k = match fst cur[k] with Op(Par(None, [| m |])) -> Some m | _ -> None
     let isPatched k =
       k > 0 && (match fst cur[k - 1] with Comment t -> t.StartsWith machinedrum.Abi.markerPrefix | _ -> false)
+    let isUnrefLabel k =
+      match fst cur[k] with
+      | Label l ->
+        not (labelRefs.ContainsKey l)
+        && not (l.StartsWith "SUB_")
+        && l <> "INIT" && l <> "TRIG" && l <> "RENDER"
+      | _ -> false
     let prevNonComment start =
       let mutable k = start - 1
       while k >= 0 && (match fst cur[k] with Comment _ -> true | _ -> false) do k <- k - 1
+      k
+    let prevCode start =
+      let mutable k = start - 1
+      while k >= 0 && (match fst cur[k] with Comment _ -> true | _ -> isUnrefLabel k) do k <- k - 1
       k
     let nextNonComment start =
       let mutable k = start + 1
@@ -689,6 +703,7 @@ let selectWith (allowScratch: bool) (first: int) (temps: int) (yFirst: int) (yTe
         while p >= 0 && back.Count < 8 do
           match fst cur[p] with
           | Comment _ -> ()
+          | _ when isUnrefLabel p -> ()
           | _ -> back.Add p
           p <- p - 1
         let b = back.ToArray()
@@ -726,6 +741,88 @@ let selectWith (allowScratch: bool) (first: int) (temps: int) (yFirst: int) (yTe
                 accHoldsSlot srcAcc slotK (b[bi] - 1) (depth - 1)
               | _ -> false
         scan 0
+    // Check whether register `r` (e.g. `A1` or `B1`) holds 1-word memory slot `(sp, ea)` at item `atIdx`.
+    // Returns `Some(holdIdx, canDropStore)` when found.
+    let regHoldsMem (r: Reg) (sp: Space) (ea: Ea) (atIdx: int) =
+      if (Lower.eaWrites ea).Length > 0 || atIdx < 0 then None
+      else
+        let eaRegs = Lower.eaRegs ea
+        let isWs = (workset sp ea).IsSome
+        let back = ResizeArray<int>()
+        let mutable p = atIdx
+        while p >= 0 && back.Count < 8 do
+          match fst cur[p] with
+          | Comment _ -> ()
+          | _ when isUnrefLabel p -> ()
+          | _ -> back.Add p
+          p <- p - 1
+        let b = back.ToArray()
+        let mutable readBetween = false
+        let rec scan bi =
+          if bi >= b.Length then None
+          else
+            let idx = b[bi]
+            match single idx with
+            | Some(Store(srcR, sp', ea'))
+                when sp' = sp && ea' = ea
+                     && (srcR = r || (match accOf r with Some acc -> r = hi acc && srcR = acc | None -> false)) ->
+              Some(idx, not readBetween && srcR = r)
+            | Some(Load(sp', ea', dstR))
+                when sp' = sp && ea' = ea
+                     && (dstR = r || (match accOf r with Some acc -> r = hi acc && dstR = acc | None -> false)) ->
+              Some(idx, false)
+            | _ ->
+              match fst cur[idx] with
+              | Op instr ->
+                match writesOf instr with
+                | Some ws
+                    when not (ws |> Array.exists (overlap r))
+                         && not (eaRegs |> Array.exists (fun er -> ws |> Array.exists (overlap er))) ->
+                  let writesMem, readsMem =
+                    match instr with
+                    | Par(_, moves) ->
+                      let wm =
+                        moves |> Array.exists (function
+                          | Store(_, sp', ea') when sp' = sp ->
+                            if isWs && (workset sp' ea').IsSome then ea' = ea else true
+                          | _ -> false)
+                      let rm =
+                        moves |> Array.exists (function
+                          | Load(sp', ea', _) when sp' = sp ->
+                            if isWs && (workset sp' ea').IsSome then ea' = ea else true
+                          | _ -> false)
+                      wm, rm
+                    | _ -> false, false
+                  if writesMem then None
+                  else
+                    if readsMem then readBetween <- true
+                    scan (bi + 1)
+                | _ -> None
+              | _ -> None
+        scan 0
+    // Search up to `maxBack` code instructions before `startIdx` (inclusive of `startIdx` in the moved-across span)
+    // for an instruction `p` satisfying `pred p`, ensuring all instructions in `p + 1 .. startIdx` do not read
+    // `avoidReads` or write `avoidWrites`.
+    let findSetup (startIdx: int) (maxBack: int) (avoidReads: Reg list) (avoidWrites: Reg list) (pred: int -> bool) =
+      let rec loop curIdx steps mid =
+        if steps > maxBack || curIdx < 0 then None
+        else
+          let p = prevCode curIdx
+          if p < 0 then None
+          else
+            let curSafe =
+              match fst cur[curIdx] with
+              | Op instr ->
+                match readsOf instr, writesOf instr with
+                | Some rs, Some ws ->
+                  not (avoidReads |> List.exists (fun ar -> rs |> Array.exists (overlap ar)))
+                  && not (avoidWrites |> List.exists (fun aw -> ws |> Array.exists (overlap aw)))
+                | _ -> false
+              | _ -> false
+            if not curSafe then None
+            elif pred p then Some(p, curIdx :: mid)
+            else loop p (steps + 1) (curIdx :: mid)
+      loop startIdx 1 []
     let pickScratch (afterIdx: int) (avoid: Reg list) (checkReadIndices: int list) =
       if not allowScratch then None
       else
@@ -746,6 +843,8 @@ let selectWith (allowScratch: bool) (first: int) (temps: int) (yFirst: int) (yTe
     let touched = HashSet<int>()
     let canTouch (indices: int list) =
       indices |> List.forall (fun k -> k >= 0 && k < n && not (touched.Contains k) && not (isPatched k))
+    let notTouched (indices: int list) =
+      indices |> List.forall (fun k -> k >= 0 && k < n && not (touched.Contains k))
     let markTouched (indices: int list) =
       for k in indices do touched.Add k |> ignore
     for i in 0 .. n - 1 do
@@ -807,24 +906,63 @@ let selectWith (allowScratch: bool) (first: int) (temps: int) (yFirst: int) (yTe
               match (if body.Length = 4 then matchTripleStore body 1 else None) with
               | Some(slotK, srcAcc, _) ->
                 let cmpIdx = prevNonComment i
-                if cmpIdx >= 0 && accHoldsSlot srcAcc slotK cmpIdx 2 then
-                  let srcAccDst = toAcc srcAcc
+                let srcAccDst = toAcc srcAcc
+                let oAcc = otherAcc srcAcc
+                let oAccDst = toAcc oAcc
+                // Either `srcAcc` holds `slotK` at `cmpIdx`, or `loadIdx; cmpIdx` loaded & tested `srcAcc` while `oAcc` is free
+                let redirectPlan =
+                  if cmpIdx >= 0 && accHoldsSlot srcAcc slotK cmpIdx 2 then
+                    Some []
+                  elif cmpIdx >= 0 then
+                    let loadIdx = prevCode cmpIdx
+                    if loadIdx >= 0
+                       && canTouch [ loadIdx; cmpIdx ]
+                       && accHoldsSlot srcAcc slotK (prevCode loadIdx) 2
+                       && deadAfter cur (lblIdx + 1) srcAcc
+                       && deadAfter cur (lblIdx + 1) oAcc then
+                      let loadRew =
+                        match single loadIdx with
+                        | Some(Load(spL, eaL, dL)) when dL = srcAcc ->
+                          Some(Op(Par(None, [| Load(spL, eaL, oAcc) |])), snd cur[loadIdx])
+                        | Some(Copy(sL, dL)) when dL = srcAcc && not (overlap sL oAcc) ->
+                          Some(Op(Par(None, [| Copy(sL, oAcc) |])), snd cur[loadIdx])
+                        | _ -> None
+                      let cmpRew =
+                        match fst cur[cmpIdx] with
+                        | Op(Par(Some(Unary(AluUnary.Tst, cAcc)), [||])) when Acc.reg cAcc = srcAcc ->
+                          Some(Op(Par(Some(Unary(AluUnary.Tst, oAccDst)), [||])), snd cur[cmpIdx])
+                        | Op(Par(Some(Binary(AluOp.Cmp, cmpReg, cAcc)), [||])) when Acc.reg cAcc = srcAcc && not (overlap cmpReg oAcc) ->
+                          Some(Op(Par(Some(Binary(AluOp.Cmp, cmpReg, oAccDst)), [||])), snd cur[cmpIdx])
+                        | Op(AluImm(CmpI, cmpOp, cAcc)) when Acc.reg cAcc = srcAcc ->
+                          Some(Op(AluImm(CmpI, cmpOp, oAccDst)), snd cur[cmpIdx])
+                        | _ -> None
+                      match loadRew, cmpRew with
+                      | Some lr, Some cr -> Some [ loadIdx, [ lr ]; cmpIdx, [ cr ] ]
+                      | _ -> None
+                    else None
+                  else None
+                match redirectPlan with
+                | Some rewrites ->
+                  let extraIdx = List.map fst rewrites
+                  let applyRewrites () =
+                    for idx, items' in rewrites do replaced[idx] <- items'
                   match fst cur[body[0]] with
                   | Op(Par(None, [| Copy(((X0 | X1 | Y0 | Y1) as s), d) |])) when d = srcAcc ->
+                    let span = extraIdx @ [ i; body[0]; lblIdx ]
+                    if canTouch span then
+                      markTouched (span @ [ body[1]; body[2]; body[3] ])
+                      applyRewrites ()
+                      replaced[i] <- [ Op(Tcc(tccCond, Some(s, srcAccDst), None)), mergedOrig ]
+                      replaced[body[0]] <- []
+                      replaced[lblIdx] <- []
+                  | Op(Par(Some(Binary(AluOp.Tfr, ((A | B) as s), d)), [||])) when Acc.reg d = srcAcc && s <> srcAcc && rewrites.IsEmpty ->
                     let span = [ i; body[0]; lblIdx ]
                     if canTouch span then
                       markTouched (span @ [ body[1]; body[2]; body[3] ])
                       replaced[i] <- [ Op(Tcc(tccCond, Some(s, srcAccDst), None)), mergedOrig ]
                       replaced[body[0]] <- []
                       replaced[lblIdx] <- []
-                  | Op(Par(Some(Binary(AluOp.Tfr, ((A | B) as s), d)), [||])) when Acc.reg d = srcAcc && s <> srcAcc ->
-                    let span = [ i; body[0]; lblIdx ]
-                    if canTouch span then
-                      markTouched (span @ [ body[1]; body[2]; body[3] ])
-                      replaced[i] <- [ Op(Tcc(tccCond, Some(s, srcAccDst), None)), mergedOrig ]
-                      replaced[body[0]] <- []
-                      replaced[lblIdx] <- []
-                  | Op(Par(None, [| Imm(op, d) |])) when allowScratch && d = srcAcc && (op.force = Long || immValue op = Some 0L) ->
+                  | Op(Par(None, [| Imm(op, d) |])) when allowScratch && rewrites.IsEmpty && d = srcAcc && (op.force = Long || immValue op = Some 0L) ->
                     match fst cur[cmpIdx] with
                     | Op(AluImm(CmpI, cmpOp, cAcc)) when immValue cmpOp = immValue op && cmpOp.expr = op.expr ->
                       match pickScratch (lblIdx + 1) [] [] with
@@ -851,10 +989,10 @@ let selectWith (allowScratch: bool) (first: int) (temps: int) (yFirst: int) (yTe
                         replaced[body[0]] <- []
                         replaced[lblIdx] <- []
                       | _ -> ()
-                  | Op(Par(Some(Unary(AluUnary.Clr, clrDst)), [||])) when allowScratch && Acc.reg clrDst = srcAcc ->
-                    let span = [ cmpIdx; i; body[0]; lblIdx ]
+                  | Op(Par(Some(Unary(AluUnary.Clr, clrDst)), [||])) when Acc.reg clrDst = srcAcc ->
+                    let span = extraIdx @ [ cmpIdx; i; body[0]; lblIdx ] |> List.distinct
                     if canTouch span then
-                      match pickScratch (lblIdx + 1) [] [ cmpIdx ] with
+                      match (if rewrites.IsEmpty then pickScratch (lblIdx + 1) [] [ cmpIdx ] else None) with
                       | Some tmp ->
                         markTouched (span @ [ body[1]; body[2]; body[3] ])
                         replaced[cmpIdx] <-
@@ -864,11 +1002,21 @@ let selectWith (allowScratch: bool) (first: int) (temps: int) (yFirst: int) (yTe
                         replaced[body[0]] <- []
                         replaced[lblIdx] <- []
                       | None ->
-                        markTouched [ i; body[0]; body[1]; body[2]; body[3]; lblIdx ]
+                        markTouched (extraIdx @ [ i; body[0]; body[1]; body[2]; body[3]; lblIdx ])
+                        applyRewrites ()
                         replaced[i] <- [ Op(IfCc(Unary(AluUnary.Clr, srcAccDst), tccCond, false)), mergedOrig ]
                         replaced[body[0]] <- []
                         replaced[lblIdx] <- []
+                  | Op(Par(Some(Unary(AluUnary.Neg, negDst)), [||])) when Acc.reg negDst = srcAcc ->
+                    let span = extraIdx @ [ i; body[0]; lblIdx ]
+                    if canTouch span then
+                      markTouched (span @ [ body[1]; body[2]; body[3] ])
+                      applyRewrites ()
+                      replaced[i] <- [ Op(IfCc(Unary(AluUnary.Neg, srcAccDst), tccCond, false)), mergedOrig ]
+                      replaced[body[0]] <- []
+                      replaced[lblIdx] <- []
                   | _ -> ()
+                | None -> ()
               | None when allowScratch ->
                 // Pattern B (body.Length = 1) and Pattern C (body.Length = 2 or 3)
                 if body.Length = 1 then
@@ -890,13 +1038,13 @@ let selectWith (allowScratch: bool) (first: int) (temps: int) (yFirst: int) (yTe
                       replaced[lblIdx] <- []
                   | Op(Par(None, [| Load(sp, ea, ((A | B) as d)) |])) when (Lower.eaWrites ea).Length = 0 ->
                     let cmpIdx = prevNonComment i
-                    let loadIdx = if cmpIdx >= 0 then prevNonComment cmpIdx else -1
+                    let loadIdx = if cmpIdx >= 0 then prevCode cmpIdx else -1
                     if loadIdx >= 0 then
                       match single loadIdx, fst cur[cmpIdx] with
                       | Some(Load(sp', ea', ((X0 | X1 | Y0 | Y1) as s))), Op(Par(Some(Binary(AluOp.Cmp, s', _)), [||]))
                           when sp = sp' && ea = ea' && s = s' ->
                         let span = [ i; bIdx; lblIdx ]
-                        if canTouch span then
+                        if canTouch span && notTouched [ loadIdx; cmpIdx ] then
                           markTouched (loadIdx :: cmpIdx :: span)
                           replaced[i] <- [ Op(Tcc(tccCond, Some(s, toAcc d), None)), mergedOrig ]
                           replaced[bIdx] <- []
@@ -947,17 +1095,52 @@ let selectWith (allowScratch: bool) (first: int) (temps: int) (yFirst: int) (yTe
                         replaced[i] <- [ Op(IfCc(Unary(AluUnary.Clr, d), tccCond, false)), mergedOrig ]
                         replaced[bIdx] <- []
                         replaced[lblIdx] <- []
-                  | Op(Par(Some(Unary(AluUnary.Neg, d)), [||])) ->
+                  | Op(Par(Some((Unary((AluUnary.Neg | AluUnary.Asr | AluUnary.Asl | AluUnary.Lsr | AluUnary.Lsl | AluUnary.Abs | AluUnary.Not), _)
+                                | Binary((AluOp.Add | AluOp.Sub), _, _)) as alu), [||]))
+                      when Lower.encodes (IfCc(alu, tccCond, false)) ->
                     let span = [ i; bIdx; lblIdx ]
                     if canTouch span then
                       markTouched span
-                      replaced[i] <- [ Op(IfCc(Unary(AluUnary.Neg, d), tccCond, false)), mergedOrig ]
+                      replaced[i] <- [ Op(IfCc(alu, tccCond, false)), mergedOrig ]
                       replaced[bIdx] <- []
                       replaced[lblIdx] <- []
+                  | Op(Par(None, [| Store(srcR, sp, ea) |])) when (workset sp ea).IsSome ->
+                    let cmpIdx = prevNonComment i
+                    if cmpIdx >= 0 then
+                      match fst cur[cmpIdx] with
+                      // `move #$0,zReg; move zReg,ea; tst a; Bcc cond lbl; move a,ea; lbl:`
+                      | Op(Par(Some(Unary(AluUnary.Tst, cAcc)), [||]))
+                          when (srcR = Acc.reg cAcc || srcR = hi (Acc.reg cAcc))
+                               && deadAfter cur (lblIdx + 1) (Acc.reg cAcc) ->
+                        let stIdx = prevCode cmpIdx
+                        if stIdx >= 0 then
+                          match single stIdx with
+                          | Some(Store(((X0 | X1 | Y0 | Y1) as zReg), sp', ea'))
+                              when sp' = sp && ea' = ea && canTouch [ stIdx; i; bIdx; lblIdx ] && notTouched [ cmpIdx ] ->
+                            markTouched [ stIdx; cmpIdx; i; bIdx; lblIdx ]
+                            replaced[stIdx] <- []
+                            replaced[i] <- [ Op(Tcc(cond, Some(zReg, cAcc), None)), mergedOrig ]
+                            replaced[lblIdx] <- []
+                          | _ -> ()
+                      // `move ea,a; cmp x1,a; Bcc cond lbl; move x1,ea; lbl:`
+                      | Op(Par(Some(Binary(AluOp.Cmp, sReg, cAcc)), [||]))
+                          when sReg = srcR && isDataReg srcR && deadAfter cur (lblIdx + 1) (Acc.reg cAcc) ->
+                        let cHi = hi (Acc.reg cAcc)
+                        match regHoldsMem cHi sp ea cmpIdx with
+                        | Some(holdIdx, canDrop) ->
+                          let dropList = if canDrop && canTouch [ holdIdx ] then [ holdIdx ] else []
+                          if canTouch (dropList @ [ i; bIdx; lblIdx ]) && notTouched [ cmpIdx ] then
+                            markTouched (dropList @ [ cmpIdx; i; bIdx; lblIdx ])
+                            for dIdx in dropList do replaced[dIdx] <- []
+                            replaced[i] <- [ Op(Tcc(tccCond, Some(srcR, cAcc), None)), mergedOrig ]
+                            replaced[bIdx] <- [ Op(Par(None, [| Store(cHi, sp, ea) |])), bodyOrig ]
+                            replaced[lblIdx] <- []
+                        | None -> ()
+                      | _ -> ()
                   | Op(Par(None, [| Imm(op, ((X0 | X1 | Y0 | Y1) as dstReg)) |]))
                       when op.force = Long || immValue op = Some 0L ->
                     let cmpIdx = prevNonComment i
-                    let prevIdx = if cmpIdx >= 0 then prevNonComment cmpIdx else -1
+                    let prevIdx = if cmpIdx >= 0 then prevCode cmpIdx else -1
                     if prevIdx >= 0 then
                       match fst cur[cmpIdx] with
                       | Op(AluImm(CmpI, cmpOp, cAcc))
@@ -970,7 +1153,7 @@ let selectWith (allowScratch: bool) (first: int) (temps: int) (yFirst: int) (yTe
                         match single prevIdx with
                         // Case B6a: `move a1,dstReg` or `tfr a,b; move b1,dstReg` before `cmp #op,a`
                         | Some(Copy(srcHi, dstReg')) when dstReg' = dstReg && (srcHi = cHi || srcHi = oHi) ->
-                          let prev2Idx = prevNonComment prevIdx
+                          let prev2Idx = prevCode prevIdx
                           let validCopy =
                             if srcHi = cHi then Some []
                             elif prev2Idx >= 0 then
@@ -1004,7 +1187,7 @@ let selectWith (allowScratch: bool) (first: int) (temps: int) (yFirst: int) (yTe
                           | _ -> ()
                         // Case B6b: `[move initSrc,dstReg;] move dstReg,a; cmp #op,a; Bcc lbl; move #>op,dstReg; lbl:`
                         | Some(Copy(dstReg', cReg')) when dstReg' = dstReg && cReg' = cReg ->
-                          let prev2Idx = prevNonComment prevIdx
+                          let prev2Idx = prevCode prevIdx
                           let initCopy =
                             if prev2Idx >= 0 then
                               match single prev2Idx with
@@ -1043,11 +1226,54 @@ let selectWith (allowScratch: bool) (first: int) (temps: int) (yFirst: int) (yTe
                               if dropNextLoad then replaced[nxIdx] <- []
                             | _ -> ()
                         | _ -> ()
+                      // Case B6c: `[setup dstReg/a;] tst a; Bcc lbl; move #$0,dstReg; lbl:` -> `clr a ifcc; [move a1,dstReg]`
+                      | Op(Par(Some(Unary(AluUnary.Tst, cAcc)), [||]))
+                          when immValue op = Some 0L && deadAfter cur (lblIdx + 1) (Acc.reg cAcc) ->
+                        let cReg = Acc.reg cAcc
+                        let cHi = hi cReg
+                        let setupPrevIdx = prevCode prevIdx
+                        let setupPlan =
+                          match single prevIdx with
+                          | Some(Copy(srcHi, dstReg')) when dstReg' = dstReg && srcHi = cHi ->
+                            Some([ prevIdx ], [ prevIdx ])
+                          | Some(Copy(dstReg', cReg')) when dstReg' = dstReg && cReg' = cReg ->
+                            Some([ prevIdx ], [])
+                          | Some(Copy(initSrc, cReg')) when cReg' = cReg && isDataReg initSrc && setupPrevIdx >= 0 ->
+                            match single setupPrevIdx with
+                            | Some(Copy(initSrc', dstReg')) when initSrc' = initSrc && dstReg' = dstReg ->
+                              Some([ setupPrevIdx; prevIdx ], [ setupPrevIdx ])
+                            | _ -> None
+                          | Some(Copy(initSrc, dstReg')) when dstReg' = dstReg && isDataReg initSrc && setupPrevIdx >= 0 ->
+                            match single setupPrevIdx with
+                            | Some(Copy(initSrc', cReg')) when initSrc' = initSrc && cReg' = cReg ->
+                              Some([ setupPrevIdx; prevIdx ], [ prevIdx ])
+                            | _ -> None
+                          | _ -> None
+                        match setupPlan with
+                        | Some(setupIndices, dropIndices)
+                            when canTouch (setupIndices @ [ i; bIdx; lblIdx ]) && notTouched [ cmpIdx ] ->
+                          let nxIdx = nextNonComment lblIdx
+                          let dropNextLoad =
+                            nxIdx < n
+                            && single nxIdx = Some(Copy(dstReg, cReg))
+                            && canTouch [ nxIdx ]
+                          let afterIdx = if dropNextLoad then nxIdx + 1 else lblIdx + 1
+                          markTouched (setupIndices @ [ cmpIdx; i; bIdx; lblIdx ] @ (if dropNextLoad then [ nxIdx ] else []))
+                          for dIdx in dropIndices do replaced[dIdx] <- []
+                          replaced[i] <-
+                            [ yield Op(IfCc(Unary(AluUnary.Clr, cAcc), tccCond, false)), mergedOrig
+                              if not (deadAfter cur afterIdx dstReg) then
+                                yield Op(Par(None, [| Copy(cHi, dstReg) |])), bodyOrig ]
+                          replaced[bIdx] <- []
+                          replaced[lblIdx] <- []
+                          if dropNextLoad then replaced[nxIdx] <- []
+                        | _ -> ()
                       | _ -> ()
                   | Op(Par(None, [| (Copy(_, ((X0 | X1 | Y0 | Y1) as dstReg)) | Load(_, _, ((X0 | X1 | Y0 | Y1) as dstReg))) as bMove |])) ->
-                    // `[setup dstReg/a;] [load srcReg;] (cmp srcReg,a | tst a); Bcc lbl; (move srcReg,dstReg | move ea,dstReg); lbl:`
+                    // `[setup dstReg/a;] [load srcReg;] (cmp srcReg,a | tst a | btst #b,reg); Bcc lbl; (move srcReg,dstReg | move ea,dstReg); lbl:`
                     let cmpIdx = prevNonComment i
                     if cmpIdx >= 0 then
+                      let p1 = prevCode cmpIdx
                       let cmpInfo =
                         match fst cur[cmpIdx], bMove with
                         | Op(Par(Some(Binary(AluOp.Cmp, ((X0 | X1 | Y0 | Y1) as srcReg), cAcc)), [||])), _
@@ -1056,12 +1282,18 @@ let selectWith (allowScratch: bool) (first: int) (temps: int) (yFirst: int) (yTe
                         | Op(Par(Some(Unary(AluUnary.Tst, cAcc)), [||])), Copy(((X0 | X1 | Y0 | Y1) as srcReg), _)
                             when srcReg <> dstReg && deadAfter cur (lblIdx + 1) (Acc.reg cAcc) ->
                           Some(srcReg, cAcc, false)
+                        | Op(BitOp(Btst, _, BitReg bitR)), Copy(((X0 | X1 | Y0 | Y1) as srcReg), _)
+                            when srcReg <> dstReg && not (overlap bitR dstReg) && p1 >= 0 ->
+                          match single p1 with
+                          | Some(Copy((A1 | B1) as cHi, dstReg')) when dstReg' = dstReg ->
+                            let cReg = if cHi = A1 then A else B
+                            if deadAfter cur (lblIdx + 1) cReg then Some(srcReg, toAcc cReg, false) else None
+                          | _ -> None
                         | _ -> None
                       match cmpInfo with
                       | Some(srcReg, cAcc, isCmp) ->
                         let cReg = Acc.reg cAcc
                         let cHi = hi cReg
-                        let p1 = prevNonComment cmpIdx
                         let srcLoadOpt =
                           if not isCmp || p1 < 0 then None
                           else
@@ -1076,14 +1308,14 @@ let selectWith (allowScratch: bool) (first: int) (temps: int) (yFirst: int) (yTe
                         let bMatches, setupIdx, midSpan =
                           match bMove, srcLoadOpt with
                           | Copy(s, _), Some(sIdx, _) when s = srcReg ->
-                            true, prevNonComment sIdx, [ sIdx; cmpIdx ]
+                            true, prevCode sIdx, [ sIdx; cmpIdx ]
                           | Copy(s, _), None when s = srcReg ->
                             true, p1, [ cmpIdx ]
                           | Load(sp, ea, _), Some(sIdx, Some(sp', ea')) when sp = sp' && ea = ea' ->
-                            true, prevNonComment sIdx, [ sIdx; cmpIdx ]
+                            true, prevCode sIdx, [ sIdx; cmpIdx ]
                           | _ -> false, -1, []
                         if bMatches && setupIdx >= 0 then
-                          let setupPrevIdx = prevNonComment setupIdx
+                          let setupPrevIdx = prevCode setupIdx
                           let setupPlan =
                             match single setupIdx with
                             | Some(Copy(srcHi, dstReg')) when dstReg' = dstReg && srcHi = cHi ->
@@ -1103,7 +1335,7 @@ let selectWith (allowScratch: bool) (first: int) (temps: int) (yFirst: int) (yTe
                             | _ -> None
                           match setupPlan with
                           | Some(setupIndices, dropIndices, rewriteIndices)
-                              when canTouch (setupIndices @ [ i; bIdx; lblIdx ]) ->
+                              when canTouch (setupIndices @ [ i; bIdx; lblIdx ]) && notTouched midSpan ->
                             let nxIdx = nextNonComment lblIdx
                             let dropNextLoad =
                               nxIdx < n
@@ -1125,113 +1357,390 @@ let selectWith (allowScratch: bool) (first: int) (temps: int) (yFirst: int) (yTe
                   | _ -> ()
                 elif body.Length = 2 then
                   let b0, b1 = body[0], body[1]
+                  let cmpIdx = prevNonComment i
+                  // Helper for b1 transferring accumulator `d` to `dst` (`Copy(hi d | d, dstReg)` or `Tfr(d, dstAcc)`)
+                  let b1Transfer (d: Reg) =
+                    match fst cur[b1] with
+                    | Op(Par(None, [| Copy(dSrc, ((X0 | X1 | Y0 | Y1) as dstReg)) |])) when dSrc = hi d || dSrc = d ->
+                      Some(dstReg, Copy( dstReg, d ))
+                    | Op(Par(Some(Binary(AluOp.Tfr, sAcc, dstAcc)), [||])) when sAcc = d && Acc.reg dstAcc <> d ->
+                      Some(Acc.reg dstAcc, Binary(AluOp.Tfr, Acc.reg dstAcc, toAcc d) |> fun a -> Copy(Acc.reg dstAcc, d))
+                    | _ -> None
+                  let matchNextReload (d: Reg) (dst: Reg) (nxIdx: int) =
+                    if nxIdx >= n || not (canTouch [ nxIdx ]) || not (deadAfter cur (nxIdx + 1) dst) then false
+                    elif isDataReg dst then
+                      single nxIdx = Some(Copy(dst, d)) && deadAfter cur (lblIdx + 1) d
+                    else
+                      fst cur[nxIdx] = Op(Par(Some(Binary(AluOp.Tfr, dst, toAcc d)), [||])) && deadAfter cur (lblIdx + 1) d
+                  let findMatchingSetup (d: Reg) (dst: Reg) =
+                    match findSetup cmpIdx 3 [ dst ] [ d; dst ] (fun p -> fst cur[p] = fst cur[b1]) with
+                    | Some(setupIdx, mid) -> Some([ setupIdx ], mid)
+                    | None ->
+                      // Also match 2-step copy `Copy(dSrc, tmpR); Copy(tmpR, dstReg)` before `cmpIdx`
+                      match fst cur[b1] with
+                      | Op(Par(None, [| Copy(dSrc, dstReg) |])) when isDataReg dstReg ->
+                        match findSetup cmpIdx 3 [ dst ] [ d; dst ] (fun p ->
+                          let pPrev = prevCode p
+                          pPrev >= 0
+                          && (match single pPrev, single p with
+                              | Some(Copy(dSrc', tmpR)), Some(Copy(tmpR', dstReg'))
+                                  when dSrc' = dSrc && tmpR' = tmpR && dstReg' = dstReg && isDataReg tmpR && deadAfter cur (p + 1) tmpR -> true
+                              | _ -> false)) with
+                        | Some(p, mid) -> Some([ prevCode p; p ], mid)
+                        | None -> None
+                      | _ -> None
                   match fst cur[b0], fst cur[b1] with
                   // Pattern C1: `move a,ea; tst a; bge lbl; move #$0,x0; move x0,ea; lbl:`
                   | Op(Par(None, [| Imm({ expr = Num 0L }, ((X0 | X1 | Y0 | Y1) as zReg)) |])),
                     Op(Par(None, [| Store(zReg', sp, ea) |]))
-                      when zReg' = zReg && (workset sp ea).IsSome ->
-                    let tstIdx = prevNonComment i
-                    let stIdx = if tstIdx >= 0 then prevNonComment tstIdx else -1
+                      when zReg' = zReg && (workset sp ea).IsSome && cmpIdx >= 0 ->
+                    let tstIdx = cmpIdx
+                    let stIdx = prevCode tstIdx
                     if stIdx >= 0 then
                       match single stIdx, fst cur[tstIdx] with
                       | Some(Store(srcR, sp', ea')), Op(Par(Some(Unary(AluUnary.Tst, cAcc)), [||]))
                           when sp' = sp && ea' = ea
                                && (srcR = Acc.reg cAcc || srcR = hi (Acc.reg cAcc))
                                && deadAfter cur (lblIdx + 1) (Acc.reg cAcc)
-                               && deadAfter cur (lblIdx + 1) zReg ->
-                        let span = [ stIdx; tstIdx; i; b0; b1; lblIdx ]
-                        if canTouch span then
-                          markTouched span
-                          replaced[stIdx] <- [ Op(Par(None, [| Imm({ expr = Num 0L; force = Auto }, zReg) |])), snd cur[b0] ]
-                          replaced[i] <- [ Op(Tcc(tccCond, Some(zReg, cAcc), None)), mergedOrig ]
-                          replaced[b0] <- [ Op(Par(None, [| Store(srcR, sp, ea) |])), Ir.Origin.merge (snd cur[stIdx]) (snd cur[b1]) ]
+                               && deadAfter cur (lblIdx + 1) zReg
+                               && canTouch [ stIdx; tstIdx; i; b0; b1; lblIdx ] ->
+                        markTouched [ stIdx; tstIdx; i; b0; b1; lblIdx ]
+                        replaced[stIdx] <- [ Op(Par(None, [| Imm({ expr = Num 0L; force = Auto }, zReg) |])), snd cur[b0] ]
+                        replaced[i] <- [ Op(Tcc(tccCond, Some(zReg, cAcc), None)), mergedOrig ]
+                        replaced[b0] <- [ Op(Par(None, [| Store(srcR, sp, ea) |])), Ir.Origin.merge (snd cur[stIdx]) (snd cur[b1]) ]
+                        replaced[b1] <- []
+                        replaced[lblIdx] <- []
+                      | _ -> ()
+                  | _ -> ()
+                  if not (touched.Contains i) && cmpIdx >= 0 then
+                    match fst cur[b0] with
+                    // Pattern C2a: `setup(d -> dst); ...; cmp #op,d; Bcc lbl; move #>op,d; b1(d -> dst); lbl:`
+                    | Op(Par(None, [| Imm(op, ((A | B) as d)) |]))
+                        when op.force = Long || immValue op = Some 0L ->
+                      match b1Transfer d, fst cur[cmpIdx] with
+                      | Some(dst, _), Op(AluImm(CmpI, cmpOp, cAcc))
+                          when Acc.reg cAcc = d && immValue cmpOp = immValue op && cmpOp.expr = op.expr ->
+                        match findMatchingSetup d dst with
+                        | Some(setupIndices, mid) ->
+                          let avoidRegs = if isDataReg dst then [ dst ] else []
+                          match pickScratch (lblIdx + 1) avoidRegs mid with
+                          | Some tmp when canTouch (setupIndices @ [ cmpIdx; i; b0; b1; lblIdx ]) && notTouched mid ->
+                            let nxIdx = nextNonComment lblIdx
+                            let dropNextLoad = matchNextReload d dst nxIdx
+                            markTouched (setupIndices @ mid @ [ i; b0; b1; lblIdx ] @ (if dropNextLoad then [ nxIdx ] else []))
+                            let immOp = { op with force = if immValue op = Some 0L then Auto else Long }
+                            for sIdx in setupIndices do replaced[sIdx] <- []
+                            replaced[cmpIdx] <-
+                              [ Op(Par(None, [| Imm(immOp, tmp) |])), snd cur[b0]
+                                Op(Par(Some(Binary(AluOp.Cmp, tmp, cAcc)), [||])), snd cur[cmpIdx] ]
+                            replaced[i] <-
+                              [ yield Op(Tcc(tccCond, Some(tmp, cAcc), None)), mergedOrig
+                                if not dropNextLoad && not (deadAfter cur (lblIdx + 1) dst) then
+                                  yield cur[b1] ]
+                            replaced[b0] <- []
+                            replaced[b1] <- []
+                            replaced[lblIdx] <- []
+                            if dropNextLoad then replaced[nxIdx] <- []
+                          | _ -> ()
+                        | None -> ()
+                      | _ -> ()
+                    | _ -> ()
+                  if not (touched.Contains i) && cmpIdx >= 0 then
+                    let b0CopyOrTfr =
+                      match fst cur[b0] with
+                      | Op(Par(None, [| Copy(((X0 | X1 | Y0 | Y1) as src), ((A | B) as d)) |])) -> Some(src, d)
+                      | Op(Par(Some(Binary(AluOp.Tfr, ((A | B) as src), dAcc)), [||])) when Acc.reg dAcc <> src -> Some(src, Acc.reg dAcc)
+                      | _ -> None
+                    match b0CopyOrTfr with
+                    | Some(src, d) ->
+                      match b1Transfer d with
+                      // Pattern C2b: `setup(d -> dst); ...; Bcc lbl; (move srcReg,d | tfr srcAcc,d); b1(d -> dst); lbl:`
+                      | Some(dst, _) when src <> dst ->
+                        match findMatchingSetup d dst with
+                        | Some(setupIndices, mid)
+                            when canTouch (setupIndices @ [ i; b0; b1; lblIdx ]) && notTouched mid ->
+                          let nxIdx = nextNonComment lblIdx
+                          let dropNextLoad = matchNextReload d dst nxIdx
+                          markTouched (setupIndices @ mid @ [ i; b0; b1; lblIdx ] @ (if dropNextLoad then [ nxIdx ] else []))
+                          for sIdx in setupIndices do replaced[sIdx] <- []
+                          replaced[i] <-
+                            [ yield Op(Tcc(tccCond, Some(src, toAcc d), None)), mergedOrig
+                              if not dropNextLoad && not (deadAfter cur (lblIdx + 1) dst) then
+                                yield cur[b1] ]
+                          replaced[b0] <- []
                           replaced[b1] <- []
                           replaced[lblIdx] <- []
-                      | _ -> ()
-                  // Pattern C2a: `move a1,y1; cmp #op,a; Bcc lbl; move #>op,a; move a1,y1; lbl:`
-                  | Op(Par(None, [| Imm(op, ((A | B) as d)) |])),
-                    Op(Par(None, [| Copy(dHi, ((X0 | X1 | Y0 | Y1) as dstReg)) |]))
-                      when dHi = hi d && (op.force = Long || immValue op = Some 0L) ->
-                    let cmpIdx = prevNonComment i
-                    let prevIdx = if cmpIdx >= 0 then prevNonComment cmpIdx else -1
-                    if prevIdx >= 0 then
-                      match single prevIdx, fst cur[cmpIdx] with
-                      | Some(Copy(dHi', dstReg')), Op(AluImm(CmpI, cmpOp, cAcc))
-                          when dHi' = dHi && dstReg' = dstReg && Acc.reg cAcc = d
-                               && immValue cmpOp = immValue op && cmpOp.expr = op.expr
-                               && deadAfter cur (lblIdx + 1) d ->
-                        match pickScratch (lblIdx + 1) [ dstReg ] [] with
-                        | Some tmp when canTouch [ prevIdx; cmpIdx; i; b0; b1; lblIdx ] ->
+                          if dropNextLoad then replaced[nxIdx] <- []
+                        | _ -> ()
+                      | _ ->
+                        // Pattern C2d (Copy/Tfr + 1-word Store): `(move src,d | tfr src,d); move d1,ea` where `d1` holds `ea`
+                        match single b1 with
+                        | Some(Store(storeSrc, sp, ea))
+                            when (storeSrc = hi d || storeSrc = d) && (Lower.eaWrites ea).Length = 0 ->
+                          match regHoldsMem storeSrc sp ea cmpIdx with
+                          | Some(holdIdx, canDrop) ->
+                            let dropList = if canDrop && canTouch [ holdIdx ] then [ holdIdx ] else []
+                            if canTouch (dropList @ [ i; b0; lblIdx ]) && notTouched [ cmpIdx; b1 ] then
+                              markTouched (dropList @ [ cmpIdx; i; b0; b1; lblIdx ])
+                              for dIdx in dropList do replaced[dIdx] <- []
+                              replaced[i] <- [ Op(Tcc(tccCond, Some(src, toAcc d), None)), mergedOrig ]
+                              replaced[b0] <- []
+                              replaced[lblIdx] <- []
+                          | None -> ()
+                        | _ -> ()
+                    | None -> ()
+                  // Pattern C2c: `setup(d -> dst); ...; Bcc lbl; (neg|clr|asr|asl|abs|not|asr #2) d; b1(d -> dst); lbl:`
+                  if not (touched.Contains i) && cmpIdx >= 0 then
+                    let b0IfCc =
+                      match fst cur[b0] with
+                      | Op(Par(Some((Unary((AluUnary.Neg | AluUnary.Clr | AluUnary.Asr | AluUnary.Asl | AluUnary.Abs | AluUnary.Not), dAcc)
+                                    | Binary((AluOp.Add | AluOp.Sub), _, dAcc)) as alu), [||]))
+                          when Lower.encodes (IfCc(alu, tccCond, false)) ->
+                        Some(Acc.reg dAcc, [ Op(IfCc(alu, tccCond, false)), mergedOrig ])
+                      | Op(ShiftImm(ShAsr, 2, sAcc, dAcc)) when sAcc = dAcc ->
+                        let u = Unary(AluUnary.Asr, dAcc)
+                        Some(Acc.reg dAcc, [ Op(IfCc(u, tccCond, false)), mergedOrig; Op(IfCc(u, tccCond, false)), snd cur[b0] ])
+                      | _ -> None
+                    match b0IfCc with
+                    | Some(d, ifCcItems) ->
+                      match b1Transfer d with
+                      | Some(dst, _) ->
+                        match findMatchingSetup d dst with
+                        | Some(setupIndices, mid)
+                            when canTouch (setupIndices @ [ i; b0; b1; lblIdx ]) && notTouched mid ->
+                          let nxIdx = nextNonComment lblIdx
+                          let dropNextLoad = matchNextReload d dst nxIdx
+                          markTouched (setupIndices @ mid @ [ i; b0; b1; lblIdx ] @ (if dropNextLoad then [ nxIdx ] else []))
+                          for sIdx in setupIndices do replaced[sIdx] <- []
+                          replaced[i] <-
+                            [ yield! ifCcItems
+                              if not dropNextLoad && not (deadAfter cur (lblIdx + 1) dst) then
+                                yield cur[b1] ]
+                          replaced[b0] <- []
+                          replaced[b1] <- []
+                          replaced[lblIdx] <- []
+                          if dropNextLoad then replaced[nxIdx] <- []
+                        | _ -> ()
+                      | None ->
+                        match single b1 with
+                        | Some(Store(storeSrc, sp, ea))
+                            when (storeSrc = hi d || storeSrc = d) && (Lower.eaWrites ea).Length = 0 ->
+                          match regHoldsMem storeSrc sp ea cmpIdx with
+                          | Some(holdIdx, canDrop) ->
+                            let dropList = if canDrop && canTouch [ holdIdx ] then [ holdIdx ] else []
+                            if canTouch (dropList @ [ i; b0; lblIdx ]) && notTouched [ cmpIdx; b1 ] then
+                              markTouched (dropList @ [ cmpIdx; i; b0; b1; lblIdx ])
+                              for dIdx in dropList do replaced[dIdx] <- []
+                              replaced[i] <- ifCcItems
+                              replaced[b0] <- []
+                              replaced[lblIdx] <- []
+                          | None -> ()
+                        | _ -> ()
+                    | None -> ()
+                  // Pattern C2e: `b0` loads `tmpReg` (`Imm` or `Load`), `b1` copies `tmpReg` to `dstReg` or stores `tmpReg` to `(sp, ea)`
+                  if not (touched.Contains i) && cmpIdx >= 0 then
+                    match single b0, single b1 with
+                    | Some((Imm(op1, ((X0 | X1 | Y0 | Y1) as tmpReg)) as m0)), Some(Copy(tmpReg', ((X0 | X1 | Y0 | Y1) as dstReg)))
+                        when tmpReg' = tmpReg && tmpReg <> dstReg
+                             && (op1.force = Long || immValue op1 = Some 0L)
+                             && deadAfter cur (lblIdx + 1) tmpReg ->
+                      let p1 = prevCode cmpIdx
+                      let cAccOpt =
+                        match fst cur[cmpIdx] with
+                        | Op(AluImm(CmpI, _, cAcc)) | Op(Par(Some(Binary(AluOp.Cmp, _, cAcc)), [||])) | Op(Par(Some(Unary(AluUnary.Tst, cAcc)), [||])) ->
+                          if deadAfter cur (lblIdx + 1) (Acc.reg cAcc) then Some cAcc else None
+                        | Op(BitOp(Btst, _, BitReg bitR)) when not (overlap bitR dstReg) && not (overlap bitR tmpReg) && p1 >= 0 ->
+                          match single p1 with
+                          | Some(Copy((A1 | B1) as cHi, dstReg')) when dstReg' = dstReg ->
+                            let cReg = if cHi = A1 then A else B
+                            if deadAfter cur (lblIdx + 1) cReg then Some(toAcc cReg) else None
+                          | _ -> None
+                        | _ -> None
+                      match cAccOpt with
+                      | Some cAcc when p1 >= 0 ->
+                        let cReg = Acc.reg cAcc
+                        let cHi = hi cReg
+                        let p2 = prevCode p1
+                        let setupOpt =
+                          match single p1 with
+                          | Some(Copy(srcHi, dstReg')) when dstReg' = dstReg && srcHi = cHi ->
+                            Some([ p1 ], [ p1 ])
+                          | Some(Copy(initSrc, cReg')) when cReg' = cReg && isDataReg initSrc && p2 >= 0 ->
+                            match single p2 with
+                            | Some(Copy(initSrc', dstReg')) when initSrc' = initSrc && dstReg' = dstReg ->
+                              Some([ p2; p1 ], [ p2 ])
+                            | _ -> None
+                          | _ -> None
+                        let cmpFreeOfTmp =
+                          match fst cur[cmpIdx] with
+                          | Op instr ->
+                            match readsOf instr, writesOf instr with
+                            | Some rs, Some ws -> not (rs |> Array.exists (overlap tmpReg)) && not (ws |> Array.exists (overlap tmpReg))
+                            | _ -> false
+                          | _ -> false
+                        match setupOpt with
+                        | Some(setupAll, setupDrop)
+                            when cmpFreeOfTmp && canTouch (setupDrop @ [ cmpIdx; i; b0; b1; lblIdx ]) && notTouched setupAll ->
                           let nxIdx = nextNonComment lblIdx
                           let dropNextLoad =
                             nxIdx < n
-                            && single nxIdx = Some(Copy(dstReg, d))
+                            && single nxIdx = Some(Copy(dstReg, cReg))
                             && deadAfter cur (nxIdx + 1) dstReg
                             && canTouch [ nxIdx ]
-                          markTouched ([ prevIdx; cmpIdx; i; b0; b1; lblIdx ] @ (if dropNextLoad then [ nxIdx ] else []))
-                          let immOp = { op with force = if immValue op = Some 0L then Auto else Long }
-                          replaced[prevIdx] <- []
+                          markTouched (setupAll @ [ cmpIdx; i; b0; b1; lblIdx ] @ (if dropNextLoad then [ nxIdx ] else []))
+                          let immOp = { op1 with force = if immValue op1 = Some 0L then Auto else Long }
+                          for dIdx in setupDrop do replaced[dIdx] <- []
                           replaced[cmpIdx] <-
-                            [ Op(Par(None, [| Imm(immOp, tmp) |])), snd cur[b0]
-                              Op(Par(Some(Binary(AluOp.Cmp, tmp, cAcc)), [||])), snd cur[cmpIdx] ]
+                            [ Op(Par(None, [| Imm(immOp, tmpReg) |])), snd cur[b0]
+                              cur[cmpIdx] ]
                           replaced[i] <-
-                            [ yield Op(Tcc(tccCond, Some(tmp, cAcc), None)), mergedOrig
+                            [ yield Op(Tcc(tccCond, Some(tmpReg, cAcc), None)), mergedOrig
                               if not dropNextLoad && not (deadAfter cur (lblIdx + 1) dstReg) then
-                                yield Op(Par(None, [| Copy(dHi, dstReg) |])), snd cur[b1] ]
+                                yield Op(Par(None, [| Copy(cHi, dstReg) |])), snd cur[b1] ]
                           replaced[b0] <- []
                           replaced[b1] <- []
                           replaced[lblIdx] <- []
                           if dropNextLoad then replaced[nxIdx] <- []
                         | _ -> ()
                       | _ -> ()
-                  // Pattern C2b: `move a1,y1; cmp srcReg,a; Bcc lbl; move srcReg,a; move a1,y1; lbl:`
-                  | Op(Par(None, [| Copy(((X0 | X1 | Y0 | Y1) as srcReg), ((A | B) as d)) |])),
-                    Op(Par(None, [| Copy(dHi, ((X0 | X1 | Y0 | Y1) as dstReg)) |]))
-                      when dHi = hi d && srcReg <> dstReg ->
-                    let cmpIdx = prevNonComment i
-                    let prevIdx = if cmpIdx >= 0 then prevNonComment cmpIdx else -1
-                    if prevIdx >= 0 then
-                      match single prevIdx, fst cur[cmpIdx] with
-                      | Some(Copy(dHi', dstReg')), Op(Par(Some(Binary(AluOp.Cmp, s', cAcc)), [||]))
-                          when dHi' = dHi && dstReg' = dstReg && s' = srcReg && Acc.reg cAcc = d
-                               && deadAfter cur (lblIdx + 1) d ->
-                        let span = [ prevIdx; i; b0; b1; lblIdx ]
-                        if canTouch span then
-                          let nxIdx = nextNonComment lblIdx
-                          let dropNextLoad =
-                            nxIdx < n
-                            && single nxIdx = Some(Copy(dstReg, d))
-                            && deadAfter cur (nxIdx + 1) dstReg
-                            && canTouch [ nxIdx ]
-                          markTouched ((cmpIdx :: span) @ (if dropNextLoad then [ nxIdx ] else []))
-                          replaced[prevIdx] <- []
-                          replaced[i] <-
-                            [ yield Op(Tcc(tccCond, Some(srcReg, cAcc), None)), mergedOrig
-                              if not dropNextLoad && not (deadAfter cur (lblIdx + 1) dstReg) then
-                                yield Op(Par(None, [| Copy(dHi, dstReg) |])), snd cur[b1] ]
-                          replaced[b0] <- []
-                          replaced[b1] <- []
-                          replaced[lblIdx] <- []
-                          if dropNextLoad then replaced[nxIdx] <- []
-                      | _ -> ()
-                  | _ -> ()
+                    | Some((Imm(_, ((X0 | X1 | Y0 | Y1) as tmpReg)) | Load(_, _, ((X0 | X1 | Y0 | Y1) as tmpReg))) as m0),
+                      Some(Store(tmpReg', sp, ea))
+                        when tmpReg' = tmpReg
+                             && (workset sp ea).IsSome
+                             && (match m0 with Imm(op1, _) -> op1.force = Long || immValue op1 = Some 0L | Load(sp1, ea1, _) -> (Lower.eaWrites ea1).Length = 0 && not (sp1 = sp && ea1 = ea) | _ -> false)
+                             && deadAfter cur (lblIdx + 1) tmpReg ->
+                      let cAccOpt =
+                        match fst cur[cmpIdx] with
+                        | Op(AluImm(CmpI, _, cAcc)) | Op(Par(Some(Binary(AluOp.Cmp, _, cAcc)), [||])) | Op(Par(Some(Unary(AluUnary.Tst, cAcc)), [||])) ->
+                          Some cAcc
+                        | _ -> None
+                      match cAccOpt with
+                      | Some cAcc ->
+                        let cReg = Acc.reg cAcc
+                        let cHi = hi cReg
+                        // Subcase 1: `cHi` already holds `(sp, ea)` before `cmpIdx` (e.g. `move y1,ea; move y1,a; cmp #op,a; Bcc lbl; move #>op,x0; move x0,ea; lbl:`)
+                        let usedCReg =
+                          match m0, regHoldsMem cHi sp ea cmpIdx with
+                          | Imm(op1, _), Some(holdIdx, canDrop) when deadAfter cur (lblIdx + 1) cReg ->
+                            let dropList = if canDrop && canTouch [ holdIdx ] then [ holdIdx ] else []
+                            let immOp = { op1 with force = if immValue op1 = Some 0L then Auto else Long }
+                            match fst cur[cmpIdx] with
+                            | Op(AluImm(CmpI, cmpOp, _))
+                                when immValue cmpOp = immValue op1 && cmpOp.expr = op1.expr
+                                     && canTouch (dropList @ [ cmpIdx; i; b0; b1; lblIdx ]) ->
+                              markTouched (dropList @ [ cmpIdx; i; b0; b1; lblIdx ])
+                              for dIdx in dropList do replaced[dIdx] <- []
+                              replaced[cmpIdx] <-
+                                [ Op(Par(None, [| Imm(immOp, tmpReg) |])), snd cur[b0]
+                                  Op(Par(Some(Binary(AluOp.Cmp, tmpReg, cAcc)), [||])), snd cur[cmpIdx] ]
+                              replaced[i] <- [ Op(Tcc(tccCond, Some(tmpReg, cAcc), None)), mergedOrig ]
+                              replaced[b0] <- [ Op(Par(None, [| Store(cHi, sp, ea) |])), snd cur[b1] ]
+                              replaced[b1] <- []
+                              replaced[lblIdx] <- []
+                              true
+                            | _ -> false
+                          | _ -> false
+                        // Subcase 2: `oAcc = otherAcc cReg` is free, and before `cmpIdx` (and optional setup of `cReg`) is `move val0,tmpReg; move tmpReg,ea`
+                        if not usedCReg then
+                          let oAcc = otherAcc cReg
+                          let oAccDst = toAcc oAcc
+                          let oHi = hi oAcc
+                          if deadAfter cur (lblIdx + 1) oAcc then
+                            let m0Reads = Lower.moveReads m0
+                            let avoidR = tmpReg :: oAcc :: List.ofArray m0Reads
+                            let avoidW = [ tmpReg; oAcc ]
+                            match findSetup cmpIdx 2 avoidR avoidW (fun p ->
+                              match single p with
+                              | Some(Store(r0, sp', ea')) when r0 = tmpReg && sp' = sp && ea' = ea ->
+                                let p0 = prevCode p
+                                p0 >= 0
+                                && (match single p0 with
+                                    | Some(Imm(op0, r0')) when r0' = tmpReg && (op0.force = Long || immValue op0 = Some 0L) -> true
+                                    | Some(Load(sp0, ea0, r0')) when r0' = tmpReg && (Lower.eaWrites ea0).Length = 0 -> true
+                                    | _ -> false)
+                              | _ -> false) with
+                            | Some(st0Idx, mid) ->
+                              let ld0Idx = prevCode st0Idx
+                              // Ensure `mid` does not touch `(sp, ea)` or `m0`'s source memory
+                              let midMemSafe =
+                                mid |> List.forall (fun mIdx ->
+                                  match fst cur[mIdx] with
+                                  | Op(Par(_, moves)) ->
+                                    not (moves |> Array.exists (function Store _ -> true | Load(spM, eaM, _) -> spM = sp && eaM = ea | _ -> false))
+                                  | Op _ -> true
+                                  | _ -> false)
+                              if midMemSafe && canTouch [ ld0Idx; st0Idx; i; b0; b1; lblIdx ] && notTouched mid then
+                                let ld0New =
+                                  match single ld0Idx with
+                                  | Some(Imm(op0, _)) when immValue op0 = Some 0L ->
+                                    Op(Par(Some(Unary(AluUnary.Clr, oAccDst)), [||])), snd cur[ld0Idx]
+                                  | Some(Imm(op0, _)) ->
+                                    Op(Par(None, [| Imm(op0, oAcc) |])), snd cur[ld0Idx]
+                                  | Some(Load(sp0, ea0, _)) ->
+                                    Op(Par(None, [| Load(sp0, ea0, oAcc) |])), snd cur[ld0Idx]
+                                  | _ -> failwith "unreachable"
+                                let m0New =
+                                  match m0 with
+                                  | Imm(op1, _) ->
+                                    let immOp1 = { op1 with force = if immValue op1 = Some 0L then Auto else Long }
+                                    Op(Par(None, [| Imm(immOp1, tmpReg) |])), snd cur[b0]
+                                  | Load _ -> cur[b0]
+                                  | _ -> failwith "unreachable"
+                                markTouched ([ ld0Idx; st0Idx ] @ mid @ [ i; b0; b1; lblIdx ])
+                                replaced[ld0Idx] <- [ ld0New ]
+                                replaced[st0Idx] <- [ m0New ]
+                                replaced[i] <- [ Op(Tcc(tccCond, Some(tmpReg, oAccDst), None)), mergedOrig ]
+                                replaced[b0] <- [ Op(Par(None, [| Store(oHi, sp, ea) |])), Ir.Origin.merge (snd cur[st0Idx]) (snd cur[b1]) ]
+                                replaced[b1] <- []
+                                replaced[lblIdx] <- []
+                            | None -> ()
+                      | None -> ()
+                    | _ -> ()
                 elif body.Length = 3 then
-                  // Pattern C3: `Bcc cond lbl; tfr b,a; neg a; tfr a,b; lbl:` when `a` is dead after `lbl`
+                  // Pattern C3: `Bcc cond lbl; tfr b,a; (neg|asr|asl|abs|not) a; tfr a,b; lbl:` when `a` is dead after `lbl`
                   let b0, b1, b2 = body[0], body[1], body[2]
                   match fst cur[b0], fst cur[b1], fst cur[b2] with
                   | Op(Par(Some(Binary(AluOp.Tfr, ((A | B) as sAcc), tmpAcc)), [||])),
-                    Op(Par(Some(Unary(AluUnary.Neg, negAcc)), [||])),
+                    Op(Par(Some(Unary((AluUnary.Neg | AluUnary.Asr | AluUnary.Asl | AluUnary.Abs | AluUnary.Not) as uOp, negAcc)), [||])),
                     Op(Par(Some(Binary(AluOp.Tfr, tmpReg, dstAcc)), [||]))
                       when Acc.reg tmpAcc <> sAcc && negAcc = tmpAcc && tmpReg = Acc.reg tmpAcc && Acc.reg dstAcc = sAcc
                            && deadAfter cur (lblIdx + 1) tmpReg ->
                     let span = [ i; b0; b1; b2; lblIdx ]
                     if canTouch span then
                       markTouched span
-                      replaced[i] <- [ Op(IfCc(Unary(AluUnary.Neg, dstAcc), tccCond, false)), Ir.Origin.merge bccOrig (snd cur[b1]) ]
+                      replaced[i] <- [ Op(IfCc(Unary(uOp, dstAcc), tccCond, false)), Ir.Origin.merge bccOrig (snd cur[b1]) ]
                       replaced[b0] <- []
                       replaced[b1] <- []
                       replaced[b2] <- []
                       replaced[lblIdx] <- []
+                  // Pattern C3b: `tfr a,b; ...; Bcc cond lbl; clr a; sub b,a; tfr a,b; lbl:` -> `neg a ifcc; tfr a,b`
+                  | Op(Par(Some(Unary(AluUnary.Clr, dAcc)), [||])),
+                    Op(Par(Some(Binary(AluOp.Sub, ((A | B) as oReg), dAcc')), [||])),
+                    Op(Par(Some(Binary(AluOp.Tfr, ((A | B) as dReg), oAccDst)), [||]))
+                      when dAcc = dAcc' && Acc.reg dAcc = dReg && Acc.reg oAccDst = oReg && dReg <> oReg ->
+                    let cmpIdx = prevNonComment i
+                    if cmpIdx >= 0 then
+                      match findSetup cmpIdx 3 [ oReg ] [ dReg; oReg ] (fun p -> fst cur[p] = fst cur[b2]) with
+                      | Some(setupIdx, mid) when canTouch [ setupIdx; i; b0; b1; b2; lblIdx ] && notTouched mid ->
+                        let nxIdx = nextNonComment lblIdx
+                        let dropNextLoad =
+                          nxIdx < n
+                          && fst cur[nxIdx] = Op(Par(Some(Binary(AluOp.Tfr, oReg, dAcc)), [||]))
+                          && deadAfter cur (nxIdx + 1) oReg
+                          && deadAfter cur (lblIdx + 1) dReg
+                          && canTouch [ nxIdx ]
+                        markTouched ([ setupIdx ] @ mid @ [ i; b0; b1; b2; lblIdx ] @ (if dropNextLoad then [ nxIdx ] else []))
+                        replaced[setupIdx] <- []
+                        replaced[i] <-
+                          [ yield Op(IfCc(Unary(AluUnary.Neg, dAcc), tccCond, false)), Ir.Origin.merge bccOrig (snd cur[b1])
+                            if not dropNextLoad && not (deadAfter cur (lblIdx + 1) oReg) then
+                              yield cur[b2] ]
+                        replaced[b0] <- []
+                        replaced[b1] <- []
+                        replaced[b2] <- []
+                        replaced[lblIdx] <- []
+                        if dropNextLoad then replaced[nxIdx] <- []
+                      | _ -> ()
                   | _ -> ()
               | None -> ()
         | _ -> ()
@@ -1249,7 +1758,7 @@ let selectWith (allowScratch: bool) (first: int) (temps: int) (yFirst: int) (yTe
   let mutable cur = items
   let mutable stepCount = 0
   let mutable running = true
-  while running && stepCount < 4 do
+  while running && stepCount < 6 do
     match selectOnce cur with
     | Some next when next <> cur ->
       cur <- next
@@ -2778,9 +3287,10 @@ let walkWith (xFirst: int) (yFirst: int) (items: (Item * int) array) =
   if n = 0 then cur
   else
 
+  let yLim = if xFirst >= 64 && yFirst < 64 then yFirst else System.Int32.MaxValue
   let dispOf = function
-    | Op(Par(None, [| Load(sp, Disp(6, { expr = Num k }), reg) |])) -> Some(sp, int k, reg, false)
-    | Op(Par(None, [| Store(reg, sp, Disp(6, { expr = Num k })) |])) -> Some(sp, int k, reg, true)
+    | Op(Par(None, [| Load(sp, Disp(6, { expr = Num k }), reg) |])) when sp <> Space.Y || int k < yLim -> Some(sp, int k, reg, false)
+    | Op(Par(None, [| Store(reg, sp, Disp(6, { expr = Num k })) |])) when sp <> Space.Y || int k < yLim -> Some(sp, int k, reg, true)
     | _ -> None
 
   let luaCount (k0: int) =

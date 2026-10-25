@@ -1,4 +1,4 @@
-input-thru	machinedrum	ok	53	53bbcacca906e4e8
+input-thru	machinedrum	ok	53	966a74f322f0d3d5
 intrinsics-parity	machinedrum	ok	132	2a1138b353657bd3
 main-tap	machinedrum	ok	56	cdc8fa43eba3b164
 pluck	machinedrum	ok	169	05d248fa6b886e7f
@@ -10,7 +10,7 @@ probe-auto-size	machinedrum	ok	1889	da8b6494841ccab4
 probe-auto-sub	machinedrum	ok	134	33128424d5dbc065
 probe-banks	machinedrum	ok	96	ce5026a92f7d0a38
 probe-bit-test	machinedrum	ok	145	63e6eb81f21da1ba
-probe-bool-let	machinedrum	ok	146	32c121dcc5c7e883
+probe-bool-let	machinedrum	ok	227	c33c8a1f0d68bd20
 probe-branch-registers	machinedrum	ok	89	88e71ee76d8805fb
 probe-clb-normf	machinedrum	ok	53	193119d5d17499c0
 probe-clb-normf-edges	machinedrum	ok	158	4e28b8d45320f68e
@@ -41,7 +41,7 @@ probe-long-array	machinedrum	ok	138	f3478d2358241af9
 probe-long-sat	machinedrum	ok	85	9e404adcad63d9f0
 probe-loop-fusion	machinedrum	ok	94	3f6e6fa7d150640f
 probe-many-arrays	machinedrum	ok	175	5adf2ba84dc72d51
-probe-memory	machinedrum	ok	115	4d39ce814aa4da3a
+probe-memory	machinedrum	ok	115	ff37b86faea20d37
 probe-mulsu-dmac	machinedrum	ok	57	3398177a383e9896
 probe-order	machinedrum	ok	147	980cc74e19d3ef6e
 probe-outer-walk-regions	machinedrum	ok	108	bc98eb6f8b882cb8
@@ -59,18 +59,21 @@ probe-size-14100	machinedrum	ok	1788	173bc2ad60c0b394
 probe-size-3400	machinedrum	ok	450	a8542ebefb4d74fc
 probe-size-8100	machinedrum	ok	1038	38d56890bfaef8d5
 probe-size-small	machinedrum	ok	30	347015f8740b6210
-probe-state-ring	machinedrum	ok	143	f635883a3ed5c953
+probe-state-ring	machinedrum	ok	143	15f440dd4b0ab406
 probe-state-ring-off	machinedrum	error	-	e3268e71cb3bfb09	ring at Y+$9: a 6-word ring starts on a multiple of 8 in the workset (move the field)
 probe-step2-abs	machinedrum	ok	246	da808ecf0186cacd
 probe-step2-long-pack	machinedrum	ok	260	a5552ca8d649f028
 probe-step2-minmax	machinedrum	ok	278	c6f0167b62a24a13
 probe-step2-runtime-math	machinedrum	error	-	a65747f19b69b900	System.Math.Min is only supported on compile-time constants; for runtime DSP values use min, max, abs or Frac.Min / Frac.Max / Frac.Clamp (Acc.Min / Acc.Max / Acc.Clamp, Long.Min / Long.Max / Long.Clamp)
-probe-step3-narrow	machinedrum	ok	135	ee540be3b9e365ad
-probe-step3-select	machinedrum	ok	100	585952064dc7324f
-probe-step3-table-walk	machinedrum	ok	182	5c292e4d73f86999
+probe-step3-dead-cursor	machinedrum	ok	141	64e6e594827dc9b1
+probe-step3-narrow	machinedrum	ok	135	1090169b494040be
+probe-step3-select	machinedrum	ok	107	c8e2d87905b3bf35
+probe-step3-table-walk	machinedrum	ok	182	3ec87e4877b22eae
+probe-step3-unswitch2	machinedrum	ok	152	401cea7688f88253
+probe-step3-walk-high	machinedrum	error	-	3757a3c5666878ab	probe-step3-walk-high: the state needs Y+76, the target has 64 words
 probe-stereo	machinedrum	error	-	0ff33fe26e5970df	probe-stereo: WritePair needs a stereo target, Machinedrum MDS has 1 channel(s)
 probe-subroutine-frames	machinedrum	ok	167	34a45b3706160ab4
-probe-subroutines	machinedrum	ok	198	de93bc8714176c96
+probe-subroutines	machinedrum	ok	198	6ae3c2b8e874342d
 probe-subroutines-deep	machinedrum	error	-	9bd55f1bd0ab30b9	probe-subroutines-deep: the call to refresh takes 15 system stack levels (a call one, a DO loop two), a machine may take 12
 probe-table-constant	machinedrum	ok	61	f60f384ef9f1814e
 probe-table-held	machinedrum	ok	73	1b45f9b68186d16e

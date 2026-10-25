@@ -2050,6 +2050,7 @@ module Step3Optimiser =
       let clamped = if hi < p.d then p.d else hi
       let mutable a = Acc.ofFrac clamped
       if Frac.bit 0 seed then a <- -a
+      if Frac.bit 1 seed then a <- a >>> 1
       let stepped = Acc.sat a
       v <- if stepped = Frac.zero then seed else stepped
       out.Write v
