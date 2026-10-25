@@ -198,7 +198,7 @@ type Ctx =
     scores   : Dictionary<Var, int>           // uses of each local, weighted by loop trip counts
     deadLocals : HashSet<Var>                 // register locals given back before their scope ended
     tables   : ResizeArray<Table>     // program tables, emitted after the code
-    unswitched : HashSet<Var>         // loops (by index) already split on a condition
+    unswitched : Dictionary<Var, int> // loops (by index) -> how many conditions they have been split on
     fusedSpines : HashSet<Expr>       // statement spines already checked for cross-stage loop fusion
     mutable bHeld  : bool             // an Acc local lives in B: nothing else may write it
     mutable bWrite : bool             // ...except the local's own updates
@@ -216,7 +216,8 @@ type Ctx =
     handOff  : Set<string>                   // hand-written helpers (by key) compiled from their F# instead
     mutable inSub  : Sub option       // the subroutine being compiled
     mutable depth  : int              // system stack levels taken here: two a DO loop
-    mutable deepest : int }           // the most, in the entry or subroutine being compiled
+    mutable deepest : int             // the most, in the entry or subroutine being compiled
+    mutable branchDepth : int }       // conditional nesting depth (if branches, while loops)
 
 /// A [<Subroutine>] helper: where its calls are, what they leave it.
 and Sub =
@@ -239,11 +240,13 @@ and CallSite =
 
 /// A cursor's address register.
 and CursorReg =
-  { reg    : int
-    region : Region       // a state array's: its name and bank
-    step   : int
-    ring   : bool
-    state  : int option } // over a state array: the array's offset from r6
+  { reg         : int
+    region      : Region       // a state array's: its name and bank
+    step        : int
+    ring        : bool
+    state       : int option   // over a state array: the array's offset from r6
+    depth       : int
+    branchDepth : int }
 
 /// An Acc local lives in B for its scope only if nothing else in the scope writes B: the scope
 /// is compiled with the local in B and compiled again with it in memory when something does.
@@ -316,6 +319,17 @@ let lined (ctx: Ctx) (e: Expr) (gen: unit -> unit) =
 let fresh (ctx: Ctx) what =
   ctx.labels <- ctx.labels + 1
   $"K_{what}_{ctx.labels}"
+
+/// Release cursors bound at the current loop/branch depth that no remaining expression reads.
+let releaseDeadCursors (ctx: Ctx) (ahead: Expr list) =
+  if not ctx.cursors.IsEmpty then
+    let rest = ahead @ ctx.conts @ ctx.pending
+    for KeyValue(w, c) in ctx.cursors do
+      if not (ctx.released.Contains w) && c.depth = ctx.depth && c.branchDepth = ctx.branchDepth then
+        let live = rest |> List.exists (fun e -> e.GetFreeVars() |> Seq.contains w)
+        if not live && ctx.released.Add w then
+          if c.ring then emit ctx (movec (immL 0xffffff) (M c.reg))
+          ctx.freeRegs <- List.sort (c.reg :: ctx.freeRegs)
 
 /// `body` run in the scope of the local `v`, which lives at `home` (None: folded to `constant`): recorded for the
 /// step view with the lines its code took. The compiler's own temporaries (`_arg1`, `matchValue`, names with @) are left out.
@@ -1671,7 +1685,9 @@ let snapshot (ctx: Ctx) =
   let trackHome, indexed, counters, freeData, tables = ctx.trackHome, ctx.indexed, ctx.counters, ctx.freeData, ctx.tables.Count
   let inductions = ctx.inductions
   let bHeld, bWrite = ctx.bHeld, ctx.bWrite
-  let unswitched = List.ofSeq ctx.unswitched
+  let depth, deepest, branchDepth = ctx.depth, ctx.deepest, ctx.branchDepth
+  let unswitched = [ for KeyValue(k, v) in ctx.unswitched -> k, v ]
+  let kept = List.ofSeq ctx.kept
   let fusedSpines = List.ofSeq ctx.fusedSpines
   let scores = Dictionary(ctx.scores)
   fun () ->
@@ -1687,9 +1703,11 @@ let snapshot (ctx: Ctx) =
     ctx.deadLocals.Clear(); ctx.deadLocals.UnionWith deadLocals
     ctx.trackHome <- trackHome; ctx.indexed <- indexed; ctx.counters <- counters; ctx.freeData <- freeData
     ctx.inductions <- inductions
-    ctx.bHeld <- bHeld; ctx.bWrite <- bWrite
+    ctx.bHeld <- bHeld; ctx.bWrite <- bWrite; ctx.depth <- depth; ctx.deepest <- deepest; ctx.branchDepth <- branchDepth
     // a loop split in the attempt given up is split again (it is not left as seen)
-    ctx.unswitched.Clear(); ctx.unswitched.UnionWith unswitched
+    ctx.unswitched.Clear()
+    for k, v in unswitched do ctx.unswitched[k] <- v
+    ctx.kept.Clear(); ctx.kept.UnionWith kept
     ctx.fusedSpines.Clear(); ctx.fusedSpines.UnionWith fusedSpines
     ctx.scores.Clear()
     for KeyValue(k, v) in scores do ctx.scores[k] <- v
@@ -2504,12 +2522,13 @@ and withCursor (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit ->
     if abs step > n then fail $"{f.name}: a ring's step is at most its {n} words"
   | _ -> ()
   // cursors no code still to run reads give their registers back
-  let ahead = value :: bodyExpr :: ctx.conts
+  let ahead = value :: bodyExpr :: ctx.conts @ ctx.pending
   for KeyValue(w, c) in ctx.cursors do
-    let live = ahead |> List.exists (fun e -> e.GetFreeVars() |> Seq.contains w)
-    if not live && ctx.released.Add w then
-      if c.ring then emit ctx (movec (immL 0xffffff) (M c.reg))
-      ctx.freeRegs <- c.reg :: ctx.freeRegs
+    if not (ctx.released.Contains w) && c.depth = ctx.depth && (c.branchDepth = ctx.branchDepth || not c.ring) then
+      let live = ahead |> List.exists (fun e -> e.GetFreeVars() |> Seq.contains w)
+      if not live && ctx.released.Add w then
+        if c.ring then emit ctx (movec (immL 0xffffff) (M c.reg))
+        ctx.freeRegs <- List.sort (c.reg :: ctx.freeRegs)
   let reg =
     let mutable mixed =
       ctx.cursors |> Map.exists (fun w c -> not (ctx.released.Contains w) && c.region.bank <> region.bank)
@@ -2558,12 +2577,13 @@ and withCursor (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit ->
   | None -> if ring then emit ctx (movec (immL (region.words.Length - 1)) (M reg))
   if step <> 1 then emit ctx (move (immL (step &&& 0xffffff)) (N reg))
   let saved = ctx.cursors
-  ctx.cursors <- ctx.cursors.Add(v, { reg = reg; region = region; step = step; ring = ring; state = over |> Option.map (fun (f, _) -> f.offset) })
+  ctx.cursors <- ctx.cursors.Add(v, { reg = reg; region = region; step = step; ring = ring; state = over |> Option.map (fun (f, _) -> f.offset); depth = ctx.depth; branchDepth = ctx.branchDepth })
+  releaseDeadCursors ctx [ bodyExpr ]
   body ()
   ctx.cursors <- saved
   if not (ctx.released.Remove v) then
     if ring then emit ctx (movec (immL 0xffffff) (M reg))
-    ctx.freeRegs <- reg :: ctx.freeRegs
+    ctx.freeRegs <- List.sort (reg :: ctx.freeRegs)
 
 /// The value of e into a home.
 and store (ctx: Ctx) (h: Home) (e: Expr) =
@@ -2820,6 +2840,7 @@ and withLetAt (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> 
     try
       let h = { space = Space.X; offset = -1; ty = TAcc; reg = Some B; bound = infinity }
       valueOf ctx value bodyExpr (fun () -> store ctx h value)
+      releaseDeadCursors ctx [ bodyExpr ]
       ctx.bHeld <- true
       let saved = ctx.vars
       ctx.vars <- ctx.vars.Add(v, h)
@@ -2850,6 +2871,7 @@ and ringGroup (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> 
         | _ -> List.rev acc
       | _ -> List.rev acc
     let group = (v, value, first) :: more bodyExpr []
+    if group.Length >= 2 then releaseDeadCursors ctx [ value; bodyExpr ]
     if group.Length < 2 || ctx.freeRegs.IsEmpty then false
     else
       let reg = ctx.freeRegs |> List.tryFind (fun r -> (r >= 4) = (first.region.bank = YMemory)) |> Option.defaultValue ctx.freeRegs.Head
@@ -2883,7 +2905,7 @@ and ringGroup (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> 
       emit ctx (Label fallback)
       for (_, x, _), h in List.zip group homes do store ctx h x
       emit ctx (Label finish)
-      ctx.freeRegs <- reg :: ctx.freeRegs
+      ctx.freeRegs <- List.sort (reg :: ctx.freeRegs)
       for (w, _, _), h in List.tail (List.zip group homes) do ctx.taps[w] <- h
       let saved = ctx.vars
       ctx.vars <- ctx.vars.Add(v, homes.Head)
@@ -2937,6 +2959,7 @@ and inMemory (ctx: Ctx) (v: Var) (value: Expr) (bodyExpr: Expr) (body: unit -> u
     let afterHome = ctx.next
     valueOf ctx value bodyExpr (fun () -> store ctx h value)
     ctx.next <- afterHome
+    releaseDeadCursors ctx [ bodyExpr ]
     let saved = ctx.vars
     ctx.vars <- ctx.vars.Add(v, h)
     bound ctx v (Some h) None body
@@ -2990,9 +3013,18 @@ and innerLocals (e: Expr) =
 
 and genStmt (ctx: Ctx) (e: Expr) : unit =
   match e with
-  | Sequential _ | Let _ | ForIntegerRangeLoop _ | WhileLoop _ | IfThenElse _ -> genStmtIn ctx e
+  | Sequential _ | Let _ -> genStmtIn ctx e
+  | ForIntegerRangeLoop _ | WhileLoop _ | IfThenElse _ ->
+    genStmtIn ctx e
+    releaseDeadCursors ctx []
+  | Call(None, mi, args) when (intrinsic (resolve mi args)).IsNone && not (isSub ctx mi) && (reflected mi).IsSome ->
+    at' ctx e
+    genStmt ctx (inlined mi args)
+    releaseDeadCursors ctx []
   // a statement reads all it reads until it is done (lets inlined helpers bind inside it)
-  | _ -> thenRun ctx e (fun () -> genStmtIn ctx e)
+  | _ ->
+    thenRun ctx e (fun () -> genStmtIn ctx e)
+    releaseDeadCursors ctx []
 
 and genStmtIn (ctx: Ctx) (e: Expr) : unit =
   let e =
@@ -3065,28 +3097,32 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
     let hi = constInt ctx "a loop bound" hi
     let copies = [ for k in lo .. hi -> body.Substitute(fun x -> if x = v then Some(Expr.Value k) else None) ]
     if not copies.IsEmpty then genStmt ctx (copies |> List.reduceBack (fun a b -> Expr.Sequential(a, b)))
-  | ForIntegerRangeLoop(v, lo, hi, body) when not (ctx.unswitched.Contains v) && not (ctx.kept.Contains v) && (invariantIf ctx v body).IsSome ->
+  | ForIntegerRangeLoop(v, lo, hi, body) when (match ctx.unswitched.TryGetValue v with true, d -> d | _ -> 0) < 2 && not (ctx.kept.Contains v) && (invariantIf ctx v body).IsSome ->
     // a condition the loop does not change, tested once: a copy of the loop for each outcome,
-    // unless the copy takes more words than unswitchMax allows
+    // unless the copy takes more words than unswitchMax allows (up to 2 nested conditions)
+    let depth0 = match ctx.unswitched.TryGetValue v with true, d -> d | _ -> 0
     let restore = snapshot ctx
     let labels = ctx.labels
     let unswitched = List.ofSeq ctx.unswitched
     let costs = ctx.unswitchCosts.Count
-    ctx.unswitched.Add v |> ignore
+    ctx.unswitched[v] <- depth0 + 1
     let c = (invariantIf ctx v body).Value
     let loop taken = Expr.ForIntegerRangeLoop(v, lo, hi, decide ctx c taken body)
     let first = ctx.items.Count
     genStmt ctx (Expr.IfThenElse(c, loop true, loop false))
-    let cost = (ctx.items |> Seq.skip first |> Seq.filter (fun it -> match it with Op _ -> true | _ -> false) |> Seq.length) / 2
-    match ctx.unswitchMax with
-    | Some m when cost > m ->
+    if depth0 > 0 then ctx.unswitched[v] <- depth0 else ctx.unswitched.Remove v |> ignore
+    let rawCost = (ctx.items |> Seq.skip first |> Seq.filter (fun it -> match it with Op _ -> true | _ -> false) |> Seq.length) / 2
+    let cost = depth0 * 10000 + rawCost
+    let overMax = match ctx.unswitchMax with Some m -> cost > m | None -> false
+    if overMax || (depth0 > 0 && rawCost > 160) then
       restore ()
       ctx.labels <- labels      // the labels numbered as if the loop had not been split
-      ctx.unswitched.Clear(); ctx.unswitched.UnionWith unswitched
+      ctx.unswitched.Clear()
+      for kv in unswitched do ctx.unswitched[kv.Key] <- kv.Value
       ctx.unswitchCosts.RemoveRange(costs, ctx.unswitchCosts.Count - costs)
       ctx.kept.Add v |> ignore
       genStmt ctx e
-    | _ -> ctx.unswitchCosts.Add cost
+    else ctx.unswitchCosts.Add cost
   | ForIntegerRangeLoop(v, lo, hi, body) when (tryConst ctx lo).IsSome && (computedIndex ctx hi).IsSome ->
     // `for _ in lo .. Frac.index w + c`: the count in A, none when it is 0 or less (as .NET's
     // loop), then DO from a1
@@ -3372,6 +3408,7 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
       | ExprShape.ShapeCombination(_, xs) -> List.iter scan xs
     scan body
     if count > 0 then
+      releaseDeadCursors ctx [ body ]
       let savedIndexed, savedCounters = ctx.indexed, ctx.counters
       // X and Y arrays stepped together: the X ones from r1..r3, the Y ones from r4, r5, so an
       // X load and a Y load can share one instruction (an XY move takes a register of each bank)
@@ -3594,7 +3631,7 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
                 emit ctx (move a1 (R reg))
                 ctx.inductions <- ctx.inductions.Add((w, region.name), reg)
               yield w, c, List.ofSeq taken
-            else ctx.freeRegs <- List.ofSeq taken @ ctx.freeRegs ]
+            else ctx.freeRegs <- List.sort (List.ofSeq taken @ ctx.freeRegs) ]
       let endLabel = fresh ctx "LOOP"
       // the loop's end address is absolute: the loader relocates it
       emit ctx (Label(endLabel + "_DO"))
@@ -3627,7 +3664,7 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
         emit ctx (move a1 (at h 0))
       | None -> ()
       emit ctx (Label endLabel)
-      ctx.freeRegs <- regs @ ctx.freeRegs
+      ctx.freeRegs <- List.sort (regs @ ctx.freeRegs)
       ctx.indexed <- savedIndexed
       ctx.counters <- savedCounters
       ctx.inductions <- savedInductions
@@ -3645,8 +3682,10 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
     let top = fresh ctx "WHILE"
     let endLabel = fresh ctx "WEND"
     emit ctx (Label top)
+    ctx.branchDepth <- ctx.branchDepth + 1
     thenRun ctx e (fun () -> thenRun ctx body (fun () -> branchUnless ctx cond endLabel))
     thenRun ctx e (fun () -> genStmt ctx body)
+    ctx.branchDepth <- ctx.branchDepth - 1
     emit ctx (bra top)
     emit ctx (Label endLabel)
   | IfThenElse(cond, t, f) when (match tryConst ctx cond with Some(:? bool) -> true | _ -> false) ->
@@ -3662,7 +3701,9 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
     // back is dead after the if too, and the then branch's own locals ended inside it).
     let freeData, deadLocals = ctx.freeData, List.ofSeq ctx.deadLocals
     let freeRegs, released = ctx.freeRegs, List.ofSeq ctx.released
+    ctx.branchDepth <- ctx.branchDepth + 1
     genStmt ctx t
+    ctx.branchDepth <- ctx.branchDepth - 1
     match f with
     | Value(null, _) -> emit ctx (Label elseLabel)
     | _ ->
@@ -3671,7 +3712,9 @@ and genStmtIn (ctx: Ctx) (e: Expr) : unit =
       emit ctx (Label elseLabel)
       ctx.freeData <- freeData; ctx.deadLocals.Clear(); ctx.deadLocals.UnionWith deadLocals
       ctx.freeRegs <- freeRegs; ctx.released.Clear(); ctx.released.UnionWith released
+      ctx.branchDepth <- ctx.branchDepth + 1
       genStmt ctx f
+      ctx.branchDepth <- ctx.branchDepth - 1
       emit ctx (Label endLabel)
   | Call(Some(Var o), mi, [x]) when o.Type = TyOutput && intrinsic mi = Some "out.write" ->
     storeWord ctx x (ym (inc r7))
@@ -3864,7 +3907,7 @@ and compileFSharpSub (ctx: Ctx) (sub: Sub) =
   ctx.freeRegs <- sub.sites |> Seq.map (fun s -> Set.ofList s.freeRegs) |> Set.intersectMany |> Set.toList
   ctx.next <- max (sub.sites |> Seq.map _.next |> Seq.max) (defaultArg (ctx.floors.TryFind (subKey sub.mi)) 0)
   sub.start <- ctx.next
-  ctx.depth <- 0; ctx.deepest <- 0
+  ctx.depth <- 0; ctx.deepest <- 0; ctx.branchDepth <- 0
   ctx.inSub <- Some sub
   ctx.line <- 0; ctx.sourceLine <- 0; ctx.origin <- def.Origin
   emit ctx (Label sub.label)
@@ -4026,6 +4069,7 @@ let entry (ctx: Ctx) (name: string) (mi: Member) =
       body rest
     | e -> e
   ctx.next <- ctx.layout.xWorkset
+  ctx.depth <- 0; ctx.branchDepth <- 0
   ctx.line <- 0; ctx.sourceLine <- 0; ctx.origin <- def.Origin
   ctx.trackHome <- None
   let rec reads (e: Expr) =
@@ -4193,8 +4237,8 @@ let rec generateWithSink (sink: Sink) (handOff: Set<string>) (chosen: Set<string
         vars = Map.empty; consts = Map.empty; next = layout.xWorkset; high = layout.xWorkset; labels = 0
         cursors = Map.empty; freeRegs = [ 1; 2; 3; 4; 5 ]; tables = ResizeArray(); conts = []; released = Collections.Generic.HashSet(); trackHome = None
         indexed = Map.empty; counters = Map.empty; inductions = Map.empty; affineAt = Dictionary(HashIdentity.Reference); taps = Dictionary(); freeData = [ X1; Y1 ]; scores = Dictionary(); deadLocals = HashSet()
-        unswitched = HashSet(); fusedSpines = HashSet(HashIdentity.Reference); bHeld = false; bWrite = false
-        subs = Dictionary(); chosen = chosen; handOff = handOff; inSub = None; depth = 0; deepest = 0; floors = floors
+        unswitched = Dictionary(); fusedSpines = HashSet(HashIdentity.Reference); bHeld = false; bWrite = false
+        subs = Dictionary(); chosen = chosen; handOff = handOff; inSub = None; depth = 0; deepest = 0; branchDepth = 0; floors = floors
         kept = keptLoops ik; unrolled = unrolledLoops ik; pending = []; unswitchMax = unswitchMax; unswitchCosts = ResizeArray()
         bindings = ResizeArray() }
     entry ctx "INIT" ik.init

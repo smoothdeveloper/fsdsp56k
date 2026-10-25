@@ -2772,16 +2772,44 @@ let fixLoops (items: (Item * int) array) =
 /// Walk workset sub-blocks in X: and Y: with a free address register (`r1..r5`), turning 2-cycle
 /// `x:(r6+$k)` / `y:(r6+$k)` moves (`Alone`) into 1-cycle `(rN)+` / `(rN)-` / `(rN)` / `(rN)+nN` /
 /// `(rN)-nN` moves (`Parallel`) that `pack` can fold into adjacent ALU and dual-move instructions.
-let walkWith (yLimit: int) (items: (Item * int) array) =
+let walkWith (xFirst: int) (yFirst: int) (items: (Item * int) array) =
   let cur = Array.copy items
   let n = cur.Length
   if n = 0 then cur
   else
 
   let dispOf = function
-    | Op(Par(None, [| Load(sp, Disp(6, { expr = Num k }), reg) |])) when sp <> Space.Y || int k < yLimit -> Some(sp, int k, reg, false)
-    | Op(Par(None, [| Store(reg, sp, Disp(6, { expr = Num k })) |])) when sp <> Space.Y || int k < yLimit -> Some(sp, int k, reg, true)
+    | Op(Par(None, [| Load(sp, Disp(6, { expr = Num k }), reg) |])) -> Some(sp, int k, reg, false)
+    | Op(Par(None, [| Store(reg, sp, Disp(6, { expr = Num k })) |])) -> Some(sp, int k, reg, true)
     | _ -> None
+
+  let luaCount (k0: int) =
+    if k0 = 0 then 0
+    elif k0 > 0 then (k0 + 62) / 63
+    else (-k0 + 63) / 64
+
+  let setupCyclesOf (k0: int) (needN: int option) =
+    (if k0 = 0 then 1 else 3 * luaCount k0) + (if needN.IsSome then 1 else 0)
+
+  let emitSetupR (ins: ResizeArray<int * (Item * int)>) (pos: int) (r: int) (k0: int) (ln: int) =
+    if k0 = 0 then
+      ins.Add(pos, (Op(Par(None, [| Copy(R 6, R r) |])), ln))
+    elif k0 > 0 then
+      let mutable rem = k0
+      let mutable src = 6
+      while rem > 0 do
+        let step = min 63 rem
+        ins.Add(pos, (Op(Lua(Disp(src, Operand.num step), R r)), ln))
+        src <- r
+        rem <- rem - step
+    else
+      let mutable rem = k0
+      let mutable src = 6
+      while rem < 0 do
+        let step = max -64 rem
+        ins.Add(pos, (Op(Lua(Disp(src, Operand.num step), R r)), ln))
+        src <- r
+        rem <- rem - step
 
   let stepEa r delta =
     if delta = 0 then Ind r
@@ -2823,7 +2851,7 @@ let walkWith (yLimit: int) (items: (Item * int) array) =
     if accs.Length < 2 then None
     else
       let _, k0, _, _ = accs[0]
-      if k0 < -64 || k0 > 63 then None
+      if k0 < -192 || k0 > 189 then None
       else
         let deltas =
           [| for a in 0 .. accs.Length - 1 ->
@@ -3063,7 +3091,7 @@ let walkWith (yLimit: int) (items: (Item * int) array) =
           else
             match canWalkSeq sub (endOff sub) with
             | Some(k0, needN, _) ->
-              let setupCycles = (if k0 = 0 then 1 else 3) + (if needN.IsSome then 1 else 0)
+              let setupCycles = setupCyclesOf k0 needN
               let packCount =
                 sub
                 |> Array.filter (fun (idx, _, reg, isStore) -> canPackWith idx sp reg isStore)
@@ -3249,43 +3277,66 @@ let walkWith (yLimit: int) (items: (Item * int) array) =
               [ 1 .. 5 ]
               |> List.filter (fun r -> isFree1 r false p0 endIdx)
               |> List.length
-            let allGroups =
-              [| for sp in [ Space.Y; Space.X ] do
-                   let allAccs =
-                     [| for idx in loopIdx + 1 .. endIdx - 1 do
-                          match dispOf (fst cur[idx]) with
-                          | Some(sp', k, reg, isStore) when sp' = sp -> yield (idx, k, reg, isStore)
-                          | _ -> () |]
-                   if allAccs.Length >= 2 && maxLoopRegs > 0 then
-                     for sub, saving in partitionGroups sp allAccs true maxLoopRegs isUnconditional do
-                       if saving > 0 then yield (sp, sub, saving) |]
-              |> Array.sortByDescending (fun (_, _, saving) -> saving)
-            let usedRegs = HashSet<int>()
-            for sp, sub, _ in allGroups do
-              let _, k0, _, _ = sub[0]
-              let prefRegs = if sp = Space.Y then [ 4; 5; 3; 2; 1 ] else [ 1; 2; 3; 4; 5 ]
-              match canWalkSeq sub k0 with
-              | Some(k0, needN, deltas) ->
-                let regOpt =
-                  prefRegs
-                  |> List.tryFind (fun r ->
-                    not (usedRegs.Contains r) && isFree1 r needN.IsSome p0 endIdx)
-                match regOpt with
-                | Some r ->
-                  usedRegs.Add r |> ignore
-                  let _, ln = cur[loopIdx]
-                  let setupR =
-                    if k0 = 0 then Op(Par(None, [| Copy(R 6, R r) |])), ln
-                    else Op(Lua(Disp(6, Operand.num k0), R r)), ln
-                  insertions.Add(p0, setupR)
-                  match needN with
-                  | Some d -> insertions.Add(p0, (Op(Par(None, [| Imm(Operand.num d, N r) |])), ln))
+            let rawY =
+              [| for idx in loopIdx + 1 .. endIdx - 1 do
+                   match dispOf (fst cur[idx]) with
+                   | Some(sp', k, reg, isStore) when sp' = Space.Y -> yield (idx, k, reg, isStore)
+                   | _ -> () |]
+            let rawX =
+              [| for idx in loopIdx + 1 .. endIdx - 1 do
+                   match dispOf (fst cur[idx]) with
+                   | Some(sp', k, reg, isStore) when sp' = Space.X -> yield (idx, k, reg, isStore)
+                   | _ -> () |]
+            let groupsFor sp split (rawAccs: (int * int * Reg * bool) array) doSplit =
+              if rawAccs.Length < 2 || maxLoopRegs <= 0 then [||]
+              elif not doSplit then
+                [| for sub, saving in partitionGroups sp rawAccs true maxLoopRegs isUnconditional do
+                     if saving > 0 then yield (sp, sub, saving) |]
+              else
+                let sAccs = rawAccs |> Array.filter (fun (_, k, _, _) -> k < split)
+                let tAccs = rawAccs |> Array.filter (fun (_, k, _, _) -> k >= split)
+                [| for part in [ sAccs; tAccs ] do
+                     if part.Length >= 2 then
+                       for sub, saving in partitionGroups sp part true maxLoopRegs isUnconditional do
+                         if saving > 0 then yield (sp, sub, saving) |]
+            let assignPhase1 (candGroups: (Space * (int * int * Reg * bool) array * int) array) =
+              let usedRegs = HashSet<int>()
+              let assigned = ResizeArray<Space * (int * int * Reg * bool) array * int * int * int * int option * int array>()
+              for sp, sub, saving in candGroups |> Array.sortByDescending (fun (_, _, s) -> s) do
+                let _, k0, _, _ = sub[0]
+                let prefRegs = if sp = Space.Y then [ 4; 5; 3; 2; 1 ] else [ 1; 2; 3; 4; 5 ]
+                match canWalkSeq sub k0 with
+                | Some(k0, needN, deltas) ->
+                  let regOpt =
+                    prefRegs
+                    |> List.tryFind (fun r ->
+                      not (usedRegs.Contains r) && isFree1 r needN.IsSome p0 endIdx)
+                  match regOpt with
+                  | Some r ->
+                    usedRegs.Add r |> ignore
+                    assigned.Add(sp, sub, saving, r, k0, needN, deltas)
                   | None -> ()
-                  for a in 0 .. sub.Length - 1 do
-                    let idx, _, _, _ = sub[a]
-                    rewriteAt idx (stepEa r deltas[a])
                 | None -> ()
+              assigned.ToArray()
+            let mutable bestAssigned = [||]
+            let mutable bestScore = -1
+            for ySplit in [ false; true ] do
+              for xSplit in [ false; true ] do
+                let gs = Array.append (groupsFor Space.Y yFirst rawY ySplit) (groupsFor Space.X xFirst rawX xSplit)
+                let assigned = assignPhase1 gs
+                let sc = assigned |> Array.sumBy (fun (_, _, saving, _, _, _, _) -> saving)
+                if sc > bestScore then
+                  bestScore <- sc
+                  bestAssigned <- assigned
+            for _, sub, _, r, k0, needN, deltas in bestAssigned do
+              let _, ln = cur[loopIdx]
+              emitSetupR insertions p0 r k0 ln
+              match needN with
+              | Some d -> insertions.Add(p0, (Op(Par(None, [| Imm(Operand.num d, N r) |])), ln))
               | None -> ()
+              for a in 0 .. sub.Length - 1 do
+                let idx, _, _, _ = sub[a]
+                rewriteAt idx (stepEa r deltas[a])
         | _ -> ()
       | _ -> ()
 
@@ -3313,51 +3364,75 @@ let walkWith (yLimit: int) (items: (Item * int) array) =
         let mutable bEnd = bStart
         while bEnd + 1 < n && renderIn[bEnd + 1] && not inWalkedLoop[bEnd + 1] && not (isBlockBoundary (bEnd + 1)) do
           bEnd <- bEnd + 1
-        let allGroups =
-          [| for sp in [ Space.Y; Space.X ] do
-               let allAccs =
-                 [| for idx in bStart .. bEnd do
-                      match dispOf (fst cur[idx]) with
-                      | Some(sp', k, reg, isStore) when sp' = sp -> yield (idx, k, reg, isStore)
-                      | _ -> () |]
-               if allAccs.Length >= 2 then
-                 for sub, saving in partitionGroups sp allAccs false 5 (fun _ -> true) do
-                   if saving > 0 then yield (sp, sub, saving) |]
-          |> Array.sortByDescending (fun (_, _, saving) -> saving)
-        let usedRegs = HashSet<int>()
-        for sp, sub, _ in allGroups do
-          if sub.Length >= 2 then
-            let firstIdx, _, _, _ = sub[0]
-            let lastIdx, lastK, _, _ = sub[sub.Length - 1]
-            let prefRegs = if sp = Space.Y then [ 4; 5; 3; 2; 1 ] else [ 1; 2; 3; 4; 5 ]
-            match canWalkSeq sub lastK with
-            | Some(k0, needN, deltas) ->
-              let setupCycles = (if k0 = 0 then 1 else 3) + (if needN.IsSome then 1 else 0)
-              let packCount =
-                sub
-                |> Array.filter (fun (idx, _, reg, isStore) -> canPackWith idx sp reg isStore)
-                |> Array.length
-              if sub.Length + packCount > setupCycles then
-                let regOpt =
-                  prefRegs
-                  |> List.tryFind (fun r ->
-                    not (usedRegs.Contains r) && isFree2 r needN.IsSome firstIdx lastIdx)
-                match regOpt with
-                | Some r ->
-                  usedRegs.Add r |> ignore
-                  let _, ln = cur[firstIdx]
-                  let setupR =
-                    if k0 = 0 then Op(Par(None, [| Copy(R 6, R r) |])), ln
-                    else Op(Lua(Disp(6, Operand.num k0), R r)), ln
-                  insertions.Add(firstIdx, setupR)
-                  match needN with
-                  | Some d -> insertions.Add(firstIdx, (Op(Par(None, [| Imm(Operand.num d, N r) |])), ln))
+        let rawY =
+          [| for idx in bStart .. bEnd do
+               match dispOf (fst cur[idx]) with
+               | Some(sp', k, reg, isStore) when sp' = Space.Y -> yield (idx, k, reg, isStore)
+               | _ -> () |]
+        let rawX =
+          [| for idx in bStart .. bEnd do
+               match dispOf (fst cur[idx]) with
+               | Some(sp', k, reg, isStore) when sp' = Space.X -> yield (idx, k, reg, isStore)
+               | _ -> () |]
+        let groupsFor2 sp split (rawAccs: (int * int * Reg * bool) array) doSplit =
+          if rawAccs.Length < 2 then [||]
+          elif not doSplit then
+            [| for sub, saving in partitionGroups sp rawAccs false 5 (fun _ -> true) do
+                 if saving > 0 then yield (sp, sub, saving) |]
+          else
+            let sAccs = rawAccs |> Array.filter (fun (_, k, _, _) -> k < split)
+            let tAccs = rawAccs |> Array.filter (fun (_, k, _, _) -> k >= split)
+            [| for part in [ sAccs; tAccs ] do
+                 if part.Length >= 2 then
+                   for sub, saving in partitionGroups sp part false 5 (fun _ -> true) do
+                     if saving > 0 then yield (sp, sub, saving) |]
+        let assignPhase2 (candGroups: (Space * (int * int * Reg * bool) array * int) array) =
+          let usedRegs = HashSet<int>()
+          let assigned = ResizeArray<Space * (int * int * Reg * bool) array * int * int * int * int * int option * int array>()
+          for sp, sub, _ in candGroups |> Array.sortByDescending (fun (_, _, s) -> s) do
+            if sub.Length >= 2 then
+              let firstIdx, _, _, _ = sub[0]
+              let lastIdx, lastK, _, _ = sub[sub.Length - 1]
+              let prefRegs = if sp = Space.Y then [ 4; 5; 3; 2; 1 ] else [ 1; 2; 3; 4; 5 ]
+              match canWalkSeq sub lastK with
+              | Some(k0, needN, deltas) ->
+                let setupCycles = setupCyclesOf k0 needN
+                let packCount =
+                  sub
+                  |> Array.filter (fun (idx, _, reg, isStore) -> canPackWith idx sp reg isStore)
+                  |> Array.length
+                let netSave = sub.Length + packCount - setupCycles
+                if netSave > 0 then
+                  let regOpt =
+                    prefRegs
+                    |> List.tryFind (fun r ->
+                      not (usedRegs.Contains r) && isFree2 r needN.IsSome firstIdx lastIdx)
+                  match regOpt with
+                  | Some r ->
+                    usedRegs.Add r |> ignore
+                    assigned.Add(sp, sub, netSave, firstIdx, r, k0, needN, deltas)
                   | None -> ()
-                  for a in 0 .. sub.Length - 1 do
-                    let idx, _, _, _ = sub[a]
-                    rewriteAt idx (stepEa r deltas[a])
-                | None -> ()
-            | None -> ()
+              | None -> ()
+          assigned.ToArray()
+        let mutable bestAssigned2 = [||]
+        let mutable bestScore2 = -1
+        for ySplit in [ false; true ] do
+          for xSplit in [ false; true ] do
+            let gs = Array.append (groupsFor2 Space.Y yFirst rawY ySplit) (groupsFor2 Space.X xFirst rawX xSplit)
+            let assigned = assignPhase2 gs
+            let sc = assigned |> Array.sumBy (fun (_, _, netSave, _, _, _, _, _) -> netSave)
+            if sc > bestScore2 then
+              bestScore2 <- sc
+              bestAssigned2 <- assigned
+        for _, sub, _, firstIdx, r, k0, needN, deltas in bestAssigned2 do
+          let _, ln = cur[firstIdx]
+          emitSetupR insertions firstIdx r k0 ln
+          match needN with
+          | Some d -> insertions.Add(firstIdx, (Op(Par(None, [| Imm(Operand.num d, N r) |])), ln))
+          | None -> ()
+          for a in 0 .. sub.Length - 1 do
+            let idx, _, _, _ = sub[a]
+            rewriteAt idx (stepEa r deltas[a])
         bStart <- bEnd + 1
 
     let walked =
@@ -3490,7 +3565,7 @@ let walkWith (yLimit: int) (items: (Item * int) array) =
     if dropped.Count = 0 then walked
     else foldCur |> Array.mapi (fun i x -> i, x) |> Array.choose (fun (i, x) -> if dropped.Contains i then None else Some x)
 
-let walk (items: (Item * int) array) = walkWith 64 items
+let walk (items: (Item * int) array) = walkWith 64 64 items
 
 type TableAccessKind =
   | ProgTable of tblSym: string
@@ -4218,7 +4293,6 @@ let runWithYSink (sink: Ir.Sink) (p: Passes) (first: int) (temps: int) (yFirst: 
   let frozen, regions = freezeHand zipped
   let mutable cur = frozen
   let yf, yt = if first < 64 then yFirst, yTemps else 0, 0
-  let yLim = if first >= 64 && yTemps > yFirst then yFirst else 64
   // a pass's rewrite, kept when it is no worse (when the passes are guarded)
   let step (name: string) (on: bool) (pass: (Item * int) array -> (Item * int) array) =
     if on then
@@ -4269,7 +4343,7 @@ let runWithYSink (sink: Ir.Sink) (p: Passes) (first: int) (temps: int) (yFirst: 
   if p.tableWalk then
     step "copyForward" p.copyForward (copyForwardWith true)
     step "deadTemps" p.deadTemps (deadTempsFromY first temps yf yt)
-  step "walk" p.walk (walkWith yLim)
+  step "walk" p.walk (walkWith first yFirst)
   step "pack" p.pack pack
   step "rotate" p.rotate (rotate >> (if p.pack then pack else id))
   cur <- thawHand regions cur

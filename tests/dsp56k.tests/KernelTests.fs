@@ -2089,9 +2089,100 @@ module Step3Optimiser =
       out.Write v
     s.w <- v
 
-  let selectKernel    = Kernel.define "probe-step3-select" <@ init @> <@ trig @> <@ renderSelect @>
-  let tableWalkKernel = Kernel.define "probe-step3-table-walk" <@ init @> <@ trig @> <@ renderTableWalk @>
-  let narrowKernel    = Kernel.define "probe-step3-narrow" <@ init @> <@ trig @> <@ renderNarrow @>
+  type DeadCursorS =
+    { [<Length 16>]
+      mutable a1  : Frac array
+      [<Length 16>]
+      mutable a2  : Frac array
+      [<Length 16>]
+      mutable a3  : Frac array
+      mutable z   : Frac }
+
+  let initDeadCursor (_: Banks.P) (s: DeadCursorS) =
+    for i in 0 .. 15 do
+      s.a1[i] <- Frac.zero
+      s.a2[i] <- Frac.zero
+      s.a3[i] <- Frac.zero
+    s.z <- Frac.zero
+
+  let trigDeadCursor (_: Banks.P) (s: DeadCursorS) =
+    s.z <- Frac.zero
+
+  let renderDeadCursor (p: Banks.P) (s: DeadCursorS) (out: Output) =
+    let c1 = Cursor.linear Scratch.x Frac.zero
+    let c2 = Cursor.linear Scratch.x (Frac.ofRaw 8)
+    let c3 = Cursor.linear Scratch.y Frac.zero
+    let c4 = Cursor.linear Scratch.y (Frac.ofRaw 8)
+    let c5 = Cursor.linear Scratch.x (Frac.ofRaw 16)
+    c1.Put p.a
+    c2.Put p.b
+    c3.Put p.c
+    c4.Put p.d
+    c5.Put p.a
+    for i in 0 .. 15 do
+      s.a1[i] <- Acc.sat (Acc.ofFrac s.a1[i] + (Acc.ofFrac p.a >>> 3))
+      s.a2[i] <- Acc.sat (Acc.ofFrac s.a2[i] + (Acc.ofFrac p.b >>> 3))
+      s.a3[i] <- Acc.sat (Acc.ofFrac s.a3[i] + (Acc.ofFrac p.c >>> 3))
+    let seed = Acc.sat (Acc.ofFrac (c4.Peek()) + c5.Peek())
+    for i in 0 .. 15 do
+      let v = Acc.sat (Acc.ofFrac s.a1[i] + s.a2[i] + s.a3[i] + seed * p.d)
+      out.Write v
+      out.Write(Acc.sat (v * p.a))
+    s.z <- seed
+
+  type HighS =
+    { [<Length 64>]
+      mutable pad : Frac array
+      mutable z1  : Frac
+      mutable z2  : Frac
+      mutable z3  : Frac
+      mutable z4  : Frac }
+
+  let initHigh (_: Banks.P) (s: HighS) =
+    for i in 0 .. 63 do
+      s.pad[i] <- Frac.zero
+    s.z1 <- Frac.zero
+    s.z2 <- Frac.zero
+    s.z3 <- Frac.zero
+    s.z4 <- Frac.zero
+
+  let trigHigh (_: Banks.P) (s: HighS) =
+    s.z1 <- Frac.zero
+    s.z2 <- Frac.zero
+    s.z3 <- Frac.zero
+    s.z4 <- Frac.zero
+
+  let renderWalkHigh (p: Banks.P) (s: HighS) (out: Output) =
+    for _ in 0 .. 31 do
+      s.z1 <- Acc.sat (s.z1 * p.a + p.b)
+      s.z2 <- Acc.sat (s.z2 * p.b + s.z1 * p.c)
+      s.z3 <- Acc.sat (s.z3 * p.c + s.z2 * p.d)
+      s.z4 <- Acc.sat (s.z4 * p.d + s.z3 * p.a)
+      out.Write(Acc.sat (Acc.ofFrac s.z1 + s.z2 + s.z3 + s.z4))
+
+  let renderUnswitch2 (p: Banks.P) (s: S) (out: Output) =
+    let mutable v = s.w
+    let mutable seed = s.seed
+    for _ in 0 .. 31 do
+      seed <- Frac.lfsr 0xc20001 seed
+      if p.a > Frac.zero then
+        v <- Acc.sat (v * p.a + seed * p.c)
+      else
+        v <- Acc.sat (v * p.b - seed * p.c)
+      if p.b > Frac.zero then
+        v <- Acc.sat (Acc.ofFrac v + seed * p.d)
+      else
+        v <- Acc.sat (Acc.ofFrac v - seed * p.d)
+      out.Write v
+    s.w <- v
+    s.seed <- seed
+
+  let selectKernel     = Kernel.define "probe-step3-select" <@ init @> <@ trig @> <@ renderSelect @>
+  let tableWalkKernel  = Kernel.define "probe-step3-table-walk" <@ init @> <@ trig @> <@ renderTableWalk @>
+  let narrowKernel     = Kernel.define "probe-step3-narrow" <@ init @> <@ trig @> <@ renderNarrow @>
+  let deadCursorKernel = Kernel.define "probe-step3-dead-cursor" <@ initDeadCursor @> <@ trigDeadCursor @> <@ renderDeadCursor @>
+  let walkHighKernel   = Kernel.define "probe-step3-walk-high" <@ initHigh @> <@ trigHigh @> <@ renderWalkHigh @>
+  let unswitch2Kernel  = Kernel.define "probe-step3-unswitch2" <@ init @> <@ trig @> <@ renderUnswitch2 @>
 
 
 let probeMachine =
@@ -3161,5 +3252,48 @@ let tests =
       | Error e, _ | _, Error e -> failtest e
       needNative ()
       conformance Step3Optimiser.narrowKernel 81
+    }
+
+    test "walkWith high displacement and dead-cursor live-range shrinking: chained lua setup above +63, pre-loop cursors freed before DO loop, idempotent and equals the .NET kernel" {
+      let highTarget = { Kernel.mds with name = "Probe high Y"; yLimit = 192 }
+      match Optimize.compile Optimize.Peephole highTarget Step3Optimiser.walkHighKernel with
+      | Error e -> failtest e
+      | Ok c ->
+        let lines = c.items |> Array.map dsp56k.Print.item
+        let at (label: string) = Array.findIndex ((=) label) lines
+        let render = lines[at "RENDER:" + 1 ..]
+        Expect.exists render (fun l -> l.Contains "lua" && l.Contains "(r6+$3f),r") "chains lua from (r6+$3f) for state words at offset > 63"
+        Expect.exists render (fun l -> l.Contains "y:(r4)+") "walks high-displacement Y state words via y:(r4)+"
+        let zip = Array.zip c.items c.origins
+        let once = Optimize.walkWith c.layout.xWorkset c.layout.yWorkset zip
+        let twice = Optimize.walkWith c.layout.xWorkset c.layout.yWorkset once
+        Expect.equal (Array.map fst twice) (Array.map fst once) "walkWith pass is idempotent"
+      needNative ()
+      let rng = Random 84
+      let steps =
+        [ yield Words(randomWords rng)
+          yield Init
+          for _ in 1 .. 60 do
+            yield Words(randomWords rng)
+            yield Render 1 ]
+      match gradeWith (imageHarness highTarget memoryMap) Step3Optimiser.walkHighKernel None { name = "random words"; steps = steps } with
+      | Error e -> failtest e
+      | Ok r -> Expect.isEmpty r.correctness (text r)
+      conformance Step3Optimiser.deadCursorKernel 82
+    }
+
+    test "two-level loop unswitching: two invariant conditions hoist to 4 specialized DO loops, unswitchMax sheds 2nd-level splits first, equals the .NET kernel" {
+      let countDo (c: Compile.Compiled) =
+        c.items |> Array.filter (function dsp56k.Item.Op(dsp56k.Loop _) -> true | _ -> false) |> Array.length
+      match Compile.generateUnswitching None Kernel.mds Step3Optimiser.unswitch2Kernel,
+            Compile.generateUnswitching (Some 5000) Kernel.mds Step3Optimiser.unswitch2Kernel with
+      | Ok(full, costs), Ok(oneLevel, _) ->
+        Expect.isTrue (costs |> List.exists (fun c -> c >= 10000)) "records 2nd-level unswitch costs in the 10000+ tier"
+        Expect.isTrue (costs |> List.exists (fun c -> c < 10000)) "records 1st-level unswitch cost below 10000"
+        Expect.equal (countDo full) 4 "two invariant conditions produce 2^2 = 4 specialized DO loops"
+        Expect.equal (countDo oneLevel) 2 "unswitchMax between tiers sheds 2nd-level splits first while keeping 1st-level unswitching"
+      | Error e, _ | _, Error e -> failtest e
+      needNative ()
+      conformance Step3Optimiser.unswitch2Kernel 83
     }
   ]
