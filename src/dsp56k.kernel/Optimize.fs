@@ -3994,13 +3994,14 @@ let walkCore (allowSubLoop: bool) (xFirst: int) (yFirst: int) (items: (Item * in
               let rec tryAssignB (sp: Space) (sub: (int * int * Reg * bool) array) (weight: int) =
                 if sub.Length >= 2 then
                   let prefRegs = if sp = Space.Y then [ 4; 5; 3; 2; 1 ] else [ 1; 2; 3; 4; 5 ]
+                  let subUncond = sub |> Array.forall (fun (idx, _, _, _) -> isUnconditional idx)
                   let placedB =
                     let regB1 =
                       prefRegs
                       |> List.tryPick (fun r ->
                         if modeA[r].IsSome then None
                         else
-                          let canHoist = isFree1 r true p0 endIdx
+                          let canHoist = (not inDoLoop[p0] || subUncond) && isFree1 r true p0 endIdx
                           match modeBMetrics sp sub weight canHoist with
                           | Some(savB, firstIdx, lastIdx, k0B, needNB, deltasB) ->
                             let sameN =
@@ -4022,31 +4023,33 @@ let walkCore (allowSubLoop: bool) (xFirst: int) (yFirst: int) (items: (Item * in
                       true
                     | None ->
                       let regB2 =
-                        prefRegs
-                        |> List.tryPick (fun r ->
-                          match modeA[r] with
-                          | Some(sp1, sub1, sav1, w1, _, _, _) ->
-                            let f1, _, _, _ = sub1[0]
-                            let l1, _, _, _ = sub1[sub1.Length - 1]
-                            let firstIdx, _, _, _ = sub[0]
-                            let lastIdx, _, _, _ = sub[sub.Length - 1]
-                            if not (spansOverlap firstIdx lastIdx f1 l1) then
-                              let canHoistBoth = isFree1 r true p0 endIdx
-                              match modeBMetrics sp sub weight canHoistBoth, modeBMetrics sp1 sub1 w1 canHoistBoth with
-                              | Some(savB, _, _, k0B, needNB, deltasB), Some(sav1B, _, _, k01B, needN1B, deltas1B)
-                                  when isFree1 r needNB.IsSome firstIdx lastIdx ->
-                                let conflictN =
-                                  match needN1B, needNB with
-                                  | Some d1, Some d2 when d1 <> d2 -> true
-                                  | _ -> false
-                                let setupR1 = if k01B = 0 then 1 else 3 * luaCount k01B
-                                let setupR2 = if k0B = 0 then 1 else 3 * luaCount k0B
-                                if not conflictN && sub.Length > setupR1 + setupR2 && sav1B + savB >= sav1 + weight * 2 then
-                                  Some(r, sp1, sub1, sav1B, w1, f1, l1, k01B, needN1B, deltas1B, savB, firstIdx, lastIdx, k0B, needNB, deltasB)
-                                else None
-                              | _ -> None
-                            else None
-                          | None -> None)
+                        if not subUncond then None
+                        else
+                          prefRegs
+                          |> List.tryPick (fun r ->
+                            match modeA[r] with
+                            | Some(sp1, sub1, sav1, w1, _, _, _) ->
+                              let f1, _, _, _ = sub1[0]
+                              let l1, _, _, _ = sub1[sub1.Length - 1]
+                              let firstIdx, _, _, _ = sub[0]
+                              let lastIdx, _, _, _ = sub[sub.Length - 1]
+                              if not (spansOverlap firstIdx lastIdx f1 l1) then
+                                let canHoistBoth = isFree1 r true p0 endIdx
+                                match modeBMetrics sp sub weight canHoistBoth, modeBMetrics sp1 sub1 w1 canHoistBoth with
+                                | Some(savB, _, _, k0B, needNB, deltasB), Some(sav1B, _, _, k01B, needN1B, deltas1B)
+                                    when isFree1 r needNB.IsSome firstIdx lastIdx ->
+                                  let conflictN =
+                                    match needN1B, needNB with
+                                    | Some d1, Some d2 when d1 <> d2 -> true
+                                    | _ -> false
+                                  let setupR1 = if k01B = 0 then 1 else 3 * luaCount k01B
+                                  let setupR2 = if k0B = 0 then 1 else 3 * luaCount k0B
+                                  if not conflictN && sub.Length > setupR1 + setupR2 && sav1B + savB >= sav1 + weight * 2 then
+                                    Some(r, sp1, sub1, sav1B, w1, f1, l1, k01B, needN1B, deltas1B, savB, firstIdx, lastIdx, k0B, needNB, deltasB)
+                                  else None
+                                | _ -> None
+                              else None
+                            | None -> None)
                       match regB2 with
                       | Some(r, sp1, sub1, sav1B, w1, f1, l1, k01B, needN1B, deltas1B, savB, firstIdx, lastIdx, k0B, needNB, deltasB) ->
                         modeA[r] <- None
@@ -4065,18 +4068,20 @@ let walkCore (allowSubLoop: bool) (xFirst: int) (yFirst: int) (items: (Item * in
               for sp, sub, saving, weight in gsA |> Array.sortByDescending (fun (_, _, s, _) -> s) do
                 tryAssignA sp sub saving weight
               if allowModeB then
-                // Step 1A-cond: Mode A conditional cyclic SESE groups on remaining free loop-wide registers
                 let walkedIdx = HashSet<int>()
-                for r in 1 .. 5 do
-                  match modeA[r] with
-                  | Some(_, sub, _, _, _, _, _) ->
-                    for idx, _, _, _ in sub do walkedIdx.Add idx |> ignore
-                  | None -> ()
-                let remY0 = rawY |> Array.filter (fun (idx, _, _, _) -> not (walkedIdx.Contains idx))
-                let remX0 = rawX |> Array.filter (fun (idx, _, _, _) -> not (walkedIdx.Contains idx))
-                let gsCondA = Array.append (groupsForBuckets Space.Y yFirst remY0 ySplit false true) (groupsForBuckets Space.X xFirst remX0 xSplit false true)
-                for sp, sub, saving, weight in gsCondA |> Array.sortByDescending (fun (_, _, s, _) -> s) do
-                  tryAssignA sp sub saving weight
+                // Step 1A-cond: Mode A conditional cyclic SESE groups on remaining free loop-wide registers
+                // (only when p0 is outside any outer DO loop so setup runs once per block, not every outer iteration)
+                if not inDoLoop[p0] then
+                  for r in 1 .. 5 do
+                    match modeA[r] with
+                    | Some(_, sub, _, _, _, _, _) ->
+                      for idx, _, _, _ in sub do walkedIdx.Add idx |> ignore
+                    | None -> ()
+                  let remY0 = rawY |> Array.filter (fun (idx, _, _, _) -> not (walkedIdx.Contains idx))
+                  let remX0 = rawX |> Array.filter (fun (idx, _, _, _) -> not (walkedIdx.Contains idx))
+                  let gsCondA = Array.append (groupsForBuckets Space.Y yFirst remY0 ySplit false true) (groupsForBuckets Space.X xFirst remX0 xSplit false true)
+                  for sp, sub, saving, weight in gsCondA |> Array.sortByDescending (fun (_, _, s, _) -> s) do
+                    tryAssignA sp sub saving weight
                 // Step 1B: Mode B on remaining unwalked accesses
                 for r in 1 .. 5 do
                   match modeA[r] with
@@ -4101,7 +4106,11 @@ let walkCore (allowSubLoop: bool) (xFirst: int) (yFirst: int) (items: (Item * in
                     |> Seq.choose (fun (_, _, _, _, _, _, _, needN, _) -> needN)
                     |> Seq.distinct
                     |> Seq.toArray
-                  let nAtP0 = distinctN.Length = 1 && isFree1 r true p0 endIdx
+                  let anyUncondN =
+                    modeB[r]
+                    |> Seq.exists (fun (_, sub', _, _, _, _, _, needN', _) ->
+                      needN'.IsSome && (sub' |> Array.forall (fun (idx, _, _, _) -> isUnconditional idx)))
+                  let nAtP0 = (not inDoLoop[p0] || anyUncondN) && distinctN.Length = 1 && isFree1 r true p0 endIdx
                   let mutable emittedPreN = false
                   for sp, sub, saving, _, _, _, k0, needN, deltas in modeB[r] do
                     let preN = nAtP0 && needN.IsSome && not emittedPreN
