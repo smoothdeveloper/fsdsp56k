@@ -3572,7 +3572,7 @@ let fixLoops (items: (Item * int) array) =
 /// Walk workset sub-blocks in X: and Y: with a free address register (`r1..r5`), turning 2-cycle
 /// `x:(r6+$k)` / `y:(r6+$k)` moves (`Alone`) into 1-cycle `(rN)+` / `(rN)-` / `(rN)` / `(rN)+nN` /
 /// `(rN)-nN` moves (`Parallel`) that `pack` can fold into adjacent ALU and dual-move instructions.
-let walkCore (allowSubLoop: bool) (xFirst: int) (yFirst: int) (items: (Item * int) array) =
+let walkCore (allowSubLoop: bool) (splitBarriers: bool) (xFirst: int) (yFirst: int) (items: (Item * int) array) =
   let cur = Array.copy items
   let n = cur.Length
   if n = 0 then cur
@@ -3913,12 +3913,12 @@ let walkCore (allowSubLoop: bool) (xFirst: int) (yFirst: int) (items: (Item * in
     let phase1UsedR = Array.init n (fun _ -> Array.create 8 false)
     let phase1UsedN = Array.init n (fun _ -> Array.create 8 false)
 
-    let partitionGroups (sp: Space) (allAccs: (int * int * Reg * bool) array) (isLoop: bool) (allowReanchor: bool) (loopWeight: int) (maxRegs: int) (isUnconditional: int -> bool) =
+    let partitionGroups (sp: Space) (allAccs: (int * int * Reg * bool) array) (isLoop: bool) (allowReanchor: bool) (loopWeight: int) (maxRegs: int) (isUnconditional: int -> bool) (spanOk: int -> int -> bool -> bool) =
       let tryWalk (sub: (int * int * Reg * bool) array) =
         if sub.Length < 2 || not (sub |> Array.forall (fun (idx, _, _, _) -> isUnconditional idx)) then None
         else
           let firstIdx, k0, _, _ = sub[0]
-          let _, lastK, _, _ = sub[sub.Length - 1]
+          let lastIdx, lastK, _, _ = sub[sub.Length - 1]
           let allSameReadOnly = sub |> Array.forall (fun (_, k, _, isStore) -> k = k0 && not isStore)
           if (isLoop || allowReanchor) && allSameReadOnly then None
           else
@@ -3938,7 +3938,7 @@ let walkCore (allowSubLoop: bool) (xFirst: int) (yFirst: int) (items: (Item * in
                 if not canAnchor then None
                 else
                   match canWalkSeq sub lastK with
-                  | Some(k0, needN, deltas) ->
+                  | Some(k0, needN, deltas) when spanOk firstIdx lastIdx needN.IsSome ->
                     let packCount = countPackable true sp sub deltas
                     let inLoopSetup = setupCyclesOf k0 None
                     let preSetup = if needN.IsSome then 2 else 0
@@ -3946,11 +3946,11 @@ let walkCore (allowSubLoop: bool) (xFirst: int) (yFirst: int) (items: (Item * in
                       let sav = max 0 (loopWeight * (sub.Length + packCount - inLoopSetup) - preSetup)
                       if sav > 0 then Some(sav, true, k0, needN, deltas) else None
                     else None
-                  | None -> None
+                  | _ -> None
               | _ -> None
             else
               match canWalkSeq sub lastK with
-              | Some(k0, needN, deltas) ->
+              | Some(k0, needN, deltas) when not allowReanchor || spanOk firstIdx lastIdx needN.IsSome ->
                 let packCount =
                   if allowReanchor then countPackable true sp sub deltas
                   else
@@ -3962,7 +3962,7 @@ let walkCore (allowSubLoop: bool) (xFirst: int) (yFirst: int) (items: (Item * in
                 else
                   let sav = max 0 (sub.Length + packCount - setupCycles)
                   if sav > 0 then Some(sav, true, k0, needN, deltas) else None
-              | None -> None
+              | _ -> None
       let valid (sub: (int * int * Reg * bool) array) =
         if not allowReanchor then
           if sub.Length < 2 || not (sub |> Array.forall (fun (idx, _, _, _) -> isUnconditional idx)) then false
@@ -3993,19 +3993,50 @@ let walkCore (allowSubLoop: bool) (xFirst: int) (yFirst: int) (items: (Item * in
                 let mutable merged = parts[a]
                 let mutable curSub = allAccs |> Array.filter (fun (_, k, _, _) -> merged.Contains k)
                 let mutable curSave = if valid curSub then groupSaving curSub else 0
-                for b in a + 1 .. parts.Count - 1 do
-                  if not usedPart[b] then
-                    let cand = Set.union merged parts[b]
-                    let candSub = allAccs |> Array.filter (fun (_, k, _, _) -> cand.Contains k)
-                    if valid candSub then
-                      let bSub = allAccs |> Array.filter (fun (_, k, _, _) -> parts[b].Contains k)
-                      let bSave = if valid bSub then groupSaving bSub else 0
-                      let candSave = groupSaving candSub
-                      if candSave >= curSave + bSave then
-                        merged <- cand
-                        curSub <- candSub
-                        curSave <- candSave
-                        usedPart[b] <- true
+                if allowReanchor && splitBarriers then
+                  let mutable keepMerging = true
+                  while keepMerging do
+                    keepMerging <- false
+                    let mutable bestB = -1
+                    let mutable bestGain = -1
+                    let mutable bestCandSave = -1
+                    let mutable bestCand = Set.empty
+                    let mutable bestCandSub = [||]
+                    for b in a + 1 .. parts.Count - 1 do
+                      if not usedPart[b] then
+                        let cand = Set.union merged parts[b]
+                        let candSub = allAccs |> Array.filter (fun (_, k, _, _) -> cand.Contains k)
+                        if valid candSub then
+                          let bSub = allAccs |> Array.filter (fun (_, k, _, _) -> parts[b].Contains k)
+                          let bSave = if valid bSub then groupSaving bSub else 0
+                          let candSave = groupSaving candSub
+                          let gain = candSave - (curSave + bSave)
+                          if gain >= 0 && (gain > bestGain || (gain = bestGain && candSave > bestCandSave)) then
+                            bestB <- b
+                            bestGain <- gain
+                            bestCandSave <- candSave
+                            bestCand <- cand
+                            bestCandSub <- candSub
+                    if bestB >= 0 then
+                      merged <- bestCand
+                      curSub <- bestCandSub
+                      curSave <- bestCandSave
+                      usedPart[bestB] <- true
+                      keepMerging <- true
+                else
+                  for b in a + 1 .. parts.Count - 1 do
+                    if not usedPart[b] then
+                      let cand = Set.union merged parts[b]
+                      let candSub = allAccs |> Array.filter (fun (_, k, _, _) -> cand.Contains k)
+                      if valid candSub then
+                        let bSub = allAccs |> Array.filter (fun (_, k, _, _) -> parts[b].Contains k)
+                        let bSave = if valid bSub then groupSaving bSub else 0
+                        let candSave = groupSaving candSub
+                        if candSave >= curSave + bSave then
+                          merged <- cand
+                          curSub <- candSub
+                          curSave <- candSave
+                          usedPart[b] <- true
                 if valid curSub then
                   usedPart[a] <- true
                   byOffsets.Add curSub
@@ -4087,16 +4118,42 @@ let walkCore (allowSubLoop: bool) (xFirst: int) (yFirst: int) (items: (Item * in
               usedOrd[a] <- true
               let mutable curSub = ordParts[a]
               let mutable curSave = groupSaving curSub
-              for b in a + 1 .. ordParts.Count - 1 do
-                if not usedOrd[b] then
-                  let candSub = Array.append curSub ordParts[b]
-                  if valid candSub then
-                    let bSave = groupSaving ordParts[b]
-                    let candSave = groupSaving candSub
-                    if candSave >= curSave + bSave then
-                      curSub <- candSub
-                      curSave <- candSave
-                      usedOrd[b] <- true
+              if allowReanchor && splitBarriers then
+                let mutable keepMerging = true
+                while keepMerging do
+                  keepMerging <- false
+                  let mutable bestB = -1
+                  let mutable bestGain = -1
+                  let mutable bestCandSave = -1
+                  let mutable bestCandSub = [||]
+                  for b in a + 1 .. ordParts.Count - 1 do
+                    if not usedOrd[b] then
+                      let candSub = Array.append curSub ordParts[b]
+                      if valid candSub then
+                        let bSave = groupSaving ordParts[b]
+                        let candSave = groupSaving candSub
+                        let gain = candSave - (curSave + bSave)
+                        if gain >= 0 && (gain > bestGain || (gain = bestGain && candSave > bestCandSave)) then
+                          bestB <- b
+                          bestGain <- gain
+                          bestCandSave <- candSave
+                          bestCandSub <- candSub
+                  if bestB >= 0 then
+                    curSub <- bestCandSub
+                    curSave <- bestCandSave
+                    usedOrd[bestB] <- true
+                    keepMerging <- true
+              else
+                for b in a + 1 .. ordParts.Count - 1 do
+                  if not usedOrd[b] then
+                    let candSub = Array.append curSub ordParts[b]
+                    if valid candSub then
+                      let bSave = groupSaving ordParts[b]
+                      let candSave = groupSaving candSub
+                      if candSave >= curSave + bSave then
+                        curSub <- candSub
+                        curSave <- candSave
+                        usedOrd[b] <- true
               byOrder.Add curSub
           let scoreTop (arr: (int * int * Reg * bool) array array) =
             let sorted = arr |> Array.map groupSaving |> Array.sortDescending
@@ -4215,18 +4272,32 @@ let walkCore (allowSubLoop: bool) (xFirst: int) (yFirst: int) (items: (Item * in
             let groupsForUncondA sp split (rawAccs: (int * int * Reg * bool) array) doSplit =
               if rawAccs.Length < 2 || maxLoopRegs <= 0 then [||]
               elif not doSplit then
-                [| for sub, saving in partitionGroups sp rawAccs true false 32 maxLoopRegs isUnconditional do
+                [| for sub, saving in partitionGroups sp rawAccs true false 32 maxLoopRegs isUnconditional (fun _ _ _ -> true) do
                      if saving > 0 then yield (sp, sub, saving, 32) |]
               else
                 let sAccs = rawAccs |> Array.filter (fun (_, k, _, _) -> k < split)
                 let tAccs = rawAccs |> Array.filter (fun (_, k, _, _) -> k >= split)
                 [| for part in [ sAccs; tAccs ] do
                      if part.Length >= 2 then
-                       for sub, saving in partitionGroups sp part true false 32 maxLoopRegs isUnconditional do
+                       for sub, saving in partitionGroups sp part true false 32 maxLoopRegs isUnconditional (fun _ _ _ -> true) do
                          if saving > 0 then yield (sp, sub, saving, 32) |]
-            let groupsForBuckets sp split (rawAccs: (int * int * Reg * bool) array) doSplit allowReanchor onlyCond =
+            let groupsForBuckets sp split (rawAccs: (int * int * Reg * bool) array) doSplit allowReanchor onlyCond (spanOk: int -> int -> bool -> bool) =
               if rawAccs.Length < 2 || (maxLoopRegs <= 0 && not anySubLoopReg) then [||]
               else
+                let effSpanOk = if allowReanchor && splitBarriers then spanOk else (fun _ _ _ -> true)
+                let splitBySpan (arr: (int * int * Reg * bool) array) =
+                  if not (allowReanchor && splitBarriers) || arr.Length < 2 then [ arr ]
+                  else
+                    let segs = ResizeArray<(int * int * Reg * bool) array>()
+                    let mutable s = 0
+                    for i in 0 .. arr.Length - 2 do
+                      let idxA, _, _, _ = arr[i]
+                      let idxB, _, _, _ = arr[i + 1]
+                      if not (effSpanOk idxA idxB false) then
+                        if i >= s + 1 then segs.Add arr[s .. i]
+                        s <- i + 1
+                    if arr.Length - 1 >= s + 1 then segs.Add arr[s .. arr.Length - 1]
+                    segs |> Seq.toList
                 let buckets = rawAccs |> Array.groupBy (fun (idx, _, _, _) -> branchSig idx)
                 [| for (_, sigList), bucketAccs in buckets do
                      let depth = sigList |> List.filter id |> List.length
@@ -4239,9 +4310,10 @@ let walkCore (allowSubLoop: bool) (xFirst: int) (yFirst: int) (items: (Item * in
                            [ bucketAccs |> Array.filter (fun (_, k, _, _) -> k < split)
                              bucketAccs |> Array.filter (fun (_, k, _, _) -> k >= split) ]
                        for part in parts do
-                         if part.Length >= 2 then
-                           for sub, saving in partitionGroups sp part true allowReanchor weight cap (fun _ -> true) do
-                             if saving > 0 then yield (sp, sub, saving, weight) |]
+                         for seg in splitBySpan part do
+                           if seg.Length >= 2 then
+                             for sub, saving in partitionGroups sp seg true allowReanchor weight cap (fun _ -> true) effSpanOk do
+                               if saving > 0 then yield (sp, sub, saving, weight) |]
             let assignPhase1 (ySplit: bool) (xSplit: bool) (allowModeB: bool) =
               // Mode A per reg: Some(sp, sub, saving, weight, k0, needN, deltas)
               let modeA = Array.create<option<Space * (int * int * Reg * bool) array * int * int * int * int option * int array>> 8 None
@@ -4370,7 +4442,7 @@ let walkCore (allowSubLoop: bool) (xFirst: int) (yFirst: int) (items: (Item * in
                     | None -> ()
                   let remY0 = rawY |> Array.filter (fun (idx, _, _, _) -> not (walkedIdx.Contains idx))
                   let remX0 = rawX |> Array.filter (fun (idx, _, _, _) -> not (walkedIdx.Contains idx))
-                  let gsCondA = Array.append (groupsForBuckets Space.Y yFirst remY0 ySplit false true) (groupsForBuckets Space.X xFirst remX0 xSplit false true)
+                  let gsCondA = Array.append (groupsForBuckets Space.Y yFirst remY0 ySplit false true (fun _ _ _ -> true)) (groupsForBuckets Space.X xFirst remX0 xSplit false true (fun _ _ _ -> true))
                   for sp, sub, saving, weight in gsCondA |> Array.sortByDescending (fun (_, _, s, _) -> s) do
                     tryAssignA sp sub saving weight
                 // Step 1B: Mode B on remaining unwalked accesses
@@ -4379,9 +4451,19 @@ let walkCore (allowSubLoop: bool) (xFirst: int) (yFirst: int) (items: (Item * in
                   | Some(_, sub, _, _, _, _, _) ->
                     for idx, _, _, _ in sub do walkedIdx.Add idx |> ignore
                   | None -> ()
+                let spanOkB fIdx lIdx needN =
+                  [ 1 .. 5 ]
+                  |> List.exists (fun r ->
+                    isFree1 r needN fIdx lIdx
+                    && (match modeA[r] with
+                        | None -> true
+                        | Some(_, sub1, _, _, _, _, _) ->
+                          let f1, _, _, _ = sub1[0]
+                          let l1, _, _, _ = sub1[sub1.Length - 1]
+                          not (spansOverlap fIdx lIdx f1 l1)))
                 let remY = rawY |> Array.filter (fun (idx, _, _, _) -> not (walkedIdx.Contains idx))
                 let remX = rawX |> Array.filter (fun (idx, _, _, _) -> not (walkedIdx.Contains idx))
-                let gsB = Array.append (groupsForBuckets Space.Y yFirst remY ySplit true false) (groupsForBuckets Space.X xFirst remX xSplit true false)
+                let gsB = Array.append (groupsForBuckets Space.Y yFirst remY ySplit true false spanOkB) (groupsForBuckets Space.X xFirst remX xSplit true false spanOkB)
                 for sp, sub, _, weight in gsB |> Array.sortByDescending (fun (_, _, s, _) -> s) do
                   tryAssignB sp sub weight
               let res = ResizeArray<Space * (int * int * Reg * bool) array * int * int * bool * int * int option * bool * int array>()
@@ -4494,14 +4576,14 @@ let walkCore (allowSubLoop: bool) (xFirst: int) (yFirst: int) (items: (Item * in
         let groupsFor2 sp split (rawAccs: (int * int * Reg * bool) array) doSplit =
           if rawAccs.Length < 2 then [||]
           elif not doSplit then
-            [| for sub, saving in partitionGroups sp rawAccs false inLoopBlock 1 5 (fun _ -> true) do
+            [| for sub, saving in partitionGroups sp rawAccs false inLoopBlock 1 5 (fun _ -> true) (fun _ _ _ -> true) do
                  if saving > 0 then yield (sp, sub, saving) |]
           else
             let sAccs = rawAccs |> Array.filter (fun (_, k, _, _) -> k < split)
             let tAccs = rawAccs |> Array.filter (fun (_, k, _, _) -> k >= split)
             [| for part in [ sAccs; tAccs ] do
                  if part.Length >= 2 then
-                   for sub, saving in partitionGroups sp part false inLoopBlock 1 5 (fun _ -> true) do
+                   for sub, saving in partitionGroups sp part false inLoopBlock 1 5 (fun _ -> true) (fun _ _ _ -> true) do
                      if saving > 0 then yield (sp, sub, saving) |]
         let assignPhase2 (candGroups: (Space * (int * int * Reg * bool) array * int) array) =
           let usedSpans = ResizeArray<int * int * int>()
@@ -4701,7 +4783,7 @@ let walkCore (allowSubLoop: bool) (xFirst: int) (yFirst: int) (items: (Item * in
     if dropped.Count = 0 then walked
     else foldCur |> Array.mapi (fun i x -> i, x) |> Array.choose (fun (i, x) -> if dropped.Contains i then None else Some x)
 
-let walkWith (xFirst: int) (yFirst: int) (items: (Item * int) array) = walkCore true xFirst yFirst items
+let walkWith (xFirst: int) (yFirst: int) (items: (Item * int) array) = walkCore true true xFirst yFirst items
 let walk (items: (Item * int) array) = walkWith 64 64 items
 
 type TableAccessKind =
@@ -5479,6 +5561,21 @@ let runWithYSink (sink: Ir.Sink) (p: Passes) (first: int) (temps: int) (yFirst: 
     if p.pack then c <- pack c
     if p.rotate then c <- (rotate >> (if p.pack then pack else id)) c
     c
+  let pickWalk (s: (Item * int) array) =
+    let wBase = walkCore false false first yFirst s
+    let wSub1 = walkCore true  false first yFirst s
+    let wSub2 = walkCore true  true  first yFirst s
+    let cBase, wBaseWords = staticCost (finishWalked wBase)
+    let cSub1, wSub1Words = staticCost (finishWalked wSub1)
+    let wSub, (cSub, wSubWords) =
+      if wSub2 = wSub1 then wSub1, (cSub1, wSub1Words)
+      else
+        let cSub2, wSub2Words = staticCost (finishWalked wSub2)
+        if (cSub2 < cSub1 && (wSub2Words <= wSub1Words || cSub1 - cSub2 >= 8L * (wSub2Words - wSub1Words))) || (cSub2 = cSub1 && wSub2Words < wSub1Words) then
+          wSub2, (cSub2, wSub2Words)
+        else wSub1, (cSub1, wSub1Words)
+    if cSub < cBase && (wSubWords <= wBaseWords || cBase - cSub >= 8L * (wSubWords - wBaseWords)) then wSub
+    else wBase
   let evalTail (start: (Item * int) array) =
     let mutable s = start
     let stepLocal on pass =
@@ -5492,13 +5589,7 @@ let runWithYSink (sink: Ir.Sink) (p: Passes) (first: int) (temps: int) (yFirst: 
       stepLocal p.copyForward (copyForwardWith true)
       stepLocal p.deadTemps (deadTempsFromY first temps yf yt)
     if p.walk then
-      let wBase = walkCore false first yFirst s
-      let wSub  = walkCore true  first yFirst s
-      let cBase, wBaseWords = staticCost (finishWalked wBase)
-      let cSub,  wSubWords  = staticCost (finishWalked wSub)
-      let wChosen =
-        if cSub < cBase && (wSubWords <= wBaseWords || cBase - cSub >= 8L * (wSubWords - wBaseWords)) then wSub
-        else wBase
+      let wChosen = pickWalk s
       stepLocal true (fun _ -> wChosen)
     stepLocal p.pack pack
     stepLocal p.rotate (rotate >> (if p.pack then pack else id))
@@ -5521,13 +5612,7 @@ let runWithYSink (sink: Ir.Sink) (p: Passes) (first: int) (temps: int) (yFirst: 
     step "copyForward" p.copyForward (copyForwardWith true)
     step "deadTemps" p.deadTemps (deadTempsFromY first temps yf yt)
   if p.walk then
-    let wBase = walkCore false first yFirst cur
-    let wSub  = walkCore true  first yFirst cur
-    let cBase, wBaseWords = staticCost (finishWalked wBase)
-    let cSub,  wSubWords  = staticCost (finishWalked wSub)
-    let wChosen =
-      if cSub < cBase && (wSubWords <= wBaseWords || cBase - cSub >= 8L * (wSubWords - wBaseWords)) then wSub
-      else wBase
+    let wChosen = pickWalk cur
     step "walk" true (fun _ -> wChosen)
   step "pack" p.pack pack
   step "rotate" p.rotate (rotate >> (if p.pack then pack else id))
