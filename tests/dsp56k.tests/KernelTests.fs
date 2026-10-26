@@ -2230,13 +2230,32 @@ module Step3Optimiser =
       out.Write(Acc.sat (Acc.ofFrac s.z4 + s.w4 * p.c))
     s.seed <- seed
 
-  let selectKernel     = Kernel.define "probe-step3-select" <@ init @> <@ trig @> <@ renderSelect @>
-  let tableWalkKernel  = Kernel.define "probe-step3-table-walk" <@ init @> <@ trig @> <@ renderTableWalk @>
-  let narrowKernel     = Kernel.define "probe-step3-narrow" <@ init @> <@ trig @> <@ renderNarrow @>
-  let deadCursorKernel = Kernel.define "probe-step3-dead-cursor" <@ initDeadCursor @> <@ trigDeadCursor @> <@ renderDeadCursor @>
-  let walkHighKernel   = Kernel.define "probe-step3-walk-high" <@ initHigh @> <@ trigHigh @> <@ renderWalkHigh @>
-  let walkPhaseKernel  = Kernel.define "probe-step3-walk-phase" <@ initWalkPhase @> <@ trigWalkPhase @> <@ renderWalkPhase @>
-  let unswitch2Kernel  = Kernel.define "probe-step3-unswitch2" <@ init @> <@ trig @> <@ renderUnswitch2 @>
+  let renderLongClampSpill (p: Banks.P) (s: S) (out: Output) =
+    let mutable seed = s.seed
+    let mutable w = s.w
+    let loL = Long.pack (Frac.ofRaw 0x010000) Frac.zero
+    let hiL = Long.pack (Frac.ofRaw 0x600000) Frac.zero
+    for _ in 0 .. 31 do
+      seed <- Frac.lfsr 0xc20001 seed
+      let stepL = Long.ofAcc (seed * p.a + p.b)
+      let clampedL = min hiL (max loL stepL)
+      let rawAcc = Acc.ofLong clampedL + w * p.c
+      let qAcc = (rawAcc >>> 14) <<< 14
+      let diffAcc = rawAcc - qAcc
+      let s1 = Acc.sat rawAcc
+      w <- Acc.sat (diffAcc + s1 * p.d)
+      out.Write(Acc.sat (Acc.ofFrac w + s1))
+    s.seed <- seed
+    s.w <- w
+
+  let selectKernel         = Kernel.define "probe-step3-select" <@ init @> <@ trig @> <@ renderSelect @>
+  let tableWalkKernel      = Kernel.define "probe-step3-table-walk" <@ init @> <@ trig @> <@ renderTableWalk @>
+  let narrowKernel         = Kernel.define "probe-step3-narrow" <@ init @> <@ trig @> <@ renderNarrow @>
+  let deadCursorKernel     = Kernel.define "probe-step3-dead-cursor" <@ initDeadCursor @> <@ trigDeadCursor @> <@ renderDeadCursor @>
+  let walkHighKernel       = Kernel.define "probe-step3-walk-high" <@ initHigh @> <@ trigHigh @> <@ renderWalkHigh @>
+  let walkPhaseKernel      = Kernel.define "probe-step3-walk-phase" <@ initWalkPhase @> <@ trigWalkPhase @> <@ renderWalkPhase @>
+  let unswitch2Kernel      = Kernel.define "probe-step3-unswitch2" <@ init @> <@ trig @> <@ renderUnswitch2 @>
+  let longClampSpillKernel = Kernel.define "probe-step3-long-clamp-spill" <@ init @> <@ trig @> <@ renderLongClampSpill @>
 
 
 let probeMachine =
@@ -3366,5 +3385,20 @@ let tests =
         Expect.equal (Array.map fst twice) (Array.map fst once) "walkWith pass is idempotent"
       needNative ()
       conformance Step3Optimiser.walkPhaseKernel 85
+    }
+
+    test "2-word Long clamp folding and DO-loop spill elimination: lowers 48-bit Long min/max clamps to Tcc and folds shift/tfr chains without temporary spills, equals the .NET kernel" {
+      match Optimize.compile Optimize.Direct Kernel.mds Step3Optimiser.longClampSpillKernel,
+            Optimize.compile Optimize.Peephole Kernel.mds Step3Optimiser.longClampSpillKernel with
+      | Ok direct, Ok peep ->
+        let lines = peep.items |> Array.map dsp56k.Print.item
+        let at (label: string) = Array.findIndex ((=) label) lines
+        let render = lines[at "RENDER:" + 1 ..]
+        Expect.exists render (fun l -> let t = l.TrimStart() in t.StartsWith "tlt " || t.StartsWith "tgt " || t.StartsWith "tle " || t.StartsWith "tge ") "lowers 2-word Long clamp diamond to conditional Tcc"
+        Expect.isFalse (render |> Array.exists (fun l -> let t = l.TrimStart() in t.StartsWith "blt " || t.StartsWith "bgt " || t.StartsWith "ble " || t.StartsWith "bge ")) "eliminates comparison branches from RENDER"
+        Expect.isLessThan peep.items.Length direct.items.Length "peephole reduces instruction count"
+      | Error e, _ | _, Error e -> failtest e
+      needNative ()
+      conformance Step3Optimiser.longClampSpillKernel 86
     }
   ]

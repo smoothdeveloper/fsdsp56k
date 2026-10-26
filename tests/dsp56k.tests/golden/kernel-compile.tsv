@@ -66,6 +66,7 @@ probe-step2-long-pack	machinedrum	ok	260	a5552ca8d649f028
 probe-step2-minmax	machinedrum	ok	278	c6f0167b62a24a13
 probe-step2-runtime-math	machinedrum	error	-	a65747f19b69b900	System.Math.Min is only supported on compile-time constants; for runtime DSP values use min, max, abs or Frac.Min / Frac.Max / Frac.Clamp (Acc.Min / Acc.Max / Acc.Clamp, Long.Min / Long.Max / Long.Clamp)
 probe-step3-dead-cursor	machinedrum	ok	141	64e6e594827dc9b1
+probe-step3-long-clamp-spill	machinedrum	ok	113	3b3b43ec6dffba7c
 probe-step3-narrow	machinedrum	ok	135	1090169b494040be
 probe-step3-select	machinedrum	ok	107	c8e2d87905b3bf35
 probe-step3-table-walk	machinedrum	ok	182	3ec87e4877b22eae

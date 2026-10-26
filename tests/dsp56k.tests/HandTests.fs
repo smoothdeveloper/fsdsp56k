@@ -285,7 +285,7 @@ let tests =
         has o "RENDER mean 2075"
         has o "follow workshop.hand.follow 1947.0 2075.0 -128.0 -128 matches .NET"
         has o "shape workshop.hand.shape 2011.0 2075.0 -64.0 -64 matches .NET"
-        has o "follow workshop.hand.follow 1024/1024 16 4 12.0"
+        has o "follow workshop.hand.follow 1024/1024 4 4 0.0"
         let listing = IO.Path.Combine(ToolTests.scratch (), "workshop.asm")
         let code, out = ToolTests.tool [| "grade"; workshop; "--define"; "HAND_SHAPE"; "--define"; "HAND_FOLLOW"; "--listing"; listing |]
         Expect.equal code 0 out
