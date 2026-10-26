@@ -71,6 +71,7 @@ probe-step3-select	machinedrum	ok	107	c8e2d87905b3bf35
 probe-step3-table-walk	machinedrum	ok	182	3ec87e4877b22eae
 probe-step3-unswitch2	machinedrum	ok	152	401cea7688f88253
 probe-step3-walk-high	machinedrum	error	-	3757a3c5666878ab	probe-step3-walk-high: the state needs Y+76, the target has 64 words
+probe-step3-walk-phase	machinedrum	ok	157	e70057964d4c6a25
 probe-stereo	machinedrum	error	-	0ff33fe26e5970df	probe-stereo: WritePair needs a stereo target, Machinedrum MDS has 1 channel(s)
 probe-subroutine-frames	machinedrum	ok	167	34a45b3706160ab4
 probe-subroutines	machinedrum	ok	198	6ae3c2b8e874342d

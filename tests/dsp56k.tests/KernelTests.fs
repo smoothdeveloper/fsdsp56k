@@ -2178,11 +2178,64 @@ module Step3Optimiser =
     s.w <- v
     s.seed <- seed
 
+  type WalkPhaseS =
+    { mutable z1   : Frac
+      mutable z2   : Frac
+      mutable z3   : Frac
+      mutable z4   : Frac
+      [<Length 12>]
+      mutable pad  : Frac array
+      mutable w1   : Frac
+      mutable w2   : Frac
+      mutable w3   : Frac
+      mutable w4   : Frac
+      mutable seed : Frac }
+
+  let initWalkPhase (_: Banks.P) (s: WalkPhaseS) =
+    s.z1 <- Frac.zero
+    s.z2 <- Frac.zero
+    s.z3 <- Frac.zero
+    s.z4 <- Frac.zero
+    for i in 0 .. 11 do
+      s.pad[i] <- Frac.zero
+    s.w1 <- Frac.zero
+    s.w2 <- Frac.zero
+    s.w3 <- Frac.zero
+    s.w4 <- Frac.zero
+    s.seed <- Frac.ofRaw 0x2468ac
+
+  let trigWalkPhase (_: Banks.P) (s: WalkPhaseS) =
+    s.z1 <- Frac.zero
+    s.z2 <- Frac.zero
+    s.z3 <- Frac.zero
+    s.z4 <- Frac.zero
+    s.w1 <- Frac.zero
+    s.w2 <- Frac.zero
+    s.w3 <- Frac.zero
+    s.w4 <- Frac.zero
+
+  let renderWalkPhase (p: Banks.P) (s: WalkPhaseS) (out: Output) =
+    let mutable seed = s.seed
+    for _ in 0 .. 31 do
+      seed <- Frac.lfsr 0xc20001 seed
+      s.z1 <- Acc.sat (s.z1 * p.a + p.b)
+      s.z2 <- Acc.sat (s.z2 * p.b + s.z1 * p.c)
+      s.z3 <- Acc.sat (s.z3 * p.c + s.z2 * p.d)
+      s.z4 <- Acc.sat (s.z4 * p.d + s.z3 * p.a)
+      if Frac.bit 0 seed then
+        s.w1 <- Acc.sat (s.w1 * p.a + s.z4 * p.b)
+        s.w2 <- Acc.sat (s.w2 * p.b + s.w1 * p.c)
+        s.w3 <- Acc.sat (s.w3 * p.c + s.w2 * p.d)
+        s.w4 <- Acc.sat (s.w4 * p.d + s.w3 * p.a)
+      out.Write(Acc.sat (Acc.ofFrac s.z4 + s.w4 * p.c))
+    s.seed <- seed
+
   let selectKernel     = Kernel.define "probe-step3-select" <@ init @> <@ trig @> <@ renderSelect @>
   let tableWalkKernel  = Kernel.define "probe-step3-table-walk" <@ init @> <@ trig @> <@ renderTableWalk @>
   let narrowKernel     = Kernel.define "probe-step3-narrow" <@ init @> <@ trig @> <@ renderNarrow @>
   let deadCursorKernel = Kernel.define "probe-step3-dead-cursor" <@ initDeadCursor @> <@ trigDeadCursor @> <@ renderDeadCursor @>
   let walkHighKernel   = Kernel.define "probe-step3-walk-high" <@ initHigh @> <@ trigHigh @> <@ renderWalkHigh @>
+  let walkPhaseKernel  = Kernel.define "probe-step3-walk-phase" <@ initWalkPhase @> <@ trigWalkPhase @> <@ renderWalkPhase @>
   let unswitch2Kernel  = Kernel.define "probe-step3-unswitch2" <@ init @> <@ trig @> <@ renderUnswitch2 @>
 
 
@@ -3296,5 +3349,22 @@ let tests =
       | Error e, _ | _, Error e -> failtest e
       needNative ()
       conformance Step3Optimiser.unswitch2Kernel 83
+    }
+
+    test "walkWith conditional SESE and multi-cluster DO-loop walking: walks both unconditional and branch-local state clusters, idempotent and equals the .NET kernel" {
+      match Optimize.compile Optimize.Peephole Kernel.mds Step3Optimiser.walkPhaseKernel with
+      | Error e -> failtest e
+      | Ok c ->
+        let lines = c.items |> Array.map dsp56k.Print.item
+        let at (label: string) = Array.findIndex ((=) label) lines
+        let render = lines[at "RENDER:" + 1 ..]
+        Expect.exists render (fun l -> l.Contains "y:(r4)+") "walks unconditional state cluster via y:(r4)+"
+        Expect.exists render (fun l -> l.Contains "y:(r5)+") "walks branch-local SESE state cluster via y:(r5)+"
+        let zip = Array.zip c.items c.origins
+        let once = Optimize.walkWith c.layout.xWorkset c.layout.yWorkset zip
+        let twice = Optimize.walkWith c.layout.xWorkset c.layout.yWorkset once
+        Expect.equal (Array.map fst twice) (Array.map fst once) "walkWith pass is idempotent"
+      needNative ()
+      conformance Step3Optimiser.walkPhaseKernel 85
     }
   ]
